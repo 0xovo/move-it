@@ -1,0 +1,39 @@
+[package]
+name = "moveit-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Move It engine: reads, seals, carries and merges a browser's cookies, logins, extensions, bookmarks and history."
+
+[dependencies]
+# RustCrypto AES-256-GCM (MIT/Apache-2.0): same cipher as the Python prototype (PyCryptodome).
+aes-gcm = "=0.10.3"
+# Linux and Mac browsers lock values with AES-128-CBC, key from PBKDF2-HMAC-SHA1 (all RustCrypto, MIT/Apache-2.0).
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha1 = "0.10"
+base64 = "=0.22.1"
+getrandom = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+# zip (MIT): the v2 payload container, deflate only.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# Argon2id (RustCrypto, MIT/Apache-2.0): makes the pairing code slow to guess.
+argon2 = "0.5"
+# Private scratch folders for reading browser databases (MIT/Apache-2.0).
+tempfile = "3"
+# SQLite (MIT), bundled so no system library is needed on any machine.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# rusty-leveldb 4.0.2 (MIT, released 2026-10-18): pure-Rust LevelDB, reads/writes the classic Local Storage
+# store the way plyvel does in the reference. Pinned; vendored by cargo like the rest.
+rusty-leveldb = "=4.0.2"
+# ruzstd 0.9.1 (MIT, released 2026-10-11): pure-Rust zstd, reads the browser-compressed Local Storage values.
+ruzstd = "=0.9.1"
+
+
+[dev-dependencies]

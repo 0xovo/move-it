@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 5 Status home</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>5 Status home</b></div>
+  <div class="app" data-screen="home">
+    <section class="state" data-state="home" data-label="In sync">
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <span class="badge-ok"><i data-icon="check"></i>In sync</span>
+      <h1 class="title">Everything is in sync</h1>
+      <p class="sub">Last sync <span data-bind="lastSync">2 minutes ago</span></p>
+      <div class="chips">
+        <span class="chip"><i data-icon="laptop"></i>This laptop</span>
+        <span class="chip"><i data-icon="desktop"></i>Office PC</span>
+      </div>
+      <div class="actions"><button class="btn btn-quiet" data-action="undo" data-state="undone"><i data-icon="undo"></i>Undo last sync</button></div>
+    </section>
+    <section class="state" data-state="undone" data-label="After undo" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <h1 class="title">Back to how it was</h1>
+      <p class="sub">Your browsers are back to <span data-bind="undoPoint">8:42 PM</span>, before the last sync.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="ok" data-state="home">OK</button></div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/screens.js"></script>
+</body>
+</html>

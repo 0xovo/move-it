@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 2 Pairing</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>2 Pairing</b></div>
+  <div class="app" data-screen="pairing">
+    <section class="state" data-state="show" data-label="This device shows a code">
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 1 of 3"><i class="on"></i><i></i><i></i></span></div>
+      <h1 class="title at-top">Pair your other device</h1>
+      <p class="sub">Open Move It there and type this code.</p>
+      <div class="card pair-card">
+        <div class="code" data-bind="code">482 913</div>
+        <div class="qr" id="qr" aria-label="QR code"></div>
+        <div class="qr-cap">or scan it</div>
+      </div>
+      <div class="waiting"><span class="pulse"></span>Waiting for your other device</div>
+      <div class="spacer"></div>
+      <button class="link" data-action="have-code" data-state="enter">I already have a code</button>
+    </section>
+    <section class="state" data-state="enter" data-label="Other device types it" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 1 of 3"><i class="on"></i><i></i><i></i></span></div>
+      <h1 class="title at-top">Type the code from your other device</h1>
+      <input class="code-input" id="codeInput" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="000 000" aria-label="Pairing code">
+      <div class="hint">6 numbers</div>
+      <div class="spacer"></div>
+      <div class="actions"><button class="btn btn-primary" id="pairBtn" data-action="pair" data-state="success" disabled>Pair</button></div>
+      <button class="link" data-action="show-code" data-state="show">Show my code instead</button>
+    </section>
+    <section class="state" data-state="wrong" data-label="Code did not work" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 1 of 3"><i class="on"></i><i></i><i></i></span></div>
+      <h1 class="title at-top">That code did not work</h1>
+      <p class="sub">Check the code on your other device and type it once more.</p>
+      <input class="code-input" inputmode="numeric" autocomplete="off" maxlength="7" placeholder="000 000" aria-label="Pairing code">
+      <div class="spacer"></div>
+      <div class="actions"><button class="btn btn-primary" data-action="pair" data-state="success">Try again</button></div>
+    </section>
+    <section class="state" data-state="success" data-label="Paired" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 1 of 3"><i class="on"></i><i></i><i></i></span></div>
+      <div class="stage"><div class="confetti" aria-hidden="true"><i style="left:8%;background:#f2c94c;animation-delay:-0.2s;animation-duration:2.6s"></i><i style="left:18%;background:#f6f3ec;animation-delay:-1.1s;animation-duration:3.1s"></i><i style="left:29%;background:#eb8a5e;animation-delay:-0.6s;animation-duration:2.4s"></i><i style="left:41%;background:#7fc8a9;animation-delay:-1.8s;animation-duration:2.9s"></i><i style="left:52%;background:#f2c94c;animation-delay:-0.9s;animation-duration:2.2s"></i><i style="left:63%;background:#f6f3ec;animation-delay:-2.1s;animation-duration:3.3s"></i><i style="left:72%;background:#eb8a5e;animation-delay:-1.4s;animation-duration:2.7s"></i><i style="left:83%;background:#7fc8a9;animation-delay:-0.3s;animation-duration:3.0s"></i><i style="left:92%;background:#f2c94c;animation-delay:-1.6s;animation-duration:2.5s"></i></div><div class="lemur" data-lemur="show"></div></div>
+      <h1 class="title">Paired!</h1>
+      <p class="sub"><span data-bind="thisDevice">This laptop</span> and <span data-bind="otherDevice">Office PC</span> are a pair now.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="next" data-go="3-pipe.html">Next</button></div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/vendor/qrcode.js"></script>
+<script src="../style/screens.js"></script>
+<script>
+  // QR: qrcode-generator (MIT). stand-in, real payload comes from the app.
+  const qr = qrcode(0, "M"); qr.addData("moveit://pair/482913"); qr.make();
+  document.getElementById("qr").innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0, scalable: true });
+  // Code box: digits only, a space after three, Pair turns on at six.
+  const input = document.getElementById("codeInput"), pairBtn = document.getElementById("pairBtn");
+  input.addEventListener("input", () => {
+    const d = input.value.replace(/\D/g, "").slice(0, 6);
+    input.value = d.length > 3 ? d.slice(0, 3) + " " + d.slice(3) : d;
+    pairBtn.disabled = d.length !== 6;
+  });
+</script>
+</body>
+</html>

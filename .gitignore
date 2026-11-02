@@ -1,0 +1,6 @@
+design/tools/.venv/
+__pycache__/
+*.pyc
+*.webm
+.DS_Store
+target/

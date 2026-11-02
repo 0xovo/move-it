@@ -1,0 +1,41 @@
+{
+ "_bookmarks_b64": "eyJyb290cyI6IHsiYm9va21hcmtfYmFyIjogeyJjaGlsZHJlbiI6IFtdLCAibmFtZSI6ICJCYXIgw6kifX19",
+ "_ext_files": {
+  "IndexedDB/chrome-extension_aaaabbbbccccdddd_0.indexeddb.leveldb/CURRENT": "TUFOSUZFU1QtMDAwMDAxCg==",
+  "Local Extension Settings/aaaabbbbccccdddd/000003.log": "AAFsZXZlbGRiIGJ5dGVz/w=="
+ },
+ "bookmarks": {
+  "present": true,
+  "sha256": "826a5e4ebbedb661475784109c3e2aae1f0336724cf3f5028400d4812128e2c2",
+  "size": 63
+ },
+ "cookies": [],
+ "exported_at": "2026-11-02T00:00:00Z",
+ "ext_localstorage": [],
+ "extensions": {
+  "files": [
+   {
+    "path": "IndexedDB/chrome-extension_aaaabbbbccccdddd_0.indexeddb.leveldb/CURRENT",
+    "sha256": "0f1bad70c7bd1e0a69562853ec529355462fcd0423263a3d39d6d0d70b780443",
+    "size": 16
+   },
+   {
+    "path": "Local Extension Settings/aaaabbbbccccdddd/000003.log",
+    "sha256": "66d6cb48cb76e2d972630968434cfd6ae6af1c1c9d9f887d64ed77c4cc407e67",
+    "size": 16
+   }
+  ],
+  "folders": [],
+  "installed_ids": [
+   "aaaabbbbccccdddd"
+  ],
+  "total_bytes": 32
+ },
+ "history": {
+  "urls": [],
+  "visits": []
+ },
+ "origin": "fedora",
+ "passwords": [],
+ "v": 2
+}

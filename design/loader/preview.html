@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It loader preview</title>
+<style>
+  :root {
+    --bg: #111017; --panel: #1a1823; --line: #2b2836; --text: #ecebf2; --muted: #9a97a8;
+    --accent: #b9f27c; --stage: #16141e; --thumb: #24212f;
+    color-scheme: dark;
+  }
+  :root[data-theme="light"] {
+    --bg: #eeedf3; --panel: #ffffff; --line: #dcdae5; --text: #1d1b26; --muted: #6c6979;
+    --accent: #3d7a12; --stage: #e4e2ec; --thumb: #d9d6e3;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--muted); font-weight: 500; }
+  .sub { color: var(--muted); margin: 4px 0 22px; }
+  .seg { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
+  .seg button { border: 0; background: transparent; color: var(--muted); padding: 6px 14px; border-radius: 999px; font: inherit; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: var(--text); color: var(--bg); }
+  .stage { background: var(--stage); border: 1px solid var(--line); border-radius: 22px; padding: 34px 20px 26px; display: grid; place-items: center; }
+  .figure { width: min(260px, 60vw); }
+  :root[data-theme="light"] .moveit-loader { filter: drop-shadow(0 1px 1.5px rgba(30, 25, 60, .45)) drop-shadow(0 6px 14px rgba(30, 25, 60, .16)); }
+  .status { margin-top: 18px; font-size: 17px; font-weight: 600; min-height: 1.5em; }
+  .status small { color: var(--muted); font-weight: 500; margin-left: 8px; font-variant-numeric: tabular-nums; }
+  .controls { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 18px 20px; display: grid; gap: 16px; }
+  .row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .row label { color: var(--muted); min-width: 74px; }
+  input[type=range] { flex: 1; min-width: 180px; accent-color: var(--accent); height: 28px; }
+  .val { font-variant-numeric: tabular-nums; width: 46px; text-align: right; font-weight: 600; }
+  .btn { border: 1px solid var(--line); background: var(--bg); color: var(--text); padding: 9px 16px; border-radius: 12px; font: inherit; cursor: pointer; }
+  .btn.primary { background: var(--accent); color: #12200a; border-color: transparent; font-weight: 600; }
+  .btn[aria-pressed="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .spacer { flex: 1; }
+  h2 { font-size: 15px; margin: 34px 0 4px; }
+  .note { color: var(--muted); margin: 0 0 14px; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .pair { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 10px; }
+  .pair .imgs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .pair .imgs div { background: #1f1c29; border-radius: 8px; aspect-ratio: 240 / 300; display: grid; place-items: center; overflow: hidden; }
+  .pair img { width: 100%; height: 100%; object-fit: contain; }
+  .pair .name { display: flex; justify-content: space-between; font-size: 13px; margin-top: 8px; }
+  .pair .tag { color: var(--muted); }
+  .pair.live { border-color: var(--accent); }
+  .legend { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; color: var(--muted); text-align: center; margin-top: 4px; }
+  ol { color: var(--muted); padding-left: 20px; margin: 0; }
+  ol li { margin: 4px 0; }
+  code { font: 13px ui-monospace, monospace; color: var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Move It <span>loader preview</span></h1>
+    <div class="seg" id="theme">
+      <button aria-pressed="true" data-v="dark">Dark</button>
+      <button aria-pressed="false" data-v="light">Light</button>
+    </div>
+  </header>
+  <p class="sub">Style C poses (your pick). The white fill is the progress bar: it rises with real progress while the lemur keeps dancing. Your real frames swap in later.</p>
+
+  <div class="stage">
+    <div class="figure" id="figure"></div>
+    <div class="status" id="status">Moving <small>0%</small></div>
+  </div>
+
+  <div class="controls">
+    <div class="row">
+      <label for="prog">Progress</label>
+      <input type="range" id="prog" min="0" max="100" step="1" value="0">
+      <span class="val" id="val">0%</span>
+    </div>
+    <div class="row">
+      <button class="btn primary" id="play">Play a pretend sync</button>
+      <button class="btn" id="wait" aria-pressed="false">Waiting state</button>
+      <button class="btn" id="reset">Reset</button>
+      <span class="spacer"></span>
+      <span style="color:var(--muted)">Surface</span>
+      <div class="seg" id="surface">
+        <button aria-pressed="true" data-v="wave">Wave</button>
+        <button aria-pressed="false" data-v="flat">Flat</button>
+      </div>
+    </div>
+  </div>
+
+  <h2>Frame pairs</h2>
+  <p class="note">Every pose is two files drawn from one shape: the outline, and the mask the fill is clipped to. The highlighted pair is on screen now.</p>
+  <div class="strip" id="strip"></div>
+
+  <h2>Swapping in the real frames</h2>
+  <ol>
+    <li>Put each pose in <code>loader/frames/</code> as <code>name.outline.svg</code> and <code>name.mask.svg</code> (PNG with a clear background works too).</li>
+    <li>List the names in <code>loader/frames/manifest.js</code>: the dance order, the waiting poses, and the finale pose.</li>
+    <li>Keep every frame on the same canvas size with the feet on the same line, so the fill level matches across poses.</li>
+  </ol>
+</div>
+
+<script src="frames/manifest.js"></script>
+<script src="moveit-loader.js"></script>
+<script>
+(async function () {
+  const m = window.MOVEIT_FRAMES;
+  const $ = (id) => document.getElementById(id);
+  const loader = await MoveItLoader.create($("figure"), { frames: m, base: "frames/" });
+
+  // Frame strip
+  const cards = {};
+  for (const [name, f] of Object.entries(m.frames)) {
+    const tag = name === m.finale ? "finale" : (m.wait || []).includes(name) ? "waiting" : "dance";
+    const el = document.createElement("div");
+    el.className = "pair";
+    el.innerHTML = '<div class="imgs"><div><img alt="" src="frames/' + f.outline + '"></div><div><img alt="" src="frames/' + f.mask + '"></div></div>' +
+      '<div class="legend"><span>outline</span><span>mask</span></div>' +
+      '<div class="name"><span>' + name + '</span><span class="tag">' + tag + '</span></div>';
+    $("strip").appendChild(el);
+    cards[name] = el;
+  }
+
+  let waiting = false, playing = null;
+  function setProgress(p, fromSlider) {
+    loader.setProgress(p);
+    if (!fromSlider) $("prog").value = Math.round(p * 100);
+    $("val").textContent = Math.round(p * 100) + "%";
+  }
+  $("prog").addEventListener("input", (e) => { stopPlay(); setProgress(e.target.value / 100, true); });
+
+  // A pretend sync with uneven real-world pacing: quick start, stalls, bursts.
+  const script = [[0, 0], [700, .06], [1400, .14], [1900, .15], [3200, .38], [4400, .40], [4600, .41],
+                  [6200, .66], [6900, .67], [8300, .93], [9000, 1]];
+  function progressAt(t) {
+    for (let i = 1; i < script.length; i++) {
+      if (t <= script[i][0]) {
+        const [t0, p0] = script[i - 1], [t1, p1] = script[i];
+        return p0 + (p1 - p0) * (t - t0) / (t1 - t0);
+      }
+    }
+    return 1;
+  }
+  function stopPlay() { if (playing) { cancelAnimationFrame(playing); playing = null; } }
+  $("play").addEventListener("click", () => {
+    stopPlay();
+    setWaiting(false);
+    setProgress(0);
+    const start = performance.now();
+    const step = (now) => {
+      const p = progressAt(now - start);
+      setProgress(p);
+      playing = p < 1 ? requestAnimationFrame(step) : null;
+    };
+    playing = requestAnimationFrame(step);
+  });
+  $("reset").addEventListener("click", () => { stopPlay(); setWaiting(false); setProgress(0); });
+
+  function setWaiting(on) {
+    waiting = on;
+    loader.setMode(on ? "wait" : "dance");
+    $("wait").setAttribute("aria-pressed", String(on));
+  }
+  $("wait").addEventListener("click", () => { stopPlay(); setWaiting(!waiting); });
+
+  function seg(id, fn) {
+    $(id).addEventListener("click", (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      for (const x of $(id).children) x.setAttribute("aria-pressed", String(x === b));
+      fn(b.dataset.v);
+    });
+  }
+  seg("theme", (v) => { document.documentElement.dataset.theme = v; });
+  seg("surface", (v) => loader.setSurface(v));
+
+  // Status line and live frame highlight
+  let lastName = "";
+  (function ui() {
+    const name = loader.frameName;
+    if (name !== lastName) {
+      if (cards[lastName]) cards[lastName].classList.remove("live");
+      if (cards[name]) cards[name].classList.add("live");
+      lastName = name;
+    }
+    const pct = Math.round(loader.shownProgress * 100);
+    $("status").innerHTML = waiting ? "Waiting for Brave to close"
+      : pct >= 100 ? "All moved"
+      : "Moving <small>" + pct + "%</small>";
+    requestAnimationFrame(ui);
+  })();
+})();
+</script>
+</body>
+</html>

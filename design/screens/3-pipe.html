@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 3 Pipe picker</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>3 Pipe picker</b></div>
+  <div class="app" data-screen="pipe">
+    <section class="state" data-state="pick">
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 2 of 3"><i></i><i class="on"></i><i></i></span></div>
+      <h1 class="title at-top">Where should Move It keep your sealed box?</h1>
+      <p class="sub">Only your devices can open it.</p>
+      <div class="options" role="radiogroup">
+        <button class="option" role="radio" aria-checked="true" data-action="pick" data-pipe="Google Drive"><span class="tile"><i data-icon="google-drive-logo"></i></span><span class="label"><b>Google Drive</b><small class="found">Found on this computer</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick" data-pipe="Dropbox"><span class="tile"><i data-icon="dropbox-logo"></i></span><span class="label"><b>Dropbox</b><small>Sign in on the next step</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick" data-pipe="iCloud Drive"><span class="tile"><i data-icon="cloud"></i></span><span class="label"><b>iCloud Drive</b><small>Sign in on the next step</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick" data-pipe="Another folder"><span class="tile"><i data-icon="folder"></i></span><span class="label"><b>Another folder</b><small>Any folder that syncs</small></span><span class="dot"></span></button>
+        <div class="group-label">Advanced</div>
+        <button class="option small" role="radio" aria-checked="false" data-action="pick" data-pipe="A git repo"><span class="tile"><i data-icon="git"></i></span><span class="label"><b>A git repo</b><small>For people who use GitHub</small></span><span class="dot"></span></button>
+      </div>
+      <div class="spacer"></div>
+      <div class="actions"><button class="btn btn-primary" data-action="use-pipe" data-go="4-preview.html"><span>Use <span data-bind="pipe">Google Drive</span></span></button></div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/screens.js"></script>
+<script>
+  MoveIt.on("pick", (el) => {
+    document.querySelectorAll(".option").forEach((o) => o.setAttribute("aria-checked", String(o === el)));
+    MoveIt.bind({ pipe: el.dataset.pipe });
+  });
+</script>
+</body>
+</html>

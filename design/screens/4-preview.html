@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 4 First sync</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>4 First sync</b></div>
+  <div class="app" data-screen="preview">
+    <section class="state" data-state="ready" data-label="Ready">
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
+      <div class="stage short"><div class="lemur" data-lemur="dance" data-progress="0"></div></div>
+      <h1 class="title">Ready to move</h1>
+      <p class="sub">From <span data-bind="source">Brave on this laptop</span></p>
+      <div class="card rows">
+        <div class="row"><i data-icon="cookie"></i><b data-bind="logins">1,240</b><span>logins and cookies</span></div>
+        <div class="row"><i data-icon="puzzle"></i><b data-bind="extensions">38</b><span>extensions</span></div>
+        <div class="row"><i data-icon="bookmark"></i><b data-bind="bookmarks">214</b><span>bookmarks</span></div>
+        <div class="row"><i data-icon="history"></i><b data-bind="history">9,812</b><span>history items</span></div>
+      </div>
+      <div class="actions"><button class="btn btn-primary" data-action="move" data-state="moving">Move It</button></div>
+      <p class="note"><i data-icon="undo"></i>Nothing gets deleted. You can undo.</p>
+    </section>
+    <section class="state" data-state="moving" data-label="Moving" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
+      <div class="stage"><div class="lemur" data-lemur="dance"></div></div>
+      <h1 class="title">Moving your things</h1>
+      <p class="sub" data-bind="movingLine">Getting started</p>
+      <p class="note">Keep Brave closed for a moment.</p>
+    </section>
+    <section class="state" data-state="done" data-label="All moved" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <h1 class="title">All moved</h1>
+      <p class="sub"><span data-bind="target">Brave on Office PC</span> has everything now.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="done" data-go="5-home.html">Done</button></div>
+    </section>
+    <section class="state" data-state="thanks" data-label="First move: coffee" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <h1 class="title">All moved</h1>
+      <p class="sub"><span data-bind="target">Brave on Office PC</span> has everything now.</p>
+      <div class="actions"><button class="btn btn-primary" tabindex="-1">Done</button></div>
+      <div class="sheet-backdrop" data-action="not-now" data-state="done"></div>
+      <div class="sheet" role="dialog" aria-labelledby="thanksTitle">
+        <span class="sheet-icon"><i data-icon="coffee"></i></span>
+        <h2 class="sheet-title" id="thanksTitle">Glad that worked!</h2>
+        <p class="sheet-text">Move It is free. If it saved you some time, you can buy me a coffee.</p>
+        <button class="btn btn-primary" data-action="coffee"><i data-icon="coffee"></i>Buy me a coffee</button>
+        <div class="sheet-links">
+          <button class="link" data-action="not-now" data-state="done">Not now</button>
+          <button class="link with-icon" data-action="follow"><i data-icon="x"></i>Follow @0xovoo</button>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/screens.js"></script>
+<script>
+  // Mockup only: a pretend run with uneven pacing. real app feeds real numbers:
+  // MoveIt.lemur("moving").setProgress(done / total); MoveIt.bind({ movingLine: "640 of 1,240 logins and cookies" })
+  const total = 1240, plan = [[0, 0], [600, .05], [1500, .16], [2100, .17], [3600, .42], [4600, .44], [6400, .7], [7000, .71], [8600, .96], [9200, 1]];
+  const at = (t) => { for (let i = 1; i < plan.length; i++) if (t <= plan[i][0]) { const [a, p] = plan[i - 1], [b, q] = plan[i]; return p + (q - p) * (t - a) / (b - a); } return 1; };
+  let run = null;
+  MoveIt.onState((name) => {
+    if (run) cancelAnimationFrame(run);
+    const l = MoveIt.lemur("moving");
+    if (name !== "moving" || !l) return;
+    l.setProgress(0);
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = at(now - t0);
+      l.setProgress(p);
+      MoveIt.bind({ movingLine: Math.round(p * total).toLocaleString("en-US") + " of " + total.toLocaleString("en-US") + " logins and cookies" });
+      run = p < 1 ? requestAnimationFrame(step) : null;
+    };
+    run = requestAnimationFrame(step);
+    l.onDone = () => setTimeout(() => { if (document.querySelector(".app").dataset.state === "moving") MoveIt.setState("thanks"); }, 900);  // first finished move only; the app keeps a flag so it never shows again
+  });
+</script>
+</body>
+</html>
