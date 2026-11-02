@@ -133,6 +133,25 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Login>> {
     Ok(out)
 }
 
+/// Read a real profile's saved logins end to end: find its Login Data store, discover the
+/// browser's own password, and decrypt every row. This is the read a live probe runs
+/// against a profile a browser itself wrote, where no caller knows the password in
+/// advance. Linux only so far: other platforms refuse rather than guess.
+pub fn discover(profile_dir: &Path) -> Result<Vec<Login>> {
+    if crate::oscrypt::Platform::current() != crate::oscrypt::Platform::Linux {
+        return Err(Error::Refused(
+            "browser password discovery is implemented for Linux only so far".into(),
+        ));
+    }
+    let (password, from_libsecret_v2) = crate::oscrypt::linux_browser_password();
+    let keys = Keys::Cbc {
+        // The write label is irrelevant for reading: the decryptor accepts both.
+        lock: crate::oscrypt::Lock::linux(&password, LinuxPrefix::V10),
+        from_libsecret_v2,
+    };
+    export(&crate::paths::login_data(profile_dir), &keys)
+}
+
 /// The label Linux values are written with: a vote over the store's existing password blobs,
 /// taken before any row changes.
 fn resolve_write_prefix(con: &Connection, keys: &Keys) -> Result<Option<LinuxPrefix>> {

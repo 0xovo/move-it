@@ -25,6 +25,74 @@ const SALT: &[u8] = b"saltysalt";
 const IV: [u8; 16] = [b' '; 16];
 pub const LINUX_FALLBACK_PASSWORD: &str = "peanuts";
 
+/// The libsecret schema attribute Chromium stamps on its current Safe Storage items.
+pub const LIBSECRET_V2_SCHEMA: &str = "chrome_libsecret_os_crypt_password_v2";
+
+/// Environment variable that overrides Linux browser-password discovery (the reference
+/// engine's name, kept so existing setups behave the same).
+pub const LINUX_PASSWORD_ENV: &str = "BRAVESYNC_LINUX_PASSWORD";
+
+/// The `application` attributes Chromium browsers store their Safe Storage item under,
+/// in the order the reference engine tries them.
+const LINUX_BROWSER_APPS: [&str; 3] = ["brave", "chrome", "chromium"];
+
+/// Discover the Linux browser password, in the reference engine's order: the
+/// `BRAVESYNC_LINUX_PASSWORD` override, then the secret service, then the compiled-in
+/// fallback. Returns the password and whether it came from a libsecret v2 item (the
+/// provenance only matters when writing into an empty store). Never fails: a machine
+/// with no keyring at all still gets the fallback, exactly like Chromium itself.
+pub fn linux_browser_password() -> (String, bool) {
+    linux_browser_password_from(std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_tool_lookup)
+}
+
+/// The ordering logic of [`linux_browser_password`], with the environment value and the
+/// secret-service lookup injected so it can be tested without a keyring.
+fn linux_browser_password_from(
+    env: Option<String>,
+    lookup: &dyn Fn(&[(&str, &str)]) -> Option<String>,
+) -> (String, bool) {
+    if let Some(pw) = env {
+        if !pw.is_empty() {
+            return (pw, false);
+        }
+    }
+    // The v2-schema item first: it is the one a current browser actually uses, and its
+    // provenance decides the write label for an empty store.
+    for app in LINUX_BROWSER_APPS {
+        if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)]) {
+            return (pw, true);
+        }
+    }
+    for app in LINUX_BROWSER_APPS {
+        if let Some(pw) = lookup(&[("application", app)]) {
+            return (pw, false);
+        }
+    }
+    (LINUX_FALLBACK_PASSWORD.to_string(), false)
+}
+
+/// One `secret-tool lookup` (the libsecret command line), with a timeout so a locked
+/// keyring's prompt can never hang a sync. `None` on any failure: tool missing, no
+/// match, empty secret, or too slow.
+fn secret_tool_lookup(attrs: &[(&str, &str)]) -> Option<String> {
+    let mut cmd = std::process::Command::new("secret-tool");
+    cmd.arg("lookup");
+    for (k, v) in attrs {
+        cmd.arg(k).arg(v);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    let out = rx.recv_timeout(std::time::Duration::from_secs(5)).ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pw = String::from_utf8(out.stdout).ok()?.trim_end_matches('\n').to_string();
+    (!pw.is_empty()).then_some(pw)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Linux,
@@ -246,6 +314,44 @@ mod tests {
         let lock = Lock::linux("peanuts", LinuxPrefix::V10);
         let enc = lock.encrypt("example.com", "bare-password", HostTag::Without).unwrap();
         assert_eq!(lock.decrypt("example.com", &enc).unwrap(), "bare-password");
+    }
+
+    #[test]
+    fn discovery_order_env_then_v2_then_app_then_fallback() {
+        let none = |_: &[(&str, &str)]| None;
+        // Nothing anywhere: the compiled-in fallback, like Chromium itself.
+        assert_eq!(
+            linux_browser_password_from(None, &none),
+            (LINUX_FALLBACK_PASSWORD.to_string(), false)
+        );
+        // The environment override wins over the keyring and is not a v2 item.
+        let v2 = |_: &[(&str, &str)]| Some("from-keyring".to_string());
+        assert_eq!(
+            linux_browser_password_from(Some("from-env".to_string()), &v2),
+            ("from-env".to_string(), false)
+        );
+        // An empty override counts as unset (the reference treats "" as no override).
+        assert_eq!(
+            linux_browser_password_from(Some(String::new()), &v2),
+            ("from-keyring".to_string(), true)
+        );
+        // A schema-scoped hit is a v2 item; an application-only hit is not.
+        let app_only = |attrs: &[(&str, &str)]| {
+            (attrs.len() == 1).then(|| "app-pw".to_string())
+        };
+        assert_eq!(
+            linux_browser_password_from(None, &app_only),
+            ("app-pw".to_string(), false)
+        );
+        // Apps are tried in brave, chrome, chromium order.
+        let chrome_only = |attrs: &[(&str, &str)]| {
+            attrs.iter().any(|(k, v)| *k == "application" && *v == "chrome")
+                .then(|| "chrome-pw".to_string())
+        };
+        assert_eq!(
+            linux_browser_password_from(None, &chrome_only),
+            ("chrome-pw".to_string(), true)
+        );
     }
 
     #[test]

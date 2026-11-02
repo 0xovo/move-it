@@ -14,6 +14,11 @@
 //! keep-both rule and are not meant to converge.
 //!
 //! Usage: moveit-harness [--secs N] [--threads N] [--seed N]
+//!        moveit-harness probe-logins <profile-dir>
+//!
+//! The probe form skips the stress test: it reads one real profile's saved logins with
+//! browser-password discovery (logins::discover) and prints what it found, one line per
+//! login. That is the live check that the engine can read a profile a browser wrote.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -302,7 +307,38 @@ fn arg(name: &str, default: u64) -> u64 {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn probe_logins(dir: &str) -> ! {
+    match logins::discover(Path::new(dir)) {
+        Ok(found) => {
+            println!("probe-logins: profile={dir}");
+            println!("probe-logins: {} login(s) discovered", found.len());
+            for l in &found {
+                println!(
+                    "origin={} username={} password={}",
+                    l.origin_url, l.username_value, l.password_value
+                );
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            println!("probe-logins: profile={dir}");
+            println!("probe-logins: FAILED: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("probe-logins") {
+        match argv.get(2) {
+            Some(dir) => probe_logins(dir),
+            None => {
+                eprintln!("usage: moveit-harness probe-logins <profile-dir>");
+                std::process::exit(2);
+            }
+        }
+    }
     let secs = arg("--secs", 3600);
     let threads = arg("--threads", 14).max(1);
     let base_seed = arg("--seed", 0x5EED_u64.wrapping_mul(0x9E3779B97F4A7C15));
