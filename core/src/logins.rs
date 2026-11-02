@@ -313,7 +313,7 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
         }
 
         // Columns the payload does not model but the schema wants: what a freshly saved login has.
-        let row: [(&str, SqlValue); 21] = [
+        let row: [(&str, SqlValue); 22] = [
             ("origin_url", text(&l.origin_url)),
             ("action_url", text(&l.action_url)),
             ("username_value", text(&l.username_value)),
@@ -335,6 +335,9 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
             ("keychain_identifier", text("")),
             ("scheme", int(0)),
             ("version", int(0)),
+            // Current browsers (schema v43) require this one NOT NULL with no default;
+            // without it the insert fails against a real profile.
+            ("blacklisted_by_user", int(0)),
         ];
         let extra: [(&str, SqlValue); 2] = [("federation_url", text("")), ("generation_upload_status", int(0))];
         // Insert in the table's own column order.
@@ -389,6 +392,23 @@ mod tests {
         date_created_is_readonly INTEGER NOT NULL DEFAULT 0, possible_observer_handles BLOB);
         CREATE INDEX logins_signon ON logins (signon_realm);";
 
+    // A current browser's logins table (schema v43, read off a real profile): several
+    // columns the v35 table does not have, and blacklisted_by_user is NOT NULL with no
+    // default, so an insert that does not name it fails outright.
+    const SCHEMA_V43: &str = "CREATE TABLE meta (key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+        INSERT INTO meta (key, value) VALUES ('version', '43');
+        CREATE TABLE logins (origin_url VARCHAR NOT NULL, action_url VARCHAR, username_element VARCHAR, username_value VARCHAR,
+        password_element VARCHAR, password_value BLOB, submit_element VARCHAR, signon_realm VARCHAR NOT NULL,
+        date_created INTEGER NOT NULL, blacklisted_by_user INTEGER NOT NULL, scheme INTEGER NOT NULL,
+        password_type INTEGER, times_used INTEGER, form_data BLOB, display_name VARCHAR, icon_url VARCHAR,
+        federation_url VARCHAR, skip_zero_click INTEGER, generation_upload_status INTEGER,
+        possible_username_pairs BLOB, id INTEGER PRIMARY KEY AUTOINCREMENT, date_last_used INTEGER NOT NULL DEFAULT 0,
+        moving_blocked_for BLOB, date_password_modified INTEGER NOT NULL DEFAULT 0, sender_email VARCHAR,
+        sender_name VARCHAR, date_received INTEGER, sharing_notification_displayed INTEGER NOT NULL DEFAULT 0,
+        keychain_identifier BLOB, sender_profile_image_url VARCHAR, date_last_filled INTEGER NOT NULL DEFAULT 0,
+        actor_login_approved INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (origin_url, username_element, username_value, password_element, signon_realm));";
+
     const D1: i64 = 13350001000000000;
     const D2: i64 = 13350002000000000;
     const ORIGIN: &str = "https://mail.example.com/login";
@@ -432,6 +452,25 @@ mod tests {
 
     fn count(p: &Path) -> i64 {
         Connection::open(p).unwrap().query_row("SELECT count(*) FROM logins", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn import_into_a_current_v43_store() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("Login Data");
+        Connection::open(&p).unwrap().execute_batch(SCHEMA_V43).unwrap();
+        let stats = import(&p, &[login("u1", "pw1", D1)], &linux(), HostTag::Without).unwrap();
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(count(&p), 1);
+        let back = export(&p, &linux()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].username_value, "u1");
+        assert_eq!(back[0].password_value, "pw1");
+        let blacklisted: i64 = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT blacklisted_by_user FROM logins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(blacklisted, 0);
     }
 
     #[test]
