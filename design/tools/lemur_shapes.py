@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lemur figure shapes used by make_frames.py. Three styles. Writes loader/concepts/<id>.outline.svg + .mask.svg.
 
-Run: tools/.venv/bin/python tools/icon_concepts.py
+Run: tools/.venv/bin/python tools/lemur_shapes.py
 """
 import math
 from pathlib import Path

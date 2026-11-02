@@ -12,7 +12,7 @@ import json
 import math
 from pathlib import Path
 
-from icon_concepts import CONCEPTS, CHIBI, figure, path_d, svg, W, H, STROKE
+from lemur_shapes import CONCEPTS, CHIBI, figure, path_d, svg, W, H, STROKE
 
 STYLE = CONCEPTS["c"][0]
 OUT = Path(__file__).resolve().parent.parent / "loader" / "frames"

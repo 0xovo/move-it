@@ -90,6 +90,8 @@ Move It is free. If it saved you a weekend of logging back in, a coffee keeps it
 
 ## License
 
-Not picked yet. Private for now.
+[GPL-3.0](LICENSE). Use it, change it, share it. If you ship a changed version, you share its source too.
+
+The Move It name, the lemur and the logo are not covered by the license. Forks need their own name and art.
 
 <sub>Icons, including the coffee and X buttons, are Move It's own. Type: [Figtree](https://github.com/erikdkennedy/figtree) (OFL). Google Drive and Dropbox marks from [Phosphor](https://phosphoricons.com) (MIT). QR codes by [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (MIT).</sub>
