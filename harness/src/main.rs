@@ -15,6 +15,7 @@
 //!
 //! Usage: moveit-harness [--secs N] [--threads N] [--seed N]
 //!        moveit-harness probe-logins <browser> <profile-dir>
+//!        moveit-harness probe-cookies <browser> <profile-dir>
 //!
 //! The probe form skips the stress test: it reads one real profile's saved logins with
 //! browser-password discovery (logins::discover, scoped to that browser) and prints
@@ -329,8 +330,46 @@ fn probe_logins(browser: moveit_core::oscrypt::LinuxBrowser, dir: &str) -> ! {
     }
 }
 
+fn probe_cookies(browser: moveit_core::oscrypt::LinuxBrowser, dir: &str) -> ! {
+    let (password, from_libsecret_v2) = moveit_core::oscrypt::linux_browser_password_for(browser);
+    let keys = cookies::Keys::Cbc {
+        lock: Lock::linux(&password, LinuxPrefix::V10),
+        from_libsecret_v2,
+    };
+    match cookies::export(&moveit_core::paths::cookies(Path::new(dir)), &keys) {
+        Ok(found) => {
+            println!("probe-cookies: profile={dir}");
+            println!("probe-cookies: {} cookie(s) decrypted", found.len());
+            for c in found.iter().take(10) {
+                println!("host={} name={} value=<redacted>", c.host, c.name);
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            println!("probe-cookies: profile={dir}");
+            println!("probe-cookies: FAILED: {e:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("probe-cookies") {
+        match (argv.get(2), argv.get(3)) {
+            (Some(browser), Some(dir)) => match moveit_core::oscrypt::LinuxBrowser::from_name(browser) {
+                Some(b) => probe_cookies(b, dir),
+                None => {
+                    eprintln!("unknown browser {browser} (brave, chrome, chromium)");
+                    std::process::exit(2);
+                }
+            },
+            _ => {
+                eprintln!("usage: moveit-harness probe-cookies <browser> <profile-dir>");
+                std::process::exit(2);
+            }
+        }
+    }
     if argv.get(1).map(String::as_str) == Some("probe-logins") {
         match (argv.get(2), argv.get(3)) {
             (Some(browser), Some(dir)) => match moveit_core::oscrypt::LinuxBrowser::from_name(browser) {

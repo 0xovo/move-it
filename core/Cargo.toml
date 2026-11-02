@@ -37,3 +37,8 @@ ruzstd = "=0.9.1"
 
 
 [dev-dependencies]
+
+# secret-service 4 (MIT OR Apache-2.0): D-Bus Secret Service client, replaces
+# the secret-tool CLI so a missing tool can no longer silently fall back.
+[target."cfg(target_os = \"linux\")".dependencies]
+secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }

@@ -70,7 +70,7 @@ impl LinuxBrowser {
 /// provenance only matters when writing into an empty store). Never fails: a machine
 /// with no keyring at all still gets the fallback, exactly like Chromium itself.
 pub fn linux_browser_password_for(browser: LinuxBrowser) -> (String, bool) {
-    linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_tool_lookup)
+    linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_service_lookup)
 }
 
 /// The ordering logic of [`linux_browser_password_for`], with the browser, the
@@ -98,26 +98,46 @@ fn linux_browser_password_from(
     (LINUX_FALLBACK_PASSWORD.to_string(), false)
 }
 
-/// One `secret-tool lookup` (the libsecret command line), with a timeout so a locked
-/// keyring's prompt can never hang a sync. `None` on any failure: tool missing, no
-/// match, empty secret, or too slow.
-fn secret_tool_lookup(attrs: &[(&str, &str)]) -> Option<String> {
-    let mut cmd = std::process::Command::new("secret-tool");
-    cmd.arg("lookup");
-    for (k, v) in attrs {
-        cmd.arg(k).arg(v);
-    }
-    cmd.stdin(std::process::Stdio::null());
+/// One secret-service lookup over D-Bus, with a timeout so a locked
+/// keyring or a hung bus can never hang a sync. `None` on any failure:
+/// no bus, no match, locked item only, empty secret, or too slow.
+/// Locked items are never unlocked here: unlocking would prompt the
+/// user, which a background sync must not do. The lookup runs on a
+/// thread so the timeout also bounds a hung D-Bus call; unlike the old
+/// secret-tool child, there is no child process left running on timeout.
+#[cfg(target_os = "linux")]
+fn secret_service_lookup(attrs: &[(&str, &str)]) -> Option<String> {
+    let owned: Vec<(String, String)> = attrs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(cmd.output());
+        let _ = tx.send(secret_service_lookup_inner(&owned));
     });
-    let out = rx.recv_timeout(std::time::Duration::from_secs(5)).ok()?.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let pw = String::from_utf8(out.stdout).ok()?.trim_end_matches('\n').to_string();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).ok()?
+}
+
+#[cfg(target_os = "linux")]
+fn secret_service_lookup_inner(attrs: &[(String, String)]) -> Option<String> {
+    use secret_service::{blocking::SecretService, EncryptionType};
+    use std::collections::HashMap;
+    let ss = SecretService::connect(EncryptionType::Dh).ok()?;
+    let map: HashMap<&str, &str> = attrs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let found = ss.search_items(map).ok()?;
+    let item = found.unlocked.first()?;
+    let secret = item.get_secret().ok()?;
+    let pw = String::from_utf8(secret).ok()?.trim_end_matches(char::from(10)).to_string();
     (!pw.is_empty()).then_some(pw)
+}
+
+/// No Secret Service off Linux: discovery falls through to the fallback.
+#[cfg(not(target_os = "linux"))]
+fn secret_service_lookup(_attrs: &[(&str, &str)]) -> Option<String> {
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +433,17 @@ mod tests {
         assert_eq!(
             linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn secret_service_lookup_miss_returns_none() {
+        // A nonsense application matches nothing in any keyring, and a
+        // machine with no bus at all also returns None, never an error.
+        assert_eq!(
+            secret_service_lookup(&[("application", "moveit-no-such-app")]),
+            None
         );
     }
 
