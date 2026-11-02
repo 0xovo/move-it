@@ -14,10 +14,11 @@
 //! keep-both rule and are not meant to converge.
 //!
 //! Usage: moveit-harness [--secs N] [--threads N] [--seed N]
-//!        moveit-harness probe-logins <profile-dir>
+//!        moveit-harness probe-logins <browser> <profile-dir>
 //!
 //! The probe form skips the stress test: it reads one real profile's saved logins with
-//! browser-password discovery (logins::discover) and prints what it found, one line per
+//! browser-password discovery (logins::discover, scoped to that browser) and prints
+//! what it found, one line per
 //! login. That is the live check that the engine can read a profile a browser wrote.
 
 use std::path::Path;
@@ -307,8 +308,8 @@ fn arg(name: &str, default: u64) -> u64 {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn probe_logins(dir: &str) -> ! {
-    match logins::discover(Path::new(dir)) {
+fn probe_logins(browser: moveit_core::oscrypt::LinuxBrowser, dir: &str) -> ! {
+    match logins::discover(Path::new(dir), browser) {
         Ok(found) => {
             println!("probe-logins: profile={dir}");
             println!("probe-logins: {} login(s) discovered", found.len());
@@ -331,10 +332,16 @@ fn probe_logins(dir: &str) -> ! {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(String::as_str) == Some("probe-logins") {
-        match argv.get(2) {
-            Some(dir) => probe_logins(dir),
-            None => {
-                eprintln!("usage: moveit-harness probe-logins <profile-dir>");
+        match (argv.get(2), argv.get(3)) {
+            (Some(browser), Some(dir)) => match moveit_core::oscrypt::LinuxBrowser::from_name(browser) {
+                Some(b) => probe_logins(b, dir),
+                None => {
+                    eprintln!("unknown browser {browser} (brave, chrome, chromium)");
+                    std::process::exit(2);
+                }
+            },
+            _ => {
+                eprintln!("usage: moveit-harness probe-logins <browser> <profile-dir>");
                 std::process::exit(2);
             }
         }

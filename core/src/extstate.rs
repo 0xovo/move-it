@@ -1,8 +1,8 @@
 //! Extension state: which extensions a profile carries, and the per-extension folders that
 //! travel with them (the two settings stores and the per-extension IndexedDB units).
 //!
-//! Port of `installed_extension_ids` / `_collect_extension_state` / `_import_extension_state`
-//! in the reference engine. JSON shape of the `"extensions"` manifest is identical:
+//! Port of `installed_extension_ids` / `_collect_extension_state` / `_import_extension_state`.
+//! JSON shape of the `"extensions"` manifest is identical:
 //! `{installed_ids, folders, files: [{path, size, sha256}], total_bytes}`.
 //!
 //! Merge unit = one extension's state folder. Every (folder, id-or-unit) the box carries

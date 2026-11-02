@@ -1,6 +1,6 @@
 //! Saved-logins store: list what a browser has, and merge an incoming set into it.
 //!
-//! Payload fields match the reference engine's "passwords" list exactly (`origin_url,
+//! Payload fields are the "passwords" list (`origin_url,
 //! action_url, username_value, password_value, date_created, date_last_used, times_used,
 //! signon_realm`), so boxes stay compatible both ways.
 //!
@@ -22,7 +22,7 @@ use std::time::Duration;
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::cookies::{sql, table_columns, Keys};
+use crate::cookies::{missing_notnull_defaults, sql, table_columns, Keys};
 use crate::oscrypt::{linux_write_prefix, login_prefix_host, HostTag, LinuxPrefix};
 use crate::{Error, Result};
 
@@ -133,17 +133,20 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Login>> {
     Ok(out)
 }
 
-/// Read a real profile's saved logins end to end: find its Login Data store, discover the
-/// browser's own password, and decrypt every row. This is the read a live probe runs
-/// against a profile a browser itself wrote, where no caller knows the password in
-/// advance. Linux only so far: other platforms refuse rather than guess.
-pub fn discover(profile_dir: &Path) -> Result<Vec<Login>> {
+/// Read a real profile's saved logins end to end: find its Login Data store, discover
+/// that browser's own password, and decrypt every row. This is the read a live probe
+/// runs against a profile a browser itself wrote, where no caller knows the password
+/// in advance. The browser is the caller's to pass in: the profile dir alone does not
+/// say which browser wrote it, and guessing across browsers would hand one browser's
+/// password to another browser's profile. Linux only so far: other platforms refuse
+/// rather than guess.
+pub fn discover(profile_dir: &Path, browser: crate::oscrypt::LinuxBrowser) -> Result<Vec<Login>> {
     if crate::oscrypt::Platform::current() != crate::oscrypt::Platform::Linux {
         return Err(Error::Refused(
             "browser password discovery is implemented for Linux only so far".into(),
         ));
     }
-    let (password, from_libsecret_v2) = crate::oscrypt::linux_browser_password();
+    let (password, from_libsecret_v2) = crate::oscrypt::linux_browser_password_for(browser);
     let keys = Keys::Cbc {
         // The write label is irrelevant for reading: the decryptor accepts both.
         lock: crate::oscrypt::Lock::linux(&password, LinuxPrefix::V10),
@@ -341,10 +344,18 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
         ];
         let extra: [(&str, SqlValue); 2] = [("federation_url", text("")), ("generation_upload_status", int(0))];
         // Insert in the table's own column order.
-        let put: Vec<(&str, &SqlValue)> = cols
+        let mut put: Vec<(&str, &SqlValue)> = cols
             .iter()
             .filter_map(|c| row.iter().chain(extra.iter()).find(|(n, _)| n == c).map(|(n, v)| (*n, v)))
             .collect();
+        // Any NOT NULL column with no default that nothing above named yet
+        // (a column a newer browser schema added) gets a neutral value here,
+        // so the insert does not fail on the constraint.
+        let present: Vec<String> = put.iter().map(|(n, _)| n.to_string()).collect();
+        let fills = missing_notnull_defaults(&tx, "logins", &present)?;
+        let mut fill_refs: Vec<(&str, &SqlValue)> =
+            fills.iter().map(|(n, v)| (n.as_str(), v)).collect();
+        put.append(&mut fill_refs);
         let names = put.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ");
         let ph = (1..=put.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
         match tx.execute(
@@ -471,6 +482,31 @@ mod tests {
             .query_row("SELECT blacklisted_by_user FROM logins", [], |r| r.get(0))
             .unwrap();
         assert_eq!(blacklisted, 0);
+    }
+
+    #[test]
+    fn unknown_notnull_columns_get_neutral_values() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("Login Data");
+        let schema = SCHEMA_V43.replace(
+            "actor_login_approved INTEGER NOT NULL DEFAULT 0,",
+            "actor_login_approved INTEGER NOT NULL DEFAULT 0, \
+             future_flag INTEGER NOT NULL, future_note TEXT NOT NULL, future_blob BLOB NOT NULL,",
+        );
+        Connection::open(&p).unwrap().execute_batch(&schema).unwrap();
+        let stats = import(&p, &[login("u1", "pw1", D1)], &linux(), HostTag::Without).unwrap();
+        assert_eq!(stats.inserted, 1);
+        let (flag, note, blob): (i64, String, Vec<u8>) = Connection::open(&p)
+            .unwrap()
+            .query_row(
+                "SELECT future_flag, future_note, future_blob FROM logins WHERE username_value='u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(flag, 0);
+        assert_eq!(note, "");
+        assert!(blob.is_empty());
     }
 
     #[test]

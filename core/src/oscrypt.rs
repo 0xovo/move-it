@@ -28,26 +28,56 @@ pub const LINUX_FALLBACK_PASSWORD: &str = "peanuts";
 /// The libsecret schema attribute Chromium stamps on its current Safe Storage items.
 pub const LIBSECRET_V2_SCHEMA: &str = "chrome_libsecret_os_crypt_password_v2";
 
-/// Environment variable that overrides Linux browser-password discovery (the reference
-/// engine's name, kept so existing setups behave the same).
-pub const LINUX_PASSWORD_ENV: &str = "BRAVESYNC_LINUX_PASSWORD";
+/// Environment variable that overrides Linux browser-password discovery.
+pub const LINUX_PASSWORD_ENV: &str = "MOVEIT_LINUX_PASSWORD";
 
-/// The `application` attributes Chromium browsers store their Safe Storage item under,
-/// in the order the reference engine tries them.
-const LINUX_BROWSER_APPS: [&str; 3] = ["brave", "chrome", "chromium"];
+/// Which Chromium browser a Linux profile belongs to. The keyring item is looked
+/// up for this browser only, never for the other browsers on the same machine:
+/// on a machine with both Brave and Chrome, a Chrome profile must not pick up
+/// Brave's password (it would only fail as WrongBrowserPassword, after a
+/// wasted lookup, and a wrong-password attempt is never harmless).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxBrowser {
+    Brave,
+    Chrome,
+    Chromium,
+}
 
-/// Discover the Linux browser password, in the reference engine's order: the
-/// `BRAVESYNC_LINUX_PASSWORD` override, then the secret service, then the compiled-in
+impl LinuxBrowser {
+    /// The `application` attribute this browser stores its Safe Storage item under.
+    pub fn keyring_app(self) -> &'static str {
+        match self {
+            LinuxBrowser::Brave => "brave",
+            LinuxBrowser::Chrome => "chrome",
+            LinuxBrowser::Chromium => "chromium",
+        }
+    }
+
+    /// Parse a browser name as the caller spells it.
+    pub fn from_name(name: &str) -> Option<LinuxBrowser> {
+        match name {
+            "brave" => Some(LinuxBrowser::Brave),
+            "chrome" => Some(LinuxBrowser::Chrome),
+            "chromium" => Some(LinuxBrowser::Chromium),
+            _ => None,
+        }
+    }
+}
+
+/// Discover the Linux browser password for one browser: the
+/// `MOVEIT_LINUX_PASSWORD` override, then the secret service, then the compiled-in
 /// fallback. Returns the password and whether it came from a libsecret v2 item (the
 /// provenance only matters when writing into an empty store). Never fails: a machine
 /// with no keyring at all still gets the fallback, exactly like Chromium itself.
-pub fn linux_browser_password() -> (String, bool) {
-    linux_browser_password_from(std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_tool_lookup)
+pub fn linux_browser_password_for(browser: LinuxBrowser) -> (String, bool) {
+    linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_tool_lookup)
 }
 
-/// The ordering logic of [`linux_browser_password`], with the environment value and the
-/// secret-service lookup injected so it can be tested without a keyring.
+/// The ordering logic of [`linux_browser_password_for`], with the browser, the
+/// environment value and the secret-service lookup injected so it can be tested
+/// without a keyring.
 fn linux_browser_password_from(
+    browser: LinuxBrowser,
     env: Option<String>,
     lookup: &dyn Fn(&[(&str, &str)]) -> Option<String>,
 ) -> (String, bool) {
@@ -56,17 +86,14 @@ fn linux_browser_password_from(
             return (pw, false);
         }
     }
+    let app = browser.keyring_app();
     // The v2-schema item first: it is the one a current browser actually uses, and its
     // provenance decides the write label for an empty store.
-    for app in LINUX_BROWSER_APPS {
-        if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)]) {
-            return (pw, true);
-        }
+    if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)]) {
+        return (pw, true);
     }
-    for app in LINUX_BROWSER_APPS {
-        if let Some(pw) = lookup(&[("application", app)]) {
-            return (pw, false);
-        }
+    if let Some(pw) = lookup(&[("application", app)]) {
+        return (pw, false);
     }
     (LINUX_FALLBACK_PASSWORD.to_string(), false)
 }
@@ -321,18 +348,18 @@ mod tests {
         let none = |_: &[(&str, &str)]| None;
         // Nothing anywhere: the compiled-in fallback, like Chromium itself.
         assert_eq!(
-            linux_browser_password_from(None, &none),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &none),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
         // The environment override wins over the keyring and is not a v2 item.
         let v2 = |_: &[(&str, &str)]| Some("from-keyring".to_string());
         assert_eq!(
-            linux_browser_password_from(Some("from-env".to_string()), &v2),
+            linux_browser_password_from(LinuxBrowser::Brave, Some("from-env".to_string()), &v2),
             ("from-env".to_string(), false)
         );
-        // An empty override counts as unset (the reference treats "" as no override).
+        // An empty override counts as unset ("" means no override).
         assert_eq!(
-            linux_browser_password_from(Some(String::new()), &v2),
+            linux_browser_password_from(LinuxBrowser::Brave, Some(String::new()), &v2),
             ("from-keyring".to_string(), true)
         );
         // A schema-scoped hit is a v2 item; an application-only hit is not.
@@ -340,17 +367,52 @@ mod tests {
             (attrs.len() == 1).then(|| "app-pw".to_string())
         };
         assert_eq!(
-            linux_browser_password_from(None, &app_only),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &app_only),
             ("app-pw".to_string(), false)
         );
-        // Apps are tried in brave, chrome, chromium order.
+        // A Chrome item is found when Chrome is the browser asked for.
         let chrome_only = |attrs: &[(&str, &str)]| {
             attrs.iter().any(|(k, v)| *k == "application" && *v == "chrome")
                 .then(|| "chrome-pw".to_string())
         };
         assert_eq!(
-            linux_browser_password_from(None, &chrome_only),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &chrome_only),
             ("chrome-pw".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn discovery_is_scoped_to_the_browser_asked_for() {
+        // Both browsers have a keyring item; each lookup must return its own.
+        let both = |attrs: &[(&str, &str)]| {
+            attrs
+                .iter()
+                .find(|(k, _)| *k == "application")
+                .and_then(|(_, v)| match *v {
+                    "brave" => Some("brave-pw".to_string()),
+                    "chrome" => Some("chrome-pw".to_string()),
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            linux_browser_password_from(LinuxBrowser::Brave, None, &both),
+            ("brave-pw".to_string(), true)
+        );
+        assert_eq!(
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &both),
+            ("chrome-pw".to_string(), true)
+        );
+        // A Brave-only keyring must not serve a Chrome profile: it falls back
+        // rather than returning Brave's password for a Chrome profile.
+        let brave_only = |attrs: &[(&str, &str)]| {
+            attrs
+                .iter()
+                .any(|(k, v)| *k == "application" && *v == "brave")
+                .then(|| "brave-pw".to_string())
+        };
+        assert_eq!(
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only),
+            (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
     }
 

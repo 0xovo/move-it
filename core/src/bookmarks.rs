@@ -1,6 +1,6 @@
 //! Bookmarks store: the Bookmarks file is carried byte for byte, never interpreted.
 //!
-//! Manifest JSON matches the reference engine: `{"present": false}` or
+//! Manifest JSON is: `{"present": false}` or
 //! `{"present": true, "size": N, "sha256": "..."}`; the bytes travel separately in the box.
 //!
 //! Keep-both rule on import:

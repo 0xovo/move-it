@@ -1,6 +1,6 @@
 //! Cookies store: list what a browser has, and merge an incoming set into it.
 //!
-//! Payload fields match the reference engine (`host, name, path, value, expires_utc,
+//! Payload fields are (`host, name, path, value, expires_utc,
 //! creation_utc, last_access_utc, is_secure, is_httponly, samesite`), with two optional
 //! extras the reference ignores: `last_update_utc` and `top_frame_site_key`.
 //!
@@ -83,6 +83,68 @@ pub(crate) fn table_columns(con: &Connection, table: &str) -> Result<Vec<String>
     let mut st = con.prepare(&format!("PRAGMA table_info({table})")).map_err(sql)?;
     let rows = st.query_map([], |r| r.get::<_, String>(1)).map_err(sql)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+}
+
+/// One row of PRAGMA table_info: name, declared type, NOT NULL, has a default,
+/// and part of the primary key.
+pub(crate) struct ColumnInfo {
+    pub name: String,
+    pub type_name: String,
+    pub notnull: bool,
+    pub has_default: bool,
+    pub pk: bool,
+}
+
+pub(crate) fn table_info(con: &Connection, table: &str) -> Result<Vec<ColumnInfo>> {
+    let mut st = con.prepare(&format!("PRAGMA table_info({table})")).map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok(ColumnInfo {
+                name: r.get(1)?,
+                type_name: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                notnull: r.get::<_, i64>(3)? != 0,
+                has_default: !matches!(r.get_ref(4)?, rusqlite::types::ValueRef::Null),
+                pk: r.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(sql)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)
+}
+
+/// A neutral value for a declared column type, used only to satisfy a NOT NULL
+/// constraint on a column the engine does not model.
+fn fill_for_type(decl: &str) -> SqlValue {
+    let t = decl.to_ascii_uppercase();
+    if t.contains("INT") {
+        SqlValue::Integer(0)
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        SqlValue::Text(String::new())
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        SqlValue::Real(0.0)
+    } else if t.contains("BLOB") || t.is_empty() {
+        SqlValue::Blob(Vec::new())
+    } else {
+        SqlValue::Text(String::new())
+    }
+}
+
+/// Values for every column that is NOT NULL with no default, is not a primary
+/// key, and is not already in `present`. The next schema bump adds a column
+/// like that, imports keep working instead of failing on the constraint.
+/// Columns with a default are left out: SQLite fills those itself.
+pub(crate) fn missing_notnull_defaults(
+    con: &Connection,
+    table: &str,
+    present: &[String],
+) -> Result<Vec<(String, SqlValue)>> {
+    let mut out = Vec::new();
+    for col in table_info(con, table)? {
+        if col.pk || !col.notnull || col.has_default || present.iter().any(|n| n == &col.name) {
+            continue;
+        }
+        out.push((col.name.clone(), fill_for_type(&col.type_name)));
+    }
+    Ok(out)
 }
 
 /// What decrypts a cookie value on read / locks it on write, chosen per platform.
@@ -307,6 +369,13 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
                 }
             }
         }
+        // Any NOT NULL column with no default that nothing above named yet
+        // (a column a newer browser schema added) gets a neutral value here,
+        // so the insert does not fail on the constraint.
+        for (n, v) in missing_notnull_defaults(&tx, "cookies", &names)? {
+            names.push(n);
+            vals.push(v);
+        }
         let placeholders = (1..=names.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
         let stmt = format!("INSERT INTO cookies ({}) VALUES ({})", names.join(", "), placeholders);
         tx.execute(&stmt, params_from_iter(vals.iter())).map_err(sql)?;
@@ -479,6 +548,31 @@ mod tests {
         assert_eq!(kept7, 2, "priority preserved on the replaced row too");
         let got = export(&p, &keys()).unwrap();
         assert!(got.iter().any(|c| c.value == "new"), "the newer value landed");
+    }
+
+    #[test]
+    fn unknown_notnull_columns_get_neutral_values() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("Cookies");
+        let schema = SCHEMA.replace(
+            "source_type INTEGER NOT NULL DEFAULT 0, has_cross_site_ancestor INTEGER NOT NULL DEFAULT 1",
+            "source_type INTEGER NOT NULL DEFAULT 0, has_cross_site_ancestor INTEGER NOT NULL DEFAULT 1, \
+             future_flag INTEGER NOT NULL, future_note TEXT NOT NULL, future_blob BLOB NOT NULL",
+        );
+        Connection::open(&p).unwrap().execute_batch(&schema).unwrap();
+        let s = import(&p, &[cookie(".a.com", "sid", "hello", 100)], &keys()).unwrap();
+        assert_eq!(s.imported, 1);
+        let con = Connection::open(&p).unwrap();
+        let (flag, note, blob): (i64, String, Vec<u8>) = con
+            .query_row(
+                "SELECT future_flag, future_note, future_blob FROM cookies WHERE host_key='.a.com'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(flag, 0);
+        assert_eq!(note, "");
+        assert!(blob.is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! History store: list what a browser has visited, and merge an incoming set into it.
 //!
-//! Payload shape matches the reference engine: `{"urls": [...], "visits": [...]}`. Visits name
+//! Payload shape is: `{"urls": [...], "visits": [...]}`. Visits name
 //! their URL by string and their referrer by the referrer's `visit_time`; row ids never leave
 //! the database.
 //!
