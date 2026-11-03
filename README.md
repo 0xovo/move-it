@@ -1,16 +1,16 @@
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/img/lemur-dark.png">
-  <img src="docs/img/lemur-light.png" alt="The Move It lemur dancing while it fills up" width="230">
-</picture>
-<br>
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/img/wordmark-dark.png">
-  <img src="docs/img/wordmark-light.png" alt="Move It" width="300">
-</picture>
+<img src="docs/img/banner.png" alt="Move It — your whole browser, on every device." width="840">
 
-**Your whole browser, on every device.**
+<br><br>
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/macos-dark.png"><img src="docs/img/os/macos-light.png" alt="macOS" height="30"></picture>
+&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/windows-dark.png"><img src="docs/img/os/windows-light.png" alt="Windows" height="30"></picture>
+&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/linux-dark.png"><img src="docs/img/os/linux-light.png" alt="Linux" height="30"></picture>
+
+<br><br>
 
 <a href="https://ko-fi.com/0xovo" target="_blank"><img src="docs/img/btn-coffee.png" alt="Buy me a coffee on Ko-fi" height="46"></a>&nbsp;&nbsp;<a href="https://x.com/0xovoo" target="_blank"><img src="docs/img/btn-x.png" alt="Follow @0xovoo on X" height="46"></a>
 
@@ -46,14 +46,25 @@ It picks up your whole browser and sets it down on your other device. You stay l
 
 <img src="docs/img/icons/undo.svg" width="22" align="absmiddle" alt=""> &nbsp;Nothing gets deleted. Move It backs up before every change, and one button undoes the last sync.
 
-## Two ways to use it
+## Ways to use it
 
 <table>
 <tr>
-<td width="50%"><img src="docs/img/icons/move.svg" width="44" alt=""><br><b>Move once</b><br>New laptop, new browser, Brave to Chrome, Linux to Windows. Everything comes over in one go.</td>
-<td width="50%"><img src="docs/img/icons/sync.svg" width="44" alt=""><br><b>Keep in sync</b><br>Runs quietly when you sign in and out, so every machine is simply the same browser.</td>
+<td width="33%"><img src="docs/img/icons/move.svg" width="44" alt=""><br><b>Move once</b><br>New laptop, new machine, Linux to Windows. Pair the two and everything comes over in one go.</td>
+<td width="33%"><img src="docs/img/icons/sync.svg" width="44" alt=""><br><b>Keep in sync</b><br>Runs quietly when you sign in and out, so every machine is simply the same browser.</td>
+<td width="33%"><img src="docs/img/icons/swap.svg" width="44" alt=""><br><b>Switch browsers</b><br>Already on the machine you want? Move straight from one browser to another, Brave to Chrome, no pairing.</td>
 </tr>
 </table>
+
+## See it move
+
+<p align="center">
+<img src="docs/img/screens/welcome.png" width="30%" alt="Welcome: your whole browser, on every device">
+&nbsp;
+<img src="docs/img/screens/moving.png" width="30%" alt="Moving: the lemur fills up as your things move">
+&nbsp;
+<img src="docs/img/screens/done.png" width="30%" alt="Done: everything landed on the other browser">
+</p>
 
 ## Browsers
 
