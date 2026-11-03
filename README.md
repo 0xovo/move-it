@@ -1,14 +1,6 @@
 <div align="center">
 
-<img src="docs/img/banner.png" alt="Move It — your whole browser, on every device." width="840">
-
-<br><br>
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/macos-dark.png"><img src="docs/img/os/macos-light.png" alt="macOS" height="30"></picture>
-&nbsp;
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/windows-dark.png"><img src="docs/img/os/windows-light.png" alt="Windows" height="30"></picture>
-&nbsp;
-<picture><source media="(prefers-color-scheme: dark)" srcset="docs/img/os/linux-dark.png"><img src="docs/img/os/linux-light.png" alt="Linux" height="30"></picture>
+<img src="docs/img/banner.png" alt="Move It — your whole browser, on every device. Available on macOS, Windows and Linux." width="840">
 
 <br><br>
 
