@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/banner.png" alt="Move It — your whole browser, on every device. Available on macOS, Windows and Linux." width="840">
+<img src="docs/img/banner.gif" alt="Move It — your whole browser, on every device. Available on macOS, Windows and Linux." width="840">
 
 <br><br>
 
