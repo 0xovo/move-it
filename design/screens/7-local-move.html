@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 7 Move on this device</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>7 Move on this device</b></div>
+  <div class="app" data-screen="local-move">
+    <section class="state" data-state="pick" data-label="Pick">
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <h1 class="title">Move on this device</h1>
+      <p class="sub">From one browser to another. Everything stays here.</p>
+      <div class="group-label">From</div>
+      <div class="options" role="radiogroup" aria-label="From">
+        <button class="option" role="radio" aria-checked="true" data-action="pick-source" data-browser="Brave"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Brave</b><small class="found">On this device</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick-source" data-browser="Chrome"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Chrome</b><small class="found">On this device</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick-source" data-browser="Chromium"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Chromium</b><small class="found">On this device</small></span><span class="dot"></span></button>
+      </div>
+      <div class="group-label">To</div>
+      <div class="options" role="radiogroup" aria-label="To">
+        <button class="option" role="radio" aria-checked="false" data-action="pick-target" data-browser="Brave" hidden><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Brave</b><small class="found">On this device</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="true" data-action="pick-target" data-browser="Chrome"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Chrome</b><small class="found">On this device</small></span><span class="dot"></span></button>
+        <button class="option" role="radio" aria-checked="false" data-action="pick-target" data-browser="Chromium"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Chromium</b><small class="found">On this device</small></span><span class="dot"></span></button>
+      </div>
+      <div class="spacer"></div>
+      <div class="actions"><button class="btn btn-primary" data-action="continue" data-state="preview">Continue</button></div>
+    </section>
+    <section class="state" data-state="preview" data-label="Preview" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <h1 class="title at-top">Ready to move</h1>
+      <p class="sub">From <span data-bind="source">Brave</span> to <span data-bind="target">Chrome</span>, on this device</p>
+      <div class="card rows">
+        <div class="row"><i data-icon="cookie"></i><b data-bind="logins">1,240</b><span>logins and cookies</span></div>
+        <div class="row"><i data-icon="password"></i><b data-bind="passwords">312</b><span>passwords</span></div>
+        <div class="row"><i data-icon="puzzle"></i><b data-bind="extensions">38</b><span>extensions</span></div>
+        <div class="row"><i data-icon="bookmark"></i><b data-bind="bookmarks">214</b><span>bookmarks</span></div>
+        <div class="row"><i data-icon="history"></i><b data-bind="history">9,812</b><span>history items</span></div>
+      </div>
+      <div class="group-label">Cannot move</div>
+      <div class="card rows">
+        <div class="row"><i data-icon="browser"></i><b data-bind="source">Brave</b><span><span data-bind="skippedCookies">26</span> cookies stay locked and cannot move</span></div>
+      </div>
+      <div class="spacer"></div>
+      <div class="actions"><button class="btn btn-primary" data-action="move" data-state="moving">Move It</button></div>
+      <p class="note"><i data-icon="undo"></i>Nothing gets deleted. You can undo.</p>
+    </section>
+    <section class="state" data-state="moving" data-label="Moving" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="dance"></div></div>
+      <h1 class="title">Moving your things</h1>
+      <p class="sub" data-bind="movingLine">Getting started</p>
+      <p class="note">Keep both browsers closed for a moment.</p>
+    </section>
+    <section class="state" data-state="done" data-label="All moved" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <h1 class="title">All moved</h1>
+      <p class="sub"><span data-bind="target">Chrome</span> has everything now.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="done" data-go="5-home.html">Done</button></div>
+    </section>
+    <section class="state" data-state="blocked" data-label="Browser open" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="wait"></div></div>
+      <h1 class="title">Close <span data-bind="browser">Chrome</span> and tap again</h1>
+      <p class="sub">Move It can only move your things while both browsers are closed.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="retry">Try again</button></div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/screens.js"></script>
+<script>
+  // Mockup only: picking a source hides it in the To list (a browser cannot move into itself)
+  // and binds the names the later states show.
+  function pick(group, el, other) {
+    group.querySelectorAll(".option").forEach((o) => o.setAttribute("aria-checked", String(o === el)));
+    other.querySelectorAll(".option").forEach((o) => { o.hidden = o.dataset.browser === el.dataset.browser; });
+    const checked = other.querySelector(".option[aria-checked=\"true\"]");
+    if (!checked || checked.hidden) {
+      const first = other.querySelector(".option:not([hidden])");
+      other.querySelectorAll(".option").forEach((o) => o.setAttribute("aria-checked", String(o === first)));
+    }
+  }
+  const groups = document.querySelectorAll(".options");
+  MoveIt.on("pick-source", (el) => { pick(groups[0], el, groups[1]); MoveIt.bind({ source: el.dataset.browser }); });
+  MoveIt.on("pick-target", (el) => { pick(groups[1], el, groups[0]); MoveIt.bind({ target: el.dataset.browser }); });
+</script>
+<script>
+  // Mockup only: a pretend run with uneven pacing, same as screen 4. The real app feeds
+  // real numbers: MoveIt.lemur("moving").setProgress(done / total).
+  const total = 1240, plan = [[0, 0], [600, .05], [1500, .16], [2100, .17], [3600, .42], [4600, .44], [6400, .7], [7000, .71], [8600, .96], [9200, 1]];
+  const at = (t) => { for (let i = 1; i < plan.length; i++) if (t <= plan[i][0]) { const [a, p] = plan[i - 1], [b, q] = plan[i]; return p + (q - p) * (t - a) / (b - a); } return 1; };
+  let run = null;
+  MoveIt.onState((name) => {
+    if (run) cancelAnimationFrame(run);
+    const l = MoveIt.lemur("moving");
+    if (name !== "moving" || !l) return;
+    l.setProgress(0);
+    const t0 = performance.now();
+    const step = (now) => {
+      const p = at(now - t0);
+      l.setProgress(p);
+      MoveIt.bind({ movingLine: Math.round(p * total).toLocaleString("en-US") + " of " + total.toLocaleString("en-US") + " logins and cookies" });
+      run = p < 1 ? requestAnimationFrame(step) : null;
+    };
+    run = requestAnimationFrame(step);
+    l.onDone = () => setTimeout(() => { if (document.querySelector(".app").dataset.state === "moving") MoveIt.setState("done"); }, 900);
+  });
+</script>
+</body>
+</html>
