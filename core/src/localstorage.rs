@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cookies::sql;
-use crate::extstate::extension_id_candidates;
+use crate::extstate::extension_id_candidates_in;
 use crate::{Error, Result};
 
 const CHROME_EPOCH_OFFSET_US: i64 = 11_644_473_600_000_000;
@@ -67,11 +67,19 @@ pub struct Report {
 }
 
 pub fn sqlite_path(profile: &Path) -> PathBuf {
-    profile.join("Default").join("LocalStorage")
+    sqlite_path_in(profile, "Default")
+}
+
+pub fn sqlite_path_in(profile: &Path, slot: &str) -> PathBuf {
+    profile.join(slot).join("LocalStorage")
 }
 
 pub fn leveldb_path(profile: &Path) -> PathBuf {
-    profile.join("Default").join("Local Storage").join("leveldb")
+    leveldb_path_in(profile, "Default")
+}
+
+pub fn leveldb_path_in(profile: &Path, slot: &str) -> PathBuf {
+    profile.join(slot).join("Local Storage").join("leveldb")
 }
 
 /// Now as a Chromium timestamp: microseconds since 1601-01-01.
@@ -111,11 +119,16 @@ fn probe(p: &Path) -> Result<Found> {
 
 /// The store that exists in this profile and its shape, if any. SQLite wins over LevelDB.
 pub fn store(profile: &Path) -> Result<Option<(Shape, PathBuf)>> {
-    let sq = sqlite_path(profile);
+    store_in(profile, "Default")
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn store_in(profile: &Path, slot: &str) -> Result<Option<(Shape, PathBuf)>> {
+    let sq = sqlite_path_in(profile, slot);
     if probe(&sq)? == Found::File {
         return Ok(Some((Shape::Sqlite, sq)));
     }
-    let ld = leveldb_path(profile);
+    let ld = leveldb_path_in(profile, slot);
     if probe(&ld)? == Found::Dir {
         return Ok(Some((Shape::Leveldb, ld)));
     }
@@ -125,6 +138,11 @@ pub fn store(profile: &Path) -> Result<Option<(Shape, PathBuf)>> {
 /// Path to hand to `Txn::begin` before [`import`].
 pub fn store_path(profile: &Path) -> Result<Option<PathBuf>> {
     Ok(store(profile)?.map(|(_, p)| p))
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn store_path_in(profile: &Path, slot: &str) -> Result<Option<PathBuf>> {
+    Ok(store_in(profile, slot)?.map(|(_, p)| p))
 }
 
 // ---- string blobs ----------------------------------------------------------------------
@@ -442,11 +460,16 @@ fn read_leveldb(dir: &Path, ext_ids: &[String]) -> Result<Vec<Triple>> {
 /// with no store (or no extension state) exports an empty list; a store that exists but cannot
 /// be parsed fails closed.
 pub fn export(profile: &Path) -> Result<Vec<Triple>> {
-    let ids = extension_id_candidates(profile)?;
+    export_in(profile, "Default")
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn export_in(profile: &Path, slot: &str) -> Result<Vec<Triple>> {
+    let ids = extension_id_candidates_in(profile, slot)?;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut entries = match store(profile)? {
+    let mut entries = match store_in(profile, slot)? {
         Some((Shape::Sqlite, p)) => read_sqlite(&p, &ids)?,
         Some((Shape::Leveldb, p)) => read_leveldb(&p, &ids)?,
         None => return Ok(Vec::new()),
@@ -621,11 +644,16 @@ fn import_leveldb(dir: &Path, section: &[Triple], now: i64, report: &mut Report)
 /// `now` is the Chromium-microsecond stamp written into the touched records; passing it in
 /// keeps the merge deterministic. A locked store is `Error::BrowserOpen` with nothing changed.
 pub fn import(profile: &Path, section: &[Triple], now: i64) -> Result<Report> {
+    import_in(profile, "Default", section, now)
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn import_in(profile: &Path, slot: &str, section: &[Triple], now: i64) -> Result<Report> {
     let mut report = Report::default();
     if section.is_empty() {
         return Ok(report);
     }
-    match store(profile)? {
+    match store_in(profile, slot)? {
         Some((Shape::Sqlite, p)) => {
             report.shape = Some(Shape::Sqlite);
             report.present = true;

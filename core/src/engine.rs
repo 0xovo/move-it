@@ -2,22 +2,29 @@
 //! profile. Every write is wrapped in the atomic journal (txn.rs), so a box is applied whole or
 //! not at all, across all the stores at once.
 //!
+//! [`import_many`] is the multi-profile form: several boxes landing in one browser folder in a
+//! single journal, including boxes routed here from another browser. A routed box lands in a
+//! brand-new profile slot, created and registered in the browser's own `Local State` inside
+//! the same journal, so undo takes the registration back out with everything else.
+//!
 //! Finding the browser's own password is deliberately NOT here: the caller passes [`cookies::Keys`]
 //! and the Linux/Mac/Windows password discovery lives above this (and, for now, in the Python
 //! reference). Everything else, the actual moving of a person's browser life, is here.
 
+use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
 use crate::cookies::{self, Cookie, Keys};
 use crate::oscrypt::HostTag;
 use crate::sealed::{Payload, BUNDLE_VERSION_2};
-use crate::{bookmarks, extstate, history, localstorage, logins, paths, txn};
+use crate::{bookmarks, extstate, history, localstorage, logins, paths, profiles, txn};
 use crate::{Error, Result};
 
-/// A profile on this machine.
+/// A profile on this machine: a browser folder (`dir`) and the slot inside it.
 pub struct Profile<'a> {
     pub dir: &'a std::path::Path,
+    pub slot: &'a str,
     pub keys: &'a Keys,
     /// Logins: whether to write SHA256(host) in front (see oscrypt). Default: Without.
     pub login_tag: HostTag,
@@ -25,18 +32,19 @@ pub struct Profile<'a> {
 
 /// Read everything movable out of a profile and build a v2 payload.
 pub fn export(p: &Profile, origin: &str) -> Result<Payload> {
-    let cookies = cookies::export(&paths::cookies(p.dir), p.keys)?;
-    let logins = logins::export(&paths::login_data(p.dir), p.keys)?;
-    let hist = history::export(&paths::history(p.dir))?;
-    let (bm_manifest, bm_bytes) = bookmarks::export(&paths::bookmarks(p.dir))?;
-    let ext = extstate::collect(p.dir)?;
-    let ls = localstorage::export(p.dir)?;
+    let cookies = cookies::export(&paths::cookies_in(p.dir, p.slot), p.keys)?;
+    let (logins, skipped_logins) = logins::export_counted(&paths::login_data_in(p.dir, p.slot), p.keys)?;
+    let hist = history::export(&paths::history_in(p.dir, p.slot))?;
+    let (bm_manifest, bm_bytes) = bookmarks::export(&paths::bookmarks_in(p.dir, p.slot))?;
+    let ext = extstate::collect_in(p.dir, p.slot)?;
+    let ls = localstorage::export_in(p.dir, p.slot)?;
 
     let mut m = Map::new();
     m.insert("v".into(), BUNDLE_VERSION_2.into());
     m.insert("origin".into(), origin.into());
     m.insert("cookies".into(), serde_json::to_value(&cookies).map_err(ser)?);
     m.insert("passwords".into(), serde_json::to_value(&logins).map_err(ser)?);
+    m.insert("skipped_logins".into(), skipped_logins.into());
     m.insert("history".into(), serde_json::to_value(&hist).map_err(ser)?);
     m.insert("bookmarks".into(), serde_json::to_value(&bm_manifest).map_err(ser)?);
     // The extensions manifest object is built by extstate; carry it through as-is.
@@ -57,6 +65,73 @@ pub struct Applied {
     pub localstorage: localstorage::Report,
 }
 
+/// One payload's sections, decoded before anything on disk is touched.
+struct Decoded<'a> {
+    cookies: Vec<Cookie>,
+    logins: Vec<logins::Login>,
+    history: history::Section,
+    localstorage: Vec<localstorage::Triple>,
+    bm_manifest: bookmarks::Manifest,
+    ext_manifest: Value,
+    payload: &'a Payload,
+}
+
+fn decode(payload: &Payload) -> Result<Decoded<'_>> {
+    let m = &payload.manifest;
+    Ok(Decoded {
+        cookies: from_section(m, "cookies")?,
+        logins: from_section(m, "passwords")?,
+        history: m.get("history").map(section).transpose()?.unwrap_or_default(),
+        localstorage: match m.get("ext_localstorage") {
+            Some(v) => localstorage::parse_section(v)?,
+            None => Vec::new(),
+        },
+        bm_manifest: m.get("bookmarks").map(section).transpose()?.unwrap_or_default(),
+        ext_manifest: m.get("extensions").cloned().unwrap_or_else(|| Value::Object(Map::new())),
+        payload,
+    })
+}
+
+/// Apply one decoded box to one slot whose stores are already snapshotted (and, for a
+/// slot the caller just created, already planted empty).
+fn apply_one(
+    root: &std::path::Path,
+    slot: &str,
+    d: &Decoded,
+    keys: &Keys,
+    login_tag: HostTag,
+    now_us: i64,
+) -> Result<Applied> {
+    let cookies_p = paths::cookies_in(root, slot);
+    let history_p = paths::history_in(root, slot);
+    let logins_p = paths::login_data_in(root, slot);
+    let bookmarks_p = paths::bookmarks_in(root, slot);
+    let mut a = Applied::default();
+    // Missing cookie/login stores on a slot the engine just created are
+    // planted by the caller. An existing never-launched profile must not
+    // be planted into: refuse. A partial profile (one store already there)
+    // still gets the other empty store so a section is not silently dropped.
+    if (!cookies_p.exists() && !d.cookies.is_empty()) || (!logins_p.exists() && !d.logins.is_empty()) {
+        if paths::never_launched(root, slot) {
+            return Err(Error::NeverLaunched {
+                browser: "the browser".into(),
+            });
+        }
+        profiles::create_empty_stores(&paths::slot_dir(root, slot))?;
+    }
+    if cookies_p.exists() {
+        a.cookies = cookies::import(&cookies_p, &d.cookies, keys)?;
+    }
+    if logins_p.exists() {
+        a.logins = logins::import(&logins_p, &d.logins, keys, login_tag)?;
+    }
+    a.history = history::import(&history_p, &d.history)?;
+    a.bookmarks = bookmarks::import(&bookmarks_p, &d.bm_manifest, d.payload.bookmarks.as_deref())?;
+    a.extensions = extstate::import_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?;
+    a.localstorage = localstorage::import_in(root, slot, &d.localstorage, now_us)?;
+    Ok(a)
+}
+
 /// Write a box into a profile, all stores at once, all-or-nothing.
 pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied> {
     let m = &box_payload.manifest;
@@ -74,14 +149,14 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
     let ext_manifest = m.get("extensions").unwrap_or(&empty);
 
     // Every store the box would touch, snapshotted together.
-    let cookies_p = paths::cookies(p.dir);
-    let history_p = paths::history(p.dir);
-    let logins_p = paths::login_data(p.dir);
-    let bookmarks_p = paths::bookmarks(p.dir);
-    let ls_p = localstorage::store_path(p.dir)?;
-    let ext_dirs = extstate::target_dirs(p.dir, ext_manifest, &box_payload.ext_files)?;
+    let cookies_p = paths::cookies_in(p.dir, p.slot);
+    let history_p = paths::history_in(p.dir, p.slot);
+    let logins_p = paths::login_data_in(p.dir, p.slot);
+    let bookmarks_p = paths::bookmarks_in(p.dir, p.slot);
+    let ls_p = localstorage::store_path_in(p.dir, p.slot)?;
+    let ext_dirs = extstate::target_dirs_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
 
-    let mut stores: Vec<(String, std::path::PathBuf)> = vec![
+    let mut stores: Vec<(String, PathBuf)> = vec![
         ("cookies".into(), cookies_p.clone()),
         ("history".into(), history_p.clone()),
         ("logins".into(), logins_p.clone()),
@@ -99,6 +174,18 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
     // From here any `?` drops `tx`, which rolls every store back.
     let applied = (|| -> Result<Applied> {
         let mut a = Applied::default();
+        // Missing cookie/login stores on a slot the engine just created are
+        // planted by the caller. An existing never-launched profile must not
+        // be planted into: refuse. A partial profile (one store already there)
+        // still gets the other empty store so a section is not silently dropped.
+        if (!cookies_p.exists() && !cookies_in.is_empty()) || (!logins_p.exists() && !logins_in.is_empty()) {
+            if paths::never_launched(p.dir, p.slot) {
+                return Err(Error::NeverLaunched {
+                    browser: "the browser".into(),
+                });
+            }
+            profiles::create_empty_stores(&paths::slot_dir(p.dir, p.slot))?;
+        }
         if cookies_p.exists() {
             a.cookies = cookies::import(&cookies_p, &cookies_in, p.keys)?;
         }
@@ -107,13 +194,244 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
         }
         a.history = history::import(&history_p, &hist_in)?;
         a.bookmarks = bookmarks::import(&bookmarks_p, &bm_manifest, box_payload.bookmarks.as_deref())?;
-        a.extensions = extstate::import(p.dir, ext_manifest, &box_payload.ext_files)?;
-        a.localstorage = localstorage::import(p.dir, &ls_in, now_us)?;
+        a.extensions = extstate::import_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
+        a.localstorage = localstorage::import_in(p.dir, p.slot, &ls_in, now_us)?;
         Ok(a)
     })();
     match applied {
         Ok(a) => {
             tx.commit()?;
+            Ok(a)
+        }
+        Err(e) => {
+            tx.rollback()?;
+            Err(e)
+        }
+    }
+}
+
+/// Where one box should land inside one browser folder.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {    /// The profile with this folder name. Merged into when it is there; created and
+    /// registered when it is not (the box's own profile, arriving on a device that
+    /// does not have it yet).
+    Slot(String),
+    /// A brand-new profile, folder name chosen by the engine. This is where a box
+    /// routed from another browser lands: always its own fresh profile, never over
+    /// a profile the person already has.
+    Fresh { display: String },
+}
+
+/// One box to land in [`import_many`].
+#[derive(Clone)]
+pub struct Job<'a> {
+    pub target: Target,
+    pub payload: &'a Payload,
+}
+
+/// What [`import_many`] did for one job.
+#[derive(Debug)]
+pub struct Landed {
+    /// The folder name the box landed in.
+    pub slot: String,
+    /// True when this move created the profile.
+    pub created: bool,
+    pub applied: Applied,
+}
+
+/// The file a routed landing carries inside its profile folder, naming the
+/// source profile it was created for (`origin`, `browser`, `slot` from the
+/// box's manifest). The app surface checks it before merging a later delivery
+/// into that profile.
+pub const LANDING_MARKER: &str = ".moveit-landing";
+
+/// Land several boxes in one browser folder under ONE journal: either every box is
+/// in and the folder has one undo point for the whole move, or the folder is exactly
+/// as it was. Creating a profile (its folder, its Preferences, its empty stores and
+/// its `Local State` registration) happens inside the same journal, so undo and
+/// crash recovery take a created profile back out whole.
+pub fn import_many(
+    root: &std::path::Path,
+    keys: &Keys,
+    login_tag: HostTag,
+    jobs: &[Job],
+    now_us: i64,
+) -> Result<Vec<Landed>> {
+    import_many_preserving(root, keys, login_tag, jobs, now_us, None)
+}
+
+pub(crate) fn import_many_preserving(
+    root: &std::path::Path,
+    keys: &Keys,
+    login_tag: HostTag,
+    jobs: &[Job],
+    now_us: i64,
+    previous: Option<&str>,
+) -> Result<Vec<Landed>> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(root).map_err(|e| Error::Io(format!("cannot create {}: {e}", root.display())))?;
+    // Finish any crashed move in this folder before starting another.
+    txn::recover(root)?;
+
+    // Decode every box up front, before touching disk.
+    let decoded: Vec<Decoded> = jobs.iter().map(|j| decode(j.payload)).collect::<Result<_>>()?;
+
+    // A registration write needs a Local State we can read. A damaged one refuses
+    // the whole move up front rather than being overwritten.
+    let ls_path = paths::local_state(root);
+    let ls_now: Option<Value> = if ls_path.exists() {
+        let bytes = std::fs::read(&ls_path).map_err(|e| Error::Io(format!("cannot read {}: {e}", ls_path.display())))?;
+        Some(
+            serde_json::from_slice(&bytes).map_err(|_| {
+                Error::Corrupt("the browser's Local State is damaged; Move It will not touch its profile list".into())
+            })?,
+        )
+    } else {
+        None
+    };
+
+    // Resolve each job's slot, and whether this move creates it.
+    let mut reserved: Vec<String> = Vec::new();
+    let mut slots: Vec<String> = Vec::new();
+    let mut displays: Vec<String> = Vec::new();
+    let mut created: Vec<bool> = Vec::new();
+    for job in jobs {
+        match &job.target {
+            Target::Slot(name) => {
+                reserved.push(name.clone());
+                created.push(!root.join(name).is_dir());
+                displays.push(
+                    job.payload
+                        .manifest
+                        .get("profile_name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| name.clone()),
+                );
+                slots.push(name.clone());
+            }
+            Target::Fresh { display } => {
+                let name = profiles::fresh_slot_name(root, &reserved);
+                reserved.push(name.clone());
+                created.push(true);
+                displays.push(display.clone());
+                slots.push(name);
+            }
+        }
+    }
+    // Slot names become folder paths. A name that did not come from this engine
+    // (a box can carry one) must be a name Chromium itself would use, nothing else:
+    // no separators, no dots, no traversal.
+    for s in &slots {
+        if !profiles::is_slot_name(s) {
+            return Err(Error::Refused(format!("{s:?} is not a profile name Move It will write to")));
+        }
+    }
+    // Two boxes landing in the same profile in one move would merge into each other
+    // in job order without the person ever choosing that. Refuse instead.
+    let mut seen = std::collections::BTreeSet::new();
+    for s in &slots {
+        if !seen.insert(s.clone()) {
+            return Err(Error::Refused(format!(
+                "two profiles in one move cannot land in the same profile ({s})"
+            )));
+        }
+    }
+    let any_created = created.iter().any(|c| *c);
+
+    // Every store every job would touch, snapshotted together. A created profile's
+    // folder itself is a store (absent before, so undo removes the whole folder),
+    // and so is Local State when any registration will be written into it.
+    let mut stores: Vec<(String, PathBuf)> = Vec::new();
+    if any_created {
+        stores.push(("localstate".into(), ls_path.clone()));
+    }
+    for (i, slot) in slots.iter().enumerate() {
+        if created[i] {
+            stores.push((format!("slotdir{i}"), paths::slot_dir(root, slot)));
+        }
+        stores.push((format!("cookies{i}"), paths::cookies_in(root, slot)));
+        stores.push((format!("history{i}"), paths::history_in(root, slot)));
+        stores.push((format!("logins{i}"), paths::login_data_in(root, slot)));
+        stores.push((format!("bookmarks{i}"), paths::bookmarks_in(root, slot)));
+        if let Some(lp) = localstorage::store_path_in(root, slot)? {
+            stores.push((format!("localstorage{i}"), lp));
+        }
+        let d = &decoded[i];
+        for (j, dir) in extstate::target_dirs_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?.into_iter().enumerate() {
+            stores.push((format!("ext{i}_{j}"), dir));
+        }
+    }
+    let store_refs: Vec<(&str, &std::path::Path)> = stores.iter().map(|(n, p)| (n.as_str(), p.as_path())).collect();
+    let tx = txn::Txn::begin(root, &store_refs)?;
+    // From here any `?` drops `tx`, which rolls everything back.
+    let applied = (|| -> Result<Vec<Landed>> {
+        if any_created {
+            for (i, slot) in slots.iter().enumerate() {
+                if !created[i] {
+                    continue;
+                }
+                let dir = paths::slot_dir(root, slot);
+                std::fs::create_dir_all(&dir).map_err(|e| Error::Io(format!("cannot create {}: {e}", dir.display())))?;
+                let prefs = dir.join("Preferences");
+                if !prefs.exists() {
+                    let bytes = serde_json::to_vec(&profiles::new_preferences(&displays[i]))
+                        .map_err(|e| Error::Io(e.to_string()))?;
+                    std::fs::write(&prefs, bytes).map_err(|e| Error::Io(format!("cannot write {}: {e}", prefs.display())))?;
+                }
+                profiles::create_empty_stores(&dir)?;
+                // A profile created for a routed box carries its landing
+                // marker: the source identity from the box itself. Later
+                // deliveries find their home by this marker, never by a
+                // bookkeeping entry alone, so no state file can redirect a
+                // merge into a profile that was not created for it. Written
+                // inside the transaction, so undo takes it out with the folder.
+                if matches!(jobs[i].target, Target::Fresh { .. }) {
+                    let m = &jobs[i].payload.manifest;
+                    let get = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or_default();
+                    // The marker names the source the way the app surface
+                    // looks it up: the stable device id when the box carries
+                    // one (the name otherwise), and the browser lowercased,
+                    // matching the case-insensitive read.
+                    let origin = match get("origin_id") {
+                        "" => get("origin"),
+                        id => id,
+                    };
+                    let marker = serde_json::json!({
+                        "origin": origin,
+                        "browser": get("profile_browser").to_lowercase(),
+                        "slot": get("profile_slot"),
+                    });
+                    let bytes = serde_json::to_vec(&marker).map_err(|e| Error::Io(e.to_string()))?;
+                    let mp = dir.join(LANDING_MARKER);
+                    std::fs::write(&mp, bytes)
+                        .map_err(|e| Error::Io(format!("cannot write {}: {e}", mp.display())))?;
+                }
+            }
+            let mut ls = ls_now.clone().unwrap_or_else(|| Value::Object(Map::new()));
+            for (i, slot) in slots.iter().enumerate() {
+                if created[i] {
+                    ls = profiles::local_state_with_slot(&ls, slot, &displays[i], (now_us / 1_000_000) as u64);
+                }
+            }
+            let bytes = serde_json::to_vec(&ls).map_err(|e| Error::Io(e.to_string()))?;
+            let tmp = root.join("Local State.moveit-tmp");
+            std::fs::write(&tmp, bytes).map_err(|e| Error::Io(format!("cannot write {}: {e}", tmp.display())))?;
+            std::fs::rename(&tmp, &ls_path).map_err(|e| Error::Io(format!("cannot write {}: {e}", ls_path.display())))?;
+        }
+        let mut out = Vec::new();
+        for (i, d) in decoded.iter().enumerate() {
+            let applied = apply_one(root, &slots[i], d, keys, login_tag, now_us)?;
+            out.push(Landed { slot: slots[i].clone(), created: created[i], applied });
+        }
+        Ok(out)
+    })();
+    match applied {
+        Ok(a) => {
+            tx.commit_preserving(previous)?;
             Ok(a)
         }
         Err(e) => {
@@ -133,7 +451,7 @@ fn section<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
 
 fn from_section<T: serde::de::DeserializeOwned>(m: &Map<String, Value>, key: &str) -> Result<Vec<T>> {
     match m.get(key) {
-        Some(Value::Array(_)) => section(m.get(key).unwrap()),
+        Some(v @ Value::Array(_)) => section(v),
         Some(Value::Null) | None => Ok(Vec::new()),
         Some(_) => Err(Error::Corrupt(format!("box section {key:?} is not a list"))),
     }

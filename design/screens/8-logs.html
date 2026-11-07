@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Move It: 8 Logs</title>
+<link rel="stylesheet" href="../style/moveit.css">
+</head>
+<body class="screen-page">
+<div>
+  <div class="dev"><b>8 Logs</b></div>
+  <div class="app" data-screen="logs">
+    <section class="state" data-state="logs" data-label="With lines">
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <h1 class="title at-top">Logs</h1>
+      <p class="sub">What Move It has been doing on this device, in plain words. Nothing secret is ever written here.</p>
+      <div class="card log-list">
+        <div class="log-row"><span class="log-level">INFO</span><span class="log-time">09:41</span><span class="log-msg">Move finished: 1,240 logins and cookies, 38 extensions, 214 bookmarks</span></div>
+        <div class="log-row"><span class="log-level warn">WARN</span><span class="log-time">09:41</span><span class="log-msg">2 logins could not move (App-Bound)</span></div>
+        <div class="log-row"><span class="log-level">INFO</span><span class="log-time">09:12</span><span class="log-msg">Paired with Office PC</span></div>
+        <div class="log-row"><span class="log-level error">ERROR</span><span class="log-time">08:57</span><span class="log-msg">Move stopped: Brave is still open</span></div>
+        <div class="log-row"><span class="log-level">INFO</span><span class="log-time">08:57</span><span class="log-msg">Move started</span></div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" data-action="export-logs">Export logs</button>
+        <button class="btn btn-quiet" data-action="back" data-go="5-home.html">Back</button>
+      </div>
+    </section>
+    <section class="state" data-state="empty" data-label="Empty" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="still"></div></div>
+      <h1 class="title">Nothing here yet</h1>
+      <p class="sub">When Move It does something, it writes a short line here.</p>
+      <div class="actions">
+        <button class="btn btn-primary" data-action="export-logs" disabled>Export logs</button>
+        <button class="btn btn-quiet" data-action="back" data-go="5-home.html">Back</button>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="../loader/frames/manifest.js"></script>
+<script src="../loader/moveit-loader.js"></script>
+<script src="../style/icons.js"></script>
+<script src="../style/screens.js"></script>
+</body>
+</html>

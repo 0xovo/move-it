@@ -12,16 +12,130 @@
   <div class="app" data-screen="preview">
     <section class="state" data-state="ready" data-label="Ready">
       <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
-      <div class="stage short"><div class="lemur" data-lemur="dance" data-progress="0"></div></div>
-      <h1 class="title">Ready to move</h1>
-      <p class="sub">From <span data-bind="source">Brave on this laptop</span></p>
-      <div class="card rows">
-        <div class="row"><i data-icon="cookie"></i><b data-bind="logins">1,240</b><span>logins and cookies</span></div>
-        <div class="row"><i data-icon="puzzle"></i><b data-bind="extensions">38</b><span>extensions</span></div>
-        <div class="row"><i data-icon="bookmark"></i><b data-bind="bookmarks">214</b><span>bookmarks</span></div>
-        <div class="row"><i data-icon="history"></i><b data-bind="history">9,812</b><span>history items</span></div>
+      <h1 class="title at-top">Ready to move</h1>
+      <p class="sub">From <span data-bind="source">Brave and Chrome on this laptop</span></p>
+      <div class="scroll">
+        <div class="card rows">
+          <div class="row"><i data-icon="cookie"></i><b data-bind="logins">1,240</b><span>logins and cookies</span></div>
+          <div class="row"><i data-icon="puzzle"></i><b data-bind="extensions">38</b><span>extensions</span></div>
+          <div class="row"><i data-icon="bookmark"></i><b data-bind="bookmarks">214</b><span>bookmarks</span></div>
+          <div class="row"><i data-icon="history"></i><b data-bind="history">9,812</b><span>history items</span></div>
+        </div>
+        <div class="group-label">Brave</div>
+        <div class="card rows">
+          <label class="profile" data-profile="brave:default" data-browser="brave" data-logins="986" data-passwords="251" data-bookmarks="186" data-history="8861">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Profile 1</span>
+              <span class="p-counts">986 logins and cookies · 251 passwords · 186 bookmarks · 8,861 history items</span>
+              <span class="p-dest">
+                <button class="route-link" data-action="route" data-profile="brave:default">Send to a different browser</button>
+                <span class="p-route" hidden><i data-icon="swap"></i>Going to <b class="p-route-name">Chrome</b><button class="route-clear" data-action="route-clear" data-profile="brave:default" aria-label="Send to its own browser instead"><i data-icon="x"></i></button></span>
+              </span>
+            </span>
+          </label>
+          <label class="profile" data-profile="brave:profile-1" data-browser="brave" data-logins="148" data-passwords="39" data-bookmarks="22" data-history="691">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Work</span>
+              <span class="p-counts">148 logins and cookies · 39 passwords · 22 bookmarks · 691 history items</span>
+              <span class="p-dest">
+                <button class="route-link" data-action="route" data-profile="brave:profile-1">Send to a different browser</button>
+                <span class="p-route" hidden><i data-icon="swap"></i>Going to <b class="p-route-name">Chrome</b><button class="route-clear" data-action="route-clear" data-profile="brave:profile-1" aria-label="Send to its own browser instead"><i data-icon="x"></i></button></span>
+              </span>
+            </span>
+          </label>
+        </div>
+        <div class="group-label">Chrome</div>
+        <div class="card rows">
+          <label class="profile" data-profile="chrome:default" data-browser="chrome" data-logins="94" data-passwords="18" data-bookmarks="6" data-history="203">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Person 1</span>
+              <span class="p-counts">94 logins and cookies · 18 passwords · 6 bookmarks · 203 history items</span>
+              <span class="p-dest">
+                <button class="route-link" data-action="route" data-profile="chrome:default">Send to a different browser</button>
+                <span class="p-route" hidden><i data-icon="swap"></i>Going to <b class="p-route-name">Brave</b><button class="route-clear" data-action="route-clear" data-profile="chrome:default" aria-label="Send to its own browser instead"><i data-icon="x"></i></button></span>
+              </span>
+            </span>
+          </label>
+          <label class="profile" data-profile="chrome:profile-1" data-browser="chrome" data-logins="12" data-passwords="4" data-bookmarks="0" data-history="57">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Person 2<span class="p-new">New profile, included</span></span>
+              <span class="p-counts">12 logins and cookies · 4 passwords · 0 bookmarks · 57 history items</span>
+              <span class="p-dest">
+                <button class="route-link" data-action="route" data-profile="chrome:profile-1">Send to a different browser</button>
+                <span class="p-route" hidden><i data-icon="swap"></i>Going to <b class="p-route-name">Brave</b><button class="route-clear" data-action="route-clear" data-profile="chrome:profile-1" aria-label="Send to its own browser instead"><i data-icon="x"></i></button></span>
+              </span>
+            </span>
+          </label>
+        </div>
+        <div class="group-label" id="routesLabel" hidden>Going somewhere else</div>
+        <div class="card rows" id="routesCard" hidden></div>
+        <div class="group-label">Cannot move</div>
+        <div class="card rows">
+          <div class="row"><i data-icon="browser"></i><b>Brave</b><span>26 cookies stay locked and cannot move</span></div>
+        </div>
       </div>
-      <div class="actions"><button class="btn btn-primary" data-action="move" data-state="moving">Move It</button></div>
+      <div class="actions"><button class="btn btn-primary" data-action="move" data-state="moving"><span>Move <span data-bind="moveCount">11,616</span> things</span></button></div>
+      <p class="note"><i data-icon="undo"></i>Nothing gets deleted. You can undo.</p>
+      <div class="sheet-backdrop" data-picker hidden></div>
+      <div class="sheet picker" data-picker hidden role="dialog" aria-labelledby="pickerTitle">
+        <h2 class="sheet-title" id="pickerTitle">Send <span data-bind="pickerProfile">this profile</span> somewhere else</h2>
+        <p class="sheet-text">It lands on the other device as its own new profile in that browser. Nothing it lands on is replaced.</p>
+        <div class="options">
+          <button class="option" data-dest="own" aria-checked="true"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b data-bind="pickerOwn">Brave</b><small>Its own browser</small></span><span class="dot"></span></button>
+          <button class="option" data-dest="chrome" aria-checked="false"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Google Chrome</b><small>As a new Chrome profile</small></span><span class="dot"></span></button>
+          <button class="option" data-dest="chromium" aria-checked="false"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Chromium</b><small>As a new Chromium profile</small></span><span class="dot"></span></button>
+          <button class="option" data-dest="brave" aria-checked="false"><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Brave</b><small>As a new Brave profile</small></span><span class="dot"></span></button>
+          <button class="option" disabled><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Microsoft Edge</b><small>Move It cannot read Edge's password on this system yet</small></span></button>
+          <button class="option" disabled><span class="tile"><i data-icon="browser"></i></span><span class="label"><b>Opera</b><small>Move It cannot read Opera's password on this system yet</small></span></button>
+        </div>
+        <p class="hint">If that browser is open on the other device, the new profile waits until it is closed.</p>
+        <button class="link" data-action="picker-close">Not now</button>
+      </div>
+    </section>
+    <section class="state" data-state="single" data-label="One browser only" hidden>
+      <div class="top"><span class="wordmark">Move It</span><span class="steps" aria-label="Step 3 of 3"><i></i><i></i><i class="on"></i></span></div>
+      <h1 class="title at-top">Ready to move</h1>
+      <p class="sub">From <span>Brave on this laptop</span></p>
+      <div class="scroll">
+        <div class="card rows">
+          <div class="row"><i data-icon="cookie"></i><b>1,134</b><span>logins and cookies</span></div>
+          <div class="row"><i data-icon="puzzle"></i><b>31</b><span>extensions</span></div>
+          <div class="row"><i data-icon="bookmark"></i><b>208</b><span>bookmarks</span></div>
+          <div class="row"><i data-icon="history"></i><b>9,552</b><span>history items</span></div>
+        </div>
+        <div class="group-label">Brave</div>
+        <div class="card rows">
+          <label class="profile">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Profile 1</span>
+              <span class="p-counts">986 logins and cookies · 251 passwords · 186 bookmarks · 8,861 history items</span>
+            </span>
+          </label>
+          <label class="profile">
+            <input type="checkbox" checked>
+            <span class="check"><i data-icon="check"></i></span>
+            <span class="p-main">
+              <span class="p-name">Work</span>
+              <span class="p-counts">148 logins and cookies · 39 passwords · 22 bookmarks · 691 history items</span>
+            </span>
+          </label>
+        </div>
+        <div class="group-label">Cannot move</div>
+        <div class="card rows">
+          <div class="row"><i data-icon="browser"></i><b>Brave</b><span>26 cookies stay locked and cannot move</span></div>
+        </div>
+      </div>
+      <div class="actions"><button class="btn btn-primary"><span>Move 11,246 things</span></button></div>
       <p class="note"><i data-icon="undo"></i>Nothing gets deleted. You can undo.</p>
     </section>
     <section class="state" data-state="moving" data-label="Moving" hidden>
@@ -63,15 +177,105 @@
 <script src="../style/icons.js"></script>
 <script src="../style/screens.js"></script>
 <script>
+  // Mockup only: unticking a profile dims its row and takes its counts out of the
+  // totals and the Move button. The real app gets the same numbers from
+  // preview_counts and hands move_start the unticked profile ids.
+  const fmt = (n) => n.toLocaleString("en-US");
+  const profiles = [...document.querySelectorAll('section[data-state="ready"] .profile')];
+  const moveBtn = document.querySelector('[data-action="move"]');
+  function selectedLogins() {
+    return profiles.reduce((sum, p) => sum + (p.querySelector("input").checked ? Number(p.dataset.logins) : 0), 0);
+  }
+  function refresh() {
+    const sums = { logins: 0, passwords: 0, bookmarks: 0, history: 0 };
+    for (const p of profiles) {
+      const on = p.querySelector("input").checked;
+      p.classList.toggle("off", !on);
+      if (!on && p.dataset.profile) routes.delete(p.dataset.profile); // left out: its route goes with it
+      const tag = p.querySelector(".p-new");
+      if (tag) tag.textContent = on ? "New profile, included" : "New profile, left out";
+      if (on) for (const k of Object.keys(sums)) sums[k] += Number(p.dataset[k]);
+    }
+    renderRoutes();
+    MoveIt.bind({
+      logins: fmt(sums.logins), bookmarks: fmt(sums.bookmarks), history: fmt(sums.history),
+      moveCount: fmt(sums.logins + sums.passwords + sums.bookmarks + sums.history + 38),
+    });
+    moveBtn.disabled = !profiles.some((p) => p.querySelector("input").checked);
+  }
+
+  // Mockup only: routing. A profile may be sent to one other browser, chosen per
+  // profile; the real app passes the choices to preview_counts (which answers
+  // with the destinations) and to move_start as the route choices. Unticking a
+  // profile drops its route, the way move_start refuses a routed-but-left-out
+  // profile. Routes live for this move only; nothing about them is remembered.
+  const routes = new Map();
+  const destShort = { brave: "Brave", chrome: "Chrome", chromium: "Chromium" };
+  const destFull = { brave: "Brave", chrome: "Google Chrome", chromium: "Chromium" };
+  const routesCard = document.getElementById("routesCard");
+  const routesLabel = document.getElementById("routesLabel");
+  const pickerEls = [...document.querySelectorAll("[data-picker]")];
+  const pickerOptions = [...document.querySelectorAll(".picker .option[data-dest]")];
+  let pickerFor = null;
+  const profileName = (row) => row.querySelector(".p-name").childNodes[0].textContent.trim();
+  const rowOf = (id) => profiles.find((p) => p.dataset.profile === id);
+  function renderRoutes() {
+    for (const p of profiles) {
+      const dest = routes.get(p.dataset.profile);
+      const chip = p.querySelector(".p-route");
+      const link = p.querySelector(".route-link");
+      if (!chip || !link) continue;
+      chip.hidden = !dest;
+      link.hidden = !!dest;
+      if (dest) chip.querySelector(".p-route-name").textContent = destShort[dest];
+    }
+    const rows = [...routes.entries()].map(([id, dest]) =>
+      `<div class="row"><i data-icon="swap"></i><b>${profileName(rowOf(id))}</b><span>to ${destShort[dest]}, as its own new profile</span></div>`);
+    routesCard.innerHTML = rows.join("");
+    routesCard.hidden = routesLabel.hidden = rows.length === 0;
+    if (rows.length) window.moveitIcons(routesCard);
+  }
+  function openPicker(id) {
+    pickerFor = id;
+    const row = rowOf(id);
+    const own = row.dataset.browser;
+    MoveIt.bind({ pickerProfile: profileName(row), pickerOwn: destFull[own] });
+    const current = routes.get(id) || "own";
+    for (const o of pickerOptions) {
+      o.hidden = o.dataset.dest === own; // the own-browser row already covers it
+      o.setAttribute("aria-checked", String(o.dataset.dest === current));
+    }
+    pickerEls.forEach((el) => { el.hidden = false; });
+  }
+  function closePicker() { pickerFor = null; pickerEls.forEach((el) => { el.hidden = true; }); }
+  document.querySelectorAll('[data-action="route"]').forEach((b) =>
+    b.addEventListener("click", (e) => { e.preventDefault(); openPicker(b.dataset.profile); }));
+  document.querySelectorAll('[data-action="route-clear"]').forEach((b) =>
+    b.addEventListener("click", (e) => { e.preventDefault(); routes.delete(b.dataset.profile); renderRoutes(); }));
+  document.querySelector('[data-action="picker-close"]').addEventListener("click", closePicker);
+  document.querySelector(".sheet-backdrop[data-picker]").addEventListener("click", closePicker);
+  pickerOptions.forEach((o) => o.addEventListener("click", () => {
+    if (!pickerFor) return;
+    if (o.dataset.dest === "own") routes.delete(pickerFor);
+    else routes.set(pickerFor, o.dataset.dest);
+    closePicker();
+    renderRoutes();
+  }));
+
+  profiles.forEach((p) => p.querySelector("input").addEventListener("change", refresh));
+  refresh();
+</script>
+<script>
   // Mockup only: a pretend run with uneven pacing. real app feeds real numbers:
   // MoveIt.lemur("moving").setProgress(done / total); MoveIt.bind({ movingLine: "640 of 1,240 logins and cookies" })
-  const total = 1240, plan = [[0, 0], [600, .05], [1500, .16], [2100, .17], [3600, .42], [4600, .44], [6400, .7], [7000, .71], [8600, .96], [9200, 1]];
+  const plan = [[0, 0], [600, .05], [1500, .16], [2100, .17], [3600, .42], [4600, .44], [6400, .7], [7000, .71], [8600, .96], [9200, 1]];
   const at = (t) => { for (let i = 1; i < plan.length; i++) if (t <= plan[i][0]) { const [a, p] = plan[i - 1], [b, q] = plan[i]; return p + (q - p) * (t - a) / (b - a); } return 1; };
   let run = null;
   MoveIt.onState((name) => {
     if (run) cancelAnimationFrame(run);
     const l = MoveIt.lemur("moving");
     if (name !== "moving" || !l) return;
+    const total = selectedLogins();
     l.setProgress(0);
     const t0 = performance.now();
     const step = (now) => {

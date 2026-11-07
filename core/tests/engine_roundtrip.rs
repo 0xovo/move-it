@@ -76,7 +76,7 @@ fn plant_cookies(dir: &Path, cs: &[Cookie]) {
 }
 
 fn profile<'a>(dir: &'a Path, k: &'a Keys) -> Profile<'a> {
-    Profile { dir, keys: k, login_tag: HostTag::Without }
+    Profile { dir, slot: "Default", keys: k, login_tag: HostTag::Without }
 }
 
 #[test]

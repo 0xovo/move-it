@@ -2,7 +2,11 @@
 //! Ported from the Python prototype; Mac added from Chromium's os_crypt_mac.
 //!
 //! - Linux: `v10`/`v11` + AES-128-CBC, IV = 16 spaces, key = PBKDF2-HMAC-SHA1(password, "saltysalt", 1 round).
-//! - Mac:   `v10` + the same CBC, key = PBKDF2-HMAC-SHA1(Keychain password, "saltysalt", 1003 rounds).
+//! - Mac:   `v10`/`v11` + the same CBC, key = PBKDF2-HMAC-SHA1(Keychain password, salt, 1003 rounds);
+//!   the salt is "saltysalt" for `v10` and "pepper" for `v11`. A store that already speaks `v11`
+//!   is followed; an empty store writes `v10`. The old rule (a non-default user data dir writes
+//!   `v11`) is dead: live proof on Chrome 156 and Brave 1.98 showed both writing `v10` in
+//!   non-default dirs, so the folder location no longer proves anything.
 //! - Windows: `v10` + AES-256-GCM with the DPAPI-unwrapped master key from Local State.
 //!   `v20` (App-Bound) is refused, never guessed.
 //!
@@ -16,12 +20,14 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use sha2::{Digest, Sha256};
 
+
 use crate::{Error, Result};
 
 type CbcEnc = cbc::Encryptor<aes::Aes128>;
 type CbcDec = cbc::Decryptor<aes::Aes128>;
 
 const SALT: &[u8] = b"saltysalt";
+const PEPPER: &[u8] = b"pepper";
 const IV: [u8; 16] = [b' '; 16];
 pub const LINUX_FALLBACK_PASSWORD: &str = "peanuts";
 
@@ -41,6 +47,8 @@ pub enum LinuxBrowser {
     Brave,
     Chrome,
     Chromium,
+    Edge,
+    Opera,
 }
 
 impl LinuxBrowser {
@@ -50,7 +58,16 @@ impl LinuxBrowser {
             LinuxBrowser::Brave => "brave",
             LinuxBrowser::Chrome => "chrome",
             LinuxBrowser::Chromium => "chromium",
+            // Edge brands the libsecret item with the product name, not "edge".
+            LinuxBrowser::Edge => "Microsoft Edge",
+            LinuxBrowser::Opera => "Opera",
         }
+    }
+
+    /// Whether an empty store may seed v11 when the password came from this
+    /// browser's own unlocked backend item (libsecret v2 on Linux).
+    pub fn empty_store_v11_from_trusted_item(self, from_trusted_item: bool) -> bool {
+        matches!(self, LinuxBrowser::Chromium) && from_trusted_item
     }
 
     /// Parse a browser name as the caller spells it.
@@ -59,6 +76,8 @@ impl LinuxBrowser {
             "brave" => Some(LinuxBrowser::Brave),
             "chrome" => Some(LinuxBrowser::Chrome),
             "chromium" => Some(LinuxBrowser::Chromium),
+            "edge" => Some(LinuxBrowser::Edge),
+            "opera" => Some(LinuxBrowser::Opera),
             _ => None,
         }
     }
@@ -67,9 +86,13 @@ impl LinuxBrowser {
 /// Discover the Linux browser password for one browser: the
 /// `MOVEIT_LINUX_PASSWORD` override, then the secret service, then the compiled-in
 /// fallback. Returns the password and whether it came from a libsecret v2 item (the
-/// provenance only matters when writing into an empty store). Never fails: a machine
-/// with no keyring at all still gets the fallback, exactly like Chromium itself.
-pub fn linux_browser_password_for(browser: LinuxBrowser) -> (String, bool) {
+/// provenance only matters when writing into an empty store). A confirmed missing
+/// item permits the fallback, and so does no secret service at all: a machine with
+/// no D-Bus session or no provider is a clean miss, and Chromium itself falls back
+/// to its basic store ("peanuts") there, so v10 writes follow it. Locked, timed-out
+/// or otherwise unusable keyrings still fail, and a fallback key never seeds v11
+/// writes (see `verify_write_key` in cookies.rs and logins.rs).
+pub fn linux_browser_password_for(browser: LinuxBrowser) -> Result<(String, bool)> {
     linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_service_lookup)
 }
 
@@ -79,34 +102,34 @@ pub fn linux_browser_password_for(browser: LinuxBrowser) -> (String, bool) {
 fn linux_browser_password_from(
     browser: LinuxBrowser,
     env: Option<String>,
-    lookup: &dyn Fn(&[(&str, &str)]) -> Option<String>,
-) -> (String, bool) {
+    lookup: &dyn Fn(&[(&str, &str)]) -> Result<Option<String>>,
+) -> Result<(String, bool)> {
     if let Some(pw) = env {
         if !pw.is_empty() {
-            return (pw, false);
+            return Ok((pw, false));
         }
     }
     let app = browser.keyring_app();
     // The v2-schema item first: it is the one a current browser actually uses, and its
     // provenance decides the write label for an empty store.
-    if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)]) {
-        return (pw, true);
+    if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)])? {
+        return Ok((pw, true));
     }
-    if let Some(pw) = lookup(&[("application", app)]) {
-        return (pw, false);
+    if let Some(pw) = lookup(&[("application", app)])? {
+        return Ok((pw, false));
     }
-    (LINUX_FALLBACK_PASSWORD.to_string(), false)
+    Ok((LINUX_FALLBACK_PASSWORD.to_string(), false))
 }
 
 /// One secret-service lookup over D-Bus, with a timeout so a locked
-/// keyring or a hung bus can never hang a sync. `None` on any failure:
-/// no bus, no match, locked item only, empty secret, or too slow.
+/// keyring or a hung bus can never hang a sync. Only a clean miss is `None`;
+/// locked items, unavailable buses and timeouts are errors.
 /// Locked items are never unlocked here: unlocking would prompt the
 /// user, which a background sync must not do. The lookup runs on a
 /// thread so the timeout also bounds a hung D-Bus call; unlike the old
 /// secret-tool child, there is no child process left running on timeout.
 #[cfg(target_os = "linux")]
-fn secret_service_lookup(attrs: &[(&str, &str)]) -> Option<String> {
+fn secret_service_lookup(attrs: &[(&str, &str)]) -> Result<Option<String>> {
     let owned: Vec<(String, String)> = attrs
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -115,29 +138,65 @@ fn secret_service_lookup(attrs: &[(&str, &str)]) -> Option<String> {
     std::thread::spawn(move || {
         let _ = tx.send(secret_service_lookup_inner(&owned));
     });
-    rx.recv_timeout(std::time::Duration::from_secs(5)).ok()?
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| Error::KeychainUnavailable("browser keyring lookup timed out".into()))?
 }
 
 #[cfg(target_os = "linux")]
-fn secret_service_lookup_inner(attrs: &[(String, String)]) -> Option<String> {
+fn secret_service_lookup_inner(attrs: &[(String, String)]) -> Result<Option<String>> {
     use secret_service::{blocking::SecretService, EncryptionType};
     use std::collections::HashMap;
-    let ss = SecretService::connect(EncryptionType::Dh).ok()?;
+    let unavailable = |e| Error::KeychainUnavailable(format!("browser keyring: {e}"));
+    let ss = match SecretService::connect(EncryptionType::Dh) {
+        Ok(ss) => ss,
+        // No bus to connect to, or a bus with no secret-service provider: there
+        // is no keyring to read, so this is a clean miss, not an error.
+        Err(e) if is_no_secret_service(&e) => return Ok(None),
+        Err(e) => return Err(unavailable(e)),
+    };
     let map: HashMap<&str, &str> = attrs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    let found = ss.search_items(map).ok()?;
-    let item = found.unlocked.first()?;
-    let secret = item.get_secret().ok()?;
-    let pw = String::from_utf8(secret).ok()?.trim_end_matches(char::from(10)).to_string();
-    (!pw.is_empty()).then_some(pw)
+    let found = ss.search_items(map).map_err(unavailable)?;
+    if !found.locked.is_empty() {
+        return Err(Error::KeychainUnavailable("browser keyring item is locked".into()));
+    }
+    let Some(item) = found.unlocked.first() else { return Ok(None) };
+    let secret = item.get_secret().map_err(unavailable)?;
+    let pw = String::from_utf8(secret)
+        .map_err(|_| Error::KeychainUnavailable("browser keyring item is not text".into()))?
+        .trim_end_matches(char::from(10)).to_string();
+    if pw.is_empty() {
+        return Err(Error::KeychainUnavailable("browser keyring item is empty".into()));
+    }
+    Ok(Some(pw))
+}
+
+/// True when a Secret Service failure means "there is no secret service here at
+/// all": no D-Bus session to connect to (`Unavailable`), or a bus that knows no
+/// provider for org.freedesktop.secrets. A locked item, a timeout, or a provider
+/// that answered with an error is not this: those stay errors.
+#[cfg(target_os = "linux")]
+fn is_no_secret_service(e: &secret_service::Error) -> bool {
+    match e {
+        secret_service::Error::Unavailable => true,
+        // OpenSession uses a zbus::Result, so missing-provider replies can
+        // arrive as raw method errors rather than the typed FDO variant.
+        secret_service::Error::Zbus(zbus::Error::MethodError(name, _, _)) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown" | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ),
+        secret_service::Error::ZbusFdo(zbus::fdo::Error::ServiceUnknown(_))
+        | secret_service::Error::ZbusFdo(zbus::fdo::Error::NameHasNoOwner(_)) => true,
+        _ => false,
+    }
 }
 
 /// No Secret Service off Linux: discovery falls through to the fallback.
 #[cfg(not(target_os = "linux"))]
-fn secret_service_lookup(_attrs: &[(&str, &str)]) -> Option<String> {
-    None
+fn secret_service_lookup(_attrs: &[(&str, &str)]) -> Result<Option<String>> {
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,18 +245,24 @@ pub enum HostTag {
 #[derive(Clone)]
 pub enum Lock {
     /// Linux or Mac: the derived 16-byte AES key, and the label to write.
-    Cbc { key: [u8; 16], write_prefix: LinuxPrefix },
+    /// `v11_key` names the keyring key on Linux and the pepper-derived key on Mac.
+    /// Linux's main key is always the compiled-in peanuts key.
+    Cbc { key: [u8; 16], v11_key: Option<[u8; 16]>, write_prefix: LinuxPrefix },
     /// Windows: the 32-byte master key.
     Gcm { master_key: [u8; 32] },
 }
 
 impl Lock {
     pub fn linux(password: &str, write_prefix: LinuxPrefix) -> Lock {
-        Lock::Cbc { key: derive(password, 1), write_prefix }
+        Lock::Cbc { key: derive(LINUX_FALLBACK_PASSWORD, 1), v11_key: Some(derive(password, 1)), write_prefix }
     }
 
     pub fn mac(keychain_password: &str) -> Lock {
-        Lock::Cbc { key: derive(keychain_password, 1003), write_prefix: LinuxPrefix::V10 }
+        Lock::Cbc {
+            key: derive(keychain_password, 1003),
+            v11_key: Some(derive_salted(keychain_password, PEPPER, 1003)),
+            write_prefix: LinuxPrefix::V10,
+        }
     }
 
     pub fn windows(master_key: [u8; 32]) -> Lock {
@@ -211,8 +276,10 @@ impl Lock {
         }
         plain.extend_from_slice(value.as_bytes());
         match self {
-            Lock::Cbc { key, write_prefix } => {
-                let body = CbcEnc::new(key.into(), &IV.into()).encrypt_padded_vec_mut::<Pkcs7>(&plain);
+            Lock::Cbc { key, v11_key, write_prefix } => {
+                let k = key_for(*write_prefix, key, v11_key);
+                let body = CbcEnc::new((&k).into(), &IV.into())
+                    .encrypt_padded_vec_mut::<Pkcs7>(&plain);
                 Ok([write_prefix.bytes().as_slice(), &body].concat())
             }
             Lock::Gcm { master_key } => {
@@ -226,15 +293,31 @@ impl Lock {
         }
     }
 
+    /// Encrypt for a label the caller picks (the store being written sets it), so the
+    /// key and the label always agree. A Windows lock takes no label choice.
+    pub fn encrypt_labelled(&self, host: &str, value: &str, tag: HostTag, prefix: LinuxPrefix) -> Result<Vec<u8>> {
+        match self {
+            Lock::Cbc { .. } => {
+                let mut l = self.clone();
+                if let Lock::Cbc { write_prefix, .. } = &mut l {
+                    *write_prefix = prefix;
+                }
+                l.encrypt(host, value, tag)
+            }
+            Lock::Gcm { .. } => self.encrypt(host, value, tag),
+        }
+    }
+
     /// Unlock one value; a matching SHA256(host) tag in front is removed.
     pub fn decrypt(&self, host: &str, data: &[u8]) -> Result<String> {
         let label = data.get(..3).unwrap_or(data);
         let plain = match self {
-            Lock::Cbc { key, .. } => {
+            Lock::Cbc { key, v11_key, .. } => {
                 if label != b"v10" && label != b"v11" {
                     return Err(Error::Refused(format!("value for {host} has unknown prefix {label:?}")));
                 }
-                CbcDec::new(key.into(), &IV.into())
+                let k = if label == b"v11" { v11_key.as_ref().unwrap_or(key) } else { key };
+                CbcDec::new(k.into(), &IV.into())
                     .decrypt_padded_vec_mut::<Pkcs7>(&data[3..])
                     .map_err(|_| Error::WrongBrowserPassword)?
             }
@@ -257,17 +340,37 @@ impl Lock {
 }
 
 fn derive(password: &str, rounds: u32) -> [u8; 16] {
+    derive_salted(password, SALT, rounds)
+}
+
+fn derive_salted(password: &str, salt: &[u8], rounds: u32) -> [u8; 16] {
     let mut k = [0u8; 16];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), SALT, rounds, &mut k);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), salt, rounds, &mut k);
     k
+}
+
+/// The key a label names: `v11` takes the lock's second key when it carries one
+/// and falls back to the main key for older caller-constructed locks.
+fn key_for(label: LinuxPrefix, key: &[u8; 16], v11_key: &Option<[u8; 16]>) -> [u8; 16] {
+    match (label, v11_key) {
+        (LinuxPrefix::V11, Some(k)) => *k,
+        _ => *key,
+    }
 }
 
 fn host_hash(host: &str) -> [u8; 32] {
     Sha256::digest(host.as_bytes()).into()
 }
 
-/// Pick the label for writing into an existing Linux store: strict majority of
-/// recognised v10/v11 values wins; a tie (or none) falls back to the password's source.
+/// Pick the label for writing into a store: strict majority of recognised
+/// v10/v11 values wins; a tie (or no values at all) falls back to the
+/// password's source when the caller sets `from_libsecret_v2` from
+/// [`LinuxBrowser::empty_store_v11_from_trusted_item`] or
+/// [`MacBrowser::empty_store_v11_from_trusted_item`] (Chromium with its own
+/// unlocked item only; Chrome and Brave keep v10). The folder location never
+/// decides: live proof showed Chrome 156 and Brave 1.98 writing v10 in
+/// non-default dirs, and no Local State field records the scheme, so the store's
+/// own rows are the only evidence for v11.
 pub fn linux_write_prefix<'a>(values: impl IntoIterator<Item = &'a [u8]>, from_libsecret_v2: bool) -> LinuxPrefix {
     let (mut v10, mut v11) = (0usize, 0usize);
     for v in values {
@@ -308,6 +411,243 @@ fn url_host(s: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
+
+// ---------------- macOS: the Safe Storage password from the login Keychain ----------------
+
+/// Which Chromium browser a macOS profile belongs to. The Keychain item is looked
+/// up for this browser only, never for the other browsers on the same machine:
+/// the same scoping rule as [`LinuxBrowser`], for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacBrowser {
+    Brave,
+    Chrome,
+    Chromium,
+    Edge,
+    Opera,
+}
+
+impl MacBrowser {
+    /// The `service` of this browser's Safe Storage item in the login Keychain.
+    pub fn keychain_service(self) -> &'static str {
+        match self {
+            MacBrowser::Brave => "Brave Safe Storage",
+            MacBrowser::Chrome => "Chrome Safe Storage",
+            MacBrowser::Chromium => "Chromium Safe Storage",
+            MacBrowser::Edge => "Microsoft Edge Safe Storage",
+            MacBrowser::Opera => "Opera Safe Storage",
+        }
+    }
+
+    /// The `account` of this browser's Safe Storage item.
+    pub fn keychain_account(self) -> &'static str {
+        match self {
+            MacBrowser::Brave => "Brave",
+            MacBrowser::Chrome => "Chrome",
+            MacBrowser::Chromium => "Chromium",
+            MacBrowser::Edge => "Microsoft Edge",
+            MacBrowser::Opera => "Opera",
+        }
+    }
+
+    /// Whether an empty store may seed v11 when the password came from this
+    /// browser's own unlocked Keychain item.
+    pub fn empty_store_v11_from_trusted_item(self, from_keychain: bool) -> bool {
+        matches!(self, MacBrowser::Chromium) && from_keychain
+    }
+
+    /// Parse a browser name as the caller spells it.
+    pub fn from_name(name: &str) -> Option<MacBrowser> {
+        match name {
+            "brave" => Some(MacBrowser::Brave),
+            "chrome" => Some(MacBrowser::Chrome),
+            "chromium" => Some(MacBrowser::Chromium),
+            "edge" => Some(MacBrowser::Edge),
+            "opera" => Some(MacBrowser::Opera),
+            _ => None,
+        }
+    }
+}
+
+/// What one Keychain lookup came back with, before it becomes an engine error.
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // its variants are built by the macOS lookup
+enum KeychainOutcome {
+    /// The Safe Storage password itself.
+    Found(String),
+    /// No such item (or an empty one): the browser never stored a password here.
+    Missing,
+    /// The keychain refused: locked, or the read needs the person at the keyboard.
+    Refused,
+    /// The `security` tool is missing or failed in some other way.
+    Unavailable,
+}
+
+/// Read one macOS browser's Safe Storage password from the login Keychain.
+/// Unlike Linux there is no fallback password: a missing or refused read is a
+/// clean error, because guessing would silently re-lock values wrong.
+pub fn mac_browser_password(browser: MacBrowser) -> Result<String> {
+    Ok(mac_browser_password_for(browser)?.0)
+}
+
+/// Like [`mac_browser_password`], plus whether the password came from the
+/// Keychain (provenance only matters when writing into an empty store).
+pub fn mac_browser_password_for(browser: MacBrowser) -> Result<(String, bool)> {
+    mac_password_from(browser, &security_cli_lookup)
+}
+
+/// The error mapping of [`mac_browser_password_for`], with the lookup injected so it
+/// can be tested without a keychain.
+fn mac_password_from(
+    browser: MacBrowser,
+    lookup: &dyn Fn(MacBrowser) -> KeychainOutcome,
+) -> Result<(String, bool)> {
+    match lookup(browser) {
+        KeychainOutcome::Found(pw) if !pw.is_empty() => Ok((pw, true)),
+        KeychainOutcome::Found(_) | KeychainOutcome::Missing => Err(Error::Refused(format!(
+            "no Safe Storage password for {} was found in the Keychain",
+            browser.keychain_service()
+        ))),
+        KeychainOutcome::Refused => Err(Error::KeychainLocked),
+        KeychainOutcome::Unavailable => Err(Error::Io(
+            "the macOS security tool did not answer".into(),
+        )),
+    }
+}
+
+/// The lock for one macOS browser, built from its Keychain password.
+pub fn mac_lock(browser: MacBrowser) -> Result<Lock> {
+    Ok(Lock::mac(&mac_browser_password(browser)?))
+}
+
+/// Sort one `security find-generic-password` result into a [`KeychainOutcome`].
+/// Pure, so the wording macOS answers with is pinned down by tests.
+#[cfg(any(target_os = "macos", test))]
+fn classify_security_output(success: bool, stdout: &[u8], stderr: &[u8]) -> KeychainOutcome {
+    let err = String::from_utf8_lossy(stderr);
+    // A locked keychain, or a session that may not prompt (SSH lands here):
+    // macOS says the interaction is not allowed instead of asking.
+    if err.contains("User interaction is not allowed") {
+        return KeychainOutcome::Refused;
+    }
+    if success {
+        let pw = String::from_utf8_lossy(stdout)
+            .trim_end_matches(['\n', '\r'])
+            .to_string();
+        return if pw.is_empty() {
+            KeychainOutcome::Missing
+        } else {
+            KeychainOutcome::Found(pw)
+        };
+    }
+    if err.contains("could not be found") || err.contains("item was not found") {
+        return KeychainOutcome::Missing;
+    }
+    KeychainOutcome::Unavailable
+}
+
+/// One Keychain lookup through the `security` tool that ships with macOS: the
+/// same shell-out philosophy as the old Linux secret-tool path, and it keeps a
+/// locked keychain a normal error instead of a hang or a prompt.
+/// What one attribute-only `security` query came back with. An item's
+/// attributes are readable without its secret, so this separates "there is
+/// no item" from "the item is there but the secret read was refused", which
+/// the secret read alone cannot always do: a read that may not prompt can
+/// be refused at once with no wording at all to classify.
+#[derive(Debug, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // its variants are built by the macOS lookup
+enum AttrOutcome {
+    /// The item is in the Keychain.
+    Exists,
+    /// No such item.
+    Missing,
+    /// The `security` tool is missing or failed in some other way.
+    Unavailable,
+}
+
+/// Sort one attribute-only `security find-generic-password` result into an
+/// [`AttrOutcome`]. Pure, like [`classify_security_output`].
+#[cfg(any(target_os = "macos", test))]
+fn classify_attr_output(success: bool, stderr: &[u8]) -> AttrOutcome {
+    if success {
+        return AttrOutcome::Exists;
+    }
+    let err = String::from_utf8_lossy(stderr);
+    if err.contains("could not be found") || err.contains("item was not found") {
+        return AttrOutcome::Missing;
+    }
+    AttrOutcome::Unavailable
+}
+
+/// Combine the attribute answer with the secret-read answer. A read that
+/// failed without a classifiable reason is a refusal when the item is
+/// known to exist: the secret is there, this reader may not have it yet
+/// (a locked Keychain, or the person's one-time OK still outstanding).
+/// When the attribute query found nothing, the item is simply missing,
+/// and answers that already know what happened pass through untouched.
+#[cfg(any(target_os = "macos", test))]
+fn resolve_keychain_outcome(attr: AttrOutcome, value: KeychainOutcome) -> KeychainOutcome {
+    if matches!(value, KeychainOutcome::Found(_) | KeychainOutcome::Refused) {
+        return value;
+    }
+    match attr {
+        AttrOutcome::Exists => KeychainOutcome::Refused,
+        AttrOutcome::Missing => KeychainOutcome::Missing,
+        AttrOutcome::Unavailable => value,
+    }
+}
+
+/// One `security` run under a hard time budget: the tool can stall on a
+/// locked keychain or a prompt nobody will ever see (an SSH session), and
+/// a stall must read as Unavailable, never as a hang. The worker thread is
+/// left to finish on its own when the budget runs out.
+#[cfg(target_os = "macos")]
+fn security_output(args: &[&str]) -> Option<std::process::Output> {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new("security").args(&args).output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(o)) => Some(o),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn security_cli_lookup(browser: MacBrowser) -> KeychainOutcome {
+    // Attributes first: they answer even when the secret read below is
+    // refused in silence, which is exactly the first-run case (the item is
+    // there and the read waits on the person's OK).
+    let attr = match security_output(&[
+        "find-generic-password",
+        "-s",
+        browser.keychain_service(),
+        "-a",
+        browser.keychain_account(),
+    ]) {
+        Some(o) => classify_attr_output(o.status.success(), &o.stderr),
+        None => AttrOutcome::Unavailable,
+    };
+    let value = match security_output(&[
+        "find-generic-password",
+        "-w",
+        "-s",
+        browser.keychain_service(),
+        "-a",
+        browser.keychain_account(),
+    ]) {
+        Some(o) => classify_security_output(o.status.success(), &o.stdout, &o.stderr),
+        None => KeychainOutcome::Unavailable,
+    };
+    resolve_keychain_outcome(attr, value)
+}
+
+/// No Keychain off macOS: the lookup simply never finds anything.
+#[cfg(not(target_os = "macos"))]
+fn security_cli_lookup(_browser: MacBrowser) -> KeychainOutcome {
+    KeychainOutcome::Unavailable
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,9 +678,20 @@ mod tests {
 
     #[test]
     fn wrong_linux_password_is_an_error_never_a_guess() {
-        let v10 = hex("7631301bb654833fa6f8a731528db92d657dc37c87544a81ba7875d0681273543b4e4fdb2564a521be4183708cc9385502c208");
-        // Wrong key either fails the padding or yields non-text; both are refusals, neither re-locks.
-        assert!(Lock::linux("not-peanuts", LinuxPrefix::V10).decrypt(".example.com", &v10).is_err());
+        let value = Lock::linux("secret", LinuxPrefix::V11)
+            .encrypt(".example.com", "password", HostTag::With).unwrap();
+        assert!(Lock::linux("wrong", LinuxPrefix::V11).decrypt(".example.com", &value).is_err());
+    }
+
+    #[test]
+    fn linux_mixed_labels_use_independent_keys() {
+        let lock = Lock::linux("keyring-secret", LinuxPrefix::V11);
+        let v10 = lock.encrypt_labelled("host", "legacy", HostTag::With, LinuxPrefix::V10).unwrap();
+        let v11 = lock.encrypt_labelled("host", "modern", HostTag::With, LinuxPrefix::V11).unwrap();
+        assert_eq!(lock.decrypt("host", &v10).unwrap(), "legacy");
+        assert_eq!(lock.decrypt("host", &v11).unwrap(), "modern");
+        assert_eq!(v10, Lock::linux("peanuts", LinuxPrefix::V10).encrypt("host", "legacy", HostTag::With).unwrap());
+        assert!(Lock::linux("peanuts", LinuxPrefix::V11).decrypt("host", &v11).is_err());
     }
 
     #[test]
@@ -365,86 +716,156 @@ mod tests {
 
     #[test]
     fn discovery_order_env_then_v2_then_app_then_fallback() {
-        let none = |_: &[(&str, &str)]| None;
+        let none = |_: &[(&str, &str)]| Ok(None);
         // Nothing anywhere: the compiled-in fallback, like Chromium itself.
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &none),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &none).unwrap(),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
         // The environment override wins over the keyring and is not a v2 item.
-        let v2 = |_: &[(&str, &str)]| Some("from-keyring".to_string());
+        let v2 = |_: &[(&str, &str)]| Ok(Some("from-keyring".to_string()));
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, Some("from-env".to_string()), &v2),
+            linux_browser_password_from(LinuxBrowser::Brave, Some("from-env".to_string()), &v2).unwrap(),
             ("from-env".to_string(), false)
         );
         // An empty override counts as unset ("" means no override).
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, Some(String::new()), &v2),
+            linux_browser_password_from(LinuxBrowser::Brave, Some(String::new()), &v2).unwrap(),
             ("from-keyring".to_string(), true)
         );
         // A schema-scoped hit is a v2 item; an application-only hit is not.
         let app_only = |attrs: &[(&str, &str)]| {
-            (attrs.len() == 1).then(|| "app-pw".to_string())
+            Ok((attrs.len() == 1).then(|| "app-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &app_only),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &app_only).unwrap(),
             ("app-pw".to_string(), false)
         );
         // A Chrome item is found when Chrome is the browser asked for.
         let chrome_only = |attrs: &[(&str, &str)]| {
-            attrs.iter().any(|(k, v)| *k == "application" && *v == "chrome")
-                .then(|| "chrome-pw".to_string())
+            Ok(attrs.iter().any(|(k, v)| *k == "application" && *v == "chrome")
+                .then(|| "chrome-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &chrome_only),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &chrome_only).unwrap(),
             ("chrome-pw".to_string(), true)
         );
+    }
+
+    #[test]
+    fn opera_is_a_linux_browser_with_its_own_keyring_app() {
+        assert_eq!(
+            LinuxBrowser::from_name("opera"),
+            Some(LinuxBrowser::Opera)
+        );
+        assert_eq!(LinuxBrowser::Opera.keyring_app(), "Opera");
+    }
+
+    #[test]
+    fn edge_is_a_linux_browser_with_its_own_keyring_app() {
+        assert_eq!(LinuxBrowser::from_name("edge"), Some(LinuxBrowser::Edge));
+        assert_eq!(LinuxBrowser::Edge.keyring_app(), "Microsoft Edge");
     }
 
     #[test]
     fn discovery_is_scoped_to_the_browser_asked_for() {
         // Both browsers have a keyring item; each lookup must return its own.
         let both = |attrs: &[(&str, &str)]| {
-            attrs
+            Ok(attrs
                 .iter()
                 .find(|(k, _)| *k == "application")
                 .and_then(|(_, v)| match *v {
                     "brave" => Some("brave-pw".to_string()),
                     "chrome" => Some("chrome-pw".to_string()),
                     _ => None,
-                })
+                }))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &both),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &both).unwrap(),
             ("brave-pw".to_string(), true)
         );
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &both),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &both).unwrap(),
             ("chrome-pw".to_string(), true)
         );
         // A Brave-only keyring must not serve a Chrome profile: it falls back
         // rather than returning Brave's password for a Chrome profile.
         let brave_only = |attrs: &[(&str, &str)]| {
-            attrs
+            Ok(attrs
                 .iter()
                 .any(|(k, v)| *k == "application" && *v == "brave")
-                .then(|| "brave-pw".to_string())
+                .then(|| "brave-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only).unwrap(),
+            (LINUX_FALLBACK_PASSWORD.to_string(), false)
+        );
+    }
+
+    #[test]
+    fn discovery_refuses_locked_or_timed_out_keyrings() {
+        // "No bus" is not in this list: the real lookup turns a missing bus or
+        // provider into a clean miss (see secret_service_lookup_inner), so the
+        // password layer falls back to peanuts instead of erroring.
+        for reason in ["locked", "timeout"] {
+            let lookup = |_: &[(&str, &str)]| Err(Error::KeychainUnavailable(reason.into()));
+            assert_eq!(linux_browser_password_from(LinuxBrowser::Chrome, None, &lookup).unwrap_err(),
+                Error::KeychainUnavailable(reason.into()));
+        }
+    }
+
+    #[test]
+    fn no_secret_service_is_a_clean_miss_and_peanuts_for_v10() {
+        // What the real lookup reports when there is no bus or no provider:
+        // no item, so the compiled-in password is used, with no v2 provenance.
+        // An empty store then writes v10; a v11 write still needs a verified key.
+        let none = |_: &[(&str, &str)]| Ok(None);
+        assert_eq!(
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &none).unwrap(),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
     }
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn secret_service_lookup_miss_returns_none() {
-        // A nonsense application matches nothing in any keyring, and a
-        // machine with no bus at all also returns None, never an error.
-        assert_eq!(
-            secret_service_lookup(&[("application", "moveit-no-such-app")]),
-            None
+    fn missing_provider_method_errors_are_clean_misses() {
+        for (name, missing) in [
+            ("org.freedesktop.DBus.Error.ServiceUnknown", true),
+            ("org.freedesktop.DBus.Error.NameHasNoOwner", true),
+            ("org.freedesktop.DBus.Error.AccessDenied", false),
+            ("org.freedesktop.DBus.Error.NoReply", false),
+            ("org.freedesktop.Secret.Error.IsLocked", false),
+        ] {
+            let message = zbus::Message::method("/org/freedesktop/secrets", "OpenSession")
+                .unwrap().build(&()).unwrap();
+            let error = secret_service::Error::Zbus(zbus::Error::MethodError(
+                name.try_into().unwrap(), None, message,
+            ));
+            assert_eq!(is_no_secret_service(&error), missing, "{name}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dead_bus_address_is_a_clean_miss() {
+        // Point zbus at a socket that does not exist: connecting fails with
+        // Unavailable, and the lookup reports a clean miss instead of an error.
+        // The env var is process-global, so this test holds a lock while it
+        // swaps it; no other test in this binary touches the bus.
+        static BUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = BUS_LOCK.lock().unwrap();
+        let prev = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+        std::env::set_var(
+            "DBUS_SESSION_BUS_ADDRESS",
+            "unix:path=/tmp/moveit-no-such-bus/socket",
         );
+        let found =
+            secret_service_lookup_inner(&[("application".to_string(), "chrome".to_string())]);
+        match prev {
+            Some(v) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", v),
+            None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+        }
+        assert_eq!(found.unwrap(), None);
     }
 
     #[test]
@@ -463,5 +884,257 @@ mod tests {
         assert_eq!(login_prefix_host("", "android://abc@com.app/"), "com.app");
         assert_eq!(login_prefix_host("", ""), "");
         assert_eq!(login_prefix_host("", "not a url"), "not a url");
+    }
+
+    // Vectors written independently of this code (same inputs through the
+    // reference stack): password "mac-test-safe-storage-pw", 1003 rounds.
+    #[test]
+    fn mac_key_matches_reference() {
+        assert_eq!(
+            derive("mac-test-safe-storage-pw", 1003).to_vec(),
+            hex("898c526c68b52821575ea43265c8a36e")
+        );
+    }
+
+    #[test]
+    fn mac_decrypts_reference_vectors() {
+        let lock = Lock::mac("mac-test-safe-storage-pw");
+        // A cookie value: SHA256(host) in front of the plaintext.
+        let tagged = hex("763130e209658513c1140173e31503b553c4769f91958473379ef733755af0f16ef1ef292b975402562acbe91e09ccbff4ddd1");
+        assert_eq!(lock.decrypt(".example.com", &tagged).unwrap(), "mac-cookie-1");
+        // CBC with a fixed IV is deterministic: our bytes must equal the reference's.
+        assert_eq!(
+            lock.encrypt(".example.com", "mac-cookie-1", HostTag::With).unwrap(),
+            tagged
+        );
+        // A login value: no host tag.
+        let untagged = hex("7631301b7193150c6caff72289b6d438daaafd");
+        assert_eq!(lock.decrypt("example.com", &untagged).unwrap(), "mac-login-pw-9");
+        assert_eq!(
+            lock.encrypt("example.com", "mac-login-pw-9", HostTag::Without).unwrap(),
+            untagged
+        );
+    }
+
+    #[test]
+    fn mac_round_trip_and_wrong_password() {
+        let lock = Lock::mac("some safe storage password");
+        let enc = lock
+            .encrypt(".example.com", "round-trip-me", HostTag::With)
+            .unwrap();
+        assert_eq!(&enc[..3], b"v10", "a Mac lock's own label is v10; stores override it per target");
+        assert_eq!(lock.decrypt(".example.com", &enc).unwrap(), "round-trip-me");
+        assert!(
+            Lock::mac("not the password")
+                .decrypt(".example.com", &enc)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mac_pepper_key_matches_reference() {
+        assert_eq!(
+            derive_salted("mac-test-safe-storage-pw", PEPPER, 1003).to_vec(),
+            hex("35584f68e84c13ed510c9cc713c644f6")
+        );
+    }
+
+    #[test]
+    fn mac_decrypts_v11_reference_vectors() {
+        let lock = Lock::mac("mac-test-safe-storage-pw");
+        // A cookie from a non-default user data dir: v11 label, pepper-derived key.
+        let tagged = hex("76313155dce3512dff6139a14eff5e3894c0e08bd12491923810b0801bcb99d2fa7db2e4d55f2d60caacf284a64e2954866e6b");
+        assert_eq!(lock.decrypt(".example.com", &tagged).unwrap(), "mac-cookie-1");
+        // Writing for a v11 store must reproduce those bytes exactly, key included.
+        assert_eq!(
+            lock.encrypt_labelled(".example.com", "mac-cookie-1", HostTag::With, LinuxPrefix::V11).unwrap(),
+            tagged
+        );
+        // A login value under the same scheme: no host tag.
+        let untagged = hex("76313140bb3ccbf51abdc8845123f745e0c0b0");
+        assert_eq!(lock.decrypt("example.com", &untagged).unwrap(), "mac-login-pw-9");
+        assert_eq!(
+            lock.encrypt_labelled("example.com", "mac-login-pw-9", HostTag::Without, LinuxPrefix::V11).unwrap(),
+            untagged
+        );
+    }
+
+    #[test]
+    fn mac_dispatch_is_by_label_not_by_trying_keys() {
+        let lock = Lock::mac("mac-test-safe-storage-pw");
+        // The v11 body under a v10 label must fail: the label picks the key.
+        let mut swapped = hex("76313155dce3512dff6139a14eff5e3894c0e08bd12491923810b0801bcb99d2fa7db2e4d55f2d60caacf284a64e2954866e6b");
+        swapped[..3].copy_from_slice(b"v10");
+        assert!(lock.decrypt(".example.com", &swapped).is_err());
+    }
+
+    #[test]
+    fn mac_mislabeled_v11_from_before_the_fix_is_a_clean_error() {
+        // Writes made before the pepper fix carried a v11 label over a salt-keyed
+        // body; no browser ever accepted those, and the reader now refuses them
+        // cleanly instead of handing back garbage.
+        let lock = Lock::mac("mac-test-safe-storage-pw");
+        let mut enc = lock.encrypt(".example.com", "secret", HostTag::With).unwrap();
+        enc[..3].copy_from_slice(b"v11");
+        assert!(matches!(lock.decrypt(".example.com", &enc), Err(Error::WrongBrowserPassword)));
+    }
+
+    #[test]
+    fn write_label_vote_counts_labels_only() {
+        // The vote reads the 3-byte label alone; even stub rows with no body count.
+        let v: Vec<&[u8]> = vec![b"v10", b"v10", b"v11realbody"];
+        assert_eq!(linux_write_prefix(v, false), LinuxPrefix::V10);
+    }
+
+    #[test]
+    fn mac_keychain_names() {
+        assert_eq!(MacBrowser::Brave.keychain_service(), "Brave Safe Storage");
+        assert_eq!(MacBrowser::Brave.keychain_account(), "Brave");
+        assert_eq!(MacBrowser::Chrome.keychain_service(), "Chrome Safe Storage");
+        assert_eq!(MacBrowser::Chrome.keychain_account(), "Chrome");
+        assert_eq!(
+            MacBrowser::Chromium.keychain_service(),
+            "Chromium Safe Storage"
+        );
+        assert_eq!(MacBrowser::Chromium.keychain_account(), "Chromium");
+        assert_eq!(
+            MacBrowser::Edge.keychain_service(),
+            "Microsoft Edge Safe Storage"
+        );
+        assert_eq!(MacBrowser::Edge.keychain_account(), "Microsoft Edge");
+        assert_eq!(MacBrowser::from_name("brave"), Some(MacBrowser::Brave));
+        assert_eq!(MacBrowser::from_name("chrome"), Some(MacBrowser::Chrome));
+        assert_eq!(MacBrowser::from_name("chromium"), Some(MacBrowser::Chromium));
+        assert_eq!(MacBrowser::from_name("edge"), Some(MacBrowser::Edge));
+        assert_eq!(MacBrowser::from_name("firefox"), None);
+    }
+
+    #[test]
+    fn empty_store_v11_trust_is_chromium_only() {
+        use LinuxBrowser::{Brave, Chrome, Chromium};
+        use MacBrowser;
+        assert!(!Brave.empty_store_v11_from_trusted_item(true));
+        assert!(!Chrome.empty_store_v11_from_trusted_item(true));
+        assert!(Chromium.empty_store_v11_from_trusted_item(true));
+        assert!(!Chromium.empty_store_v11_from_trusted_item(false));
+        assert!(!MacBrowser::Chrome.empty_store_v11_from_trusted_item(true));
+        assert!(MacBrowser::Chromium.empty_store_v11_from_trusted_item(true));
+    }
+
+    #[test]
+    fn mac_keychain_outcomes_map_to_engine_errors() {
+        let found = |_: MacBrowser| KeychainOutcome::Found("pw-123".to_string());
+        assert_eq!(
+            mac_password_from(MacBrowser::Brave, &found).unwrap(),
+            ("pw-123".to_string(), true)
+        );
+        // An empty secret counts as missing: no silent empty password.
+        let empty = |_: MacBrowser| KeychainOutcome::Found(String::new());
+        assert!(matches!(
+            mac_password_from(MacBrowser::Brave, &empty),
+            Err(Error::Refused(_))
+        ));
+        let missing = |_: MacBrowser| KeychainOutcome::Missing;
+        assert!(matches!(
+            mac_password_from(MacBrowser::Chrome, &missing),
+            Err(Error::Refused(_))
+        ));
+        // The locked or non-interactive keychain gets its own friendly error.
+        let refused = |_: MacBrowser| KeychainOutcome::Refused;
+        assert_eq!(
+            mac_password_from(MacBrowser::Brave, &refused).unwrap_err(),
+            Error::KeychainLocked
+        );
+        let unavailable = |_: MacBrowser| KeychainOutcome::Unavailable;
+        assert!(matches!(
+            mac_password_from(MacBrowser::Brave, &unavailable),
+            Err(Error::Io(_))
+        ));
+    }
+
+    #[test]
+    fn security_output_classification() {
+        // Success prints the password, newline and all.
+        assert_eq!(
+            classify_security_output(true, b"hunter2\n", b""),
+            KeychainOutcome::Found("hunter2".to_string())
+        );
+        // Success with nothing is a missing item, not an empty password.
+        assert_eq!(
+            classify_security_output(true, b"\n", b""),
+            KeychainOutcome::Missing
+        );
+        // The SSH / locked case: macOS refuses instead of prompting.
+        assert_eq!(
+            classify_security_output(
+                false,
+                b"",
+                b"security: SecKeychainSearchCopyNext: User interaction is not allowed."
+            ),
+            KeychainOutcome::Refused
+        );
+        assert_eq!(
+            classify_security_output(
+                false,
+                b"",
+                b"The specified item could not be found in the keychain."
+            ),
+            KeychainOutcome::Missing
+        );
+        assert_eq!(
+            classify_security_output(false, b"", b"something else went wrong"),
+            KeychainOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn security_attr_classification() {
+        // Attributes print for an existing item, secret or no secret.
+        assert_eq!(classify_attr_output(true, b""), AttrOutcome::Exists);
+        assert_eq!(
+            classify_attr_output(
+                false,
+                b"The specified item could not be found in the keychain."
+            ),
+            AttrOutcome::Missing
+        );
+        assert_eq!(classify_attr_output(false, b""), AttrOutcome::Unavailable);
+    }
+
+    #[test]
+    fn keychain_outcome_resolution() {
+        // Measured on a real machine: the item exists (its attributes
+        // answer) and the secret read fails at once with no wording at
+        // all, because this reader has not been given the person's OK
+        // yet. That is a refusal, not a broken tool.
+        assert_eq!(
+            resolve_keychain_outcome(
+                AttrOutcome::Exists,
+                classify_security_output(false, b"", b"")
+            ),
+            KeychainOutcome::Refused
+        );
+        // No item by either measure stays missing.
+        assert_eq!(
+            resolve_keychain_outcome(AttrOutcome::Missing, KeychainOutcome::Unavailable),
+            KeychainOutcome::Missing
+        );
+        // Answers that already know what happened pass through untouched.
+        assert_eq!(
+            resolve_keychain_outcome(
+                AttrOutcome::Missing,
+                KeychainOutcome::Found("pw".to_string())
+            ),
+            KeychainOutcome::Found("pw".to_string())
+        );
+        assert_eq!(
+            resolve_keychain_outcome(AttrOutcome::Unavailable, KeychainOutcome::Refused),
+            KeychainOutcome::Refused
+        );
+        // Nothing classifiable anywhere is still Unavailable.
+        assert_eq!(
+            resolve_keychain_outcome(AttrOutcome::Unavailable, KeychainOutcome::Unavailable),
+            KeychainOutcome::Unavailable
+        );
     }
 }

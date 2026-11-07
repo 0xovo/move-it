@@ -36,9 +36,28 @@ rusty-leveldb = "=4.0.2"
 ruzstd = "=0.9.1"
 
 
+# libc (MIT OR Apache-2.0): killpg for the git timeout, unix only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 
 # secret-service 4 (MIT OR Apache-2.0): D-Bus Secret Service client, replaces
 # the secret-tool CLI so a missing tool can no longer silently fall back.
 [target."cfg(target_os = \"linux\")".dependencies]
 secret-service = { version = "4", default-features = false, features = ["rt-async-io-crypto-rust"] }
+# zbus 4 (MIT OR Apache-2.0): only its D-Bus error type, so a bus with no
+# secret-service provider (ServiceUnknown / NameHasNoOwner) can be told apart
+# from a keyring that answered with an error. Same version secret-service uses.
+zbus = { version = "4", default-features = false }
+# keyring 3 (MIT OR Apache-2.0): the OS keychain where a paired device keeps its
+# sync key instead of a file on disk. The backend is per platform: Secret Service
+# on Linux, the login Keychain on macOS, Credential Manager on Windows (same
+# crate, same Entry API).
+keyring = { version = "3", default-features = false, features = ["async-secret-service"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }

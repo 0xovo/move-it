@@ -10,6 +10,7 @@
   --surface: #ffffff; --line: #e3ded3; --line-strong: #cfc8ba;
   --ok: #2f8a57; --ok-soft: #e3f1e8;
   --warn: #b5651d; --warn-soft: #f8ebdc;
+  --bad: #b03a2e; --bad-soft: #f9e7e2;
   --stage: #1f1d1a;
   --font: "Figtree", system-ui, sans-serif;
   --r-btn: 14px; --r-card: 16px; --r-stage: 22px;
@@ -123,6 +124,67 @@
 .row .icon { width: 20px; height: 20px; color: var(--muted); }
 .row b { font-weight: 800; font-variant-numeric: tabular-nums; }
 .row span { color: var(--muted); }
+
+/* logs */
+.log-list { margin-top: 16px; padding: 4px 14px; flex: 1; min-height: 0; overflow-y: auto; }
+.log-row { display: flex; align-items: baseline; gap: 9px; padding: 8px 0; }
+.log-row + .log-row { border-top: 1px solid var(--line); }
+.log-level { flex: none; padding: 2px 7px; border-radius: 999px; background: var(--bg2); color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .05em; }
+.log-level.warn { background: var(--warn-soft); color: var(--warn); }
+.log-level.error { background: var(--bad-soft); color: var(--bad); }
+.log-time { flex: none; color: var(--faint); font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.log-msg { flex: 1; font-size: 13.5px; font-weight: 600; overflow-wrap: anywhere; }
+/* preview: scrollable middle (totals, profile groups, cannot-move) */
+.scroll { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+
+/* preview: one tickable row per profile under its browser */
+.profile { display: flex; align-items: flex-start; gap: 11px; padding: 9px 0; cursor: pointer; }
+.profile + .profile { border-top: 1px solid var(--line); }
+.profile input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.profile .check {
+  width: 21px; height: 21px; margin-top: 1px; flex: none; display: grid; place-items: center;
+  border: 2px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: transparent;
+}
+.profile .check .icon { width: 13px; height: 13px; opacity: 0; }
+.profile input:checked ~ .check { background: var(--ink); border-color: var(--ink); color: var(--on-ink); }
+.profile input:checked ~ .check .icon { opacity: 1; }
+.profile input:focus-visible ~ .check { box-shadow: 0 0 0 4px rgba(31, 29, 26, .10); }
+.profile .p-main { flex: 1; display: grid; line-height: 1.3; }
+.profile .p-name { display: flex; align-items: center; gap: 8px; font-weight: 800; }
+.profile .p-counts { color: var(--muted); font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.profile .p-new { padding: 2px 8px; border-radius: 999px; background: var(--ok-soft); color: var(--ok); font-size: 11px; font-weight: 800; letter-spacing: .02em; }
+.profile.off .p-main { opacity: .45; }
+.profile.off .p-new { background: var(--bg2); color: var(--muted); }
+
+/* preview: routing (send a profile to a different browser) */
+.profile .p-dest { display: block; }
+.route-link {
+  margin-top: 5px; padding: 0; background: none; border: 0; cursor: pointer;
+  color: var(--muted); font: 700 12.5px/1 var(--font);
+  text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--line-strong);
+}
+.p-route {
+  display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; padding: 3px 5px 3px 9px;
+  border-radius: 999px; background: var(--bg); border: 1px solid var(--line);
+  font-size: 12px; font-weight: 700; color: var(--muted);
+}
+.p-route .icon { width: 14px; height: 14px; }
+.p-route b { color: var(--text); font-weight: 800; }
+.route-clear {
+  display: grid; place-items: center; width: 18px; height: 18px; padding: 0;
+  border: 0; border-radius: 50%; background: var(--line); color: var(--muted); cursor: pointer;
+}
+.route-clear .icon { width: 10px; height: 10px; }
+
+/* destination picker: the shared sheet, as a left-aligned list */
+.sheet.picker { justify-items: stretch; text-align: left; }
+.sheet.picker .sheet-title { text-align: left; }
+.sheet.picker .sheet-text { margin-bottom: 12px; }
+.sheet.picker .options { margin-top: 0; width: 100%; }
+.sheet.picker .hint { margin-top: 12px; }
+.sheet.picker .link { margin: 10px auto 0; }
+.option:disabled { opacity: .55; cursor: default; }
+.option:disabled .dot { display: none; }
 
 /* confetti for the paired moment */
 .confetti { position: absolute; inset: 0; pointer-events: none; }

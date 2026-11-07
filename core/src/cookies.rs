@@ -149,7 +149,8 @@ pub(crate) fn missing_notnull_defaults(
 
 /// What decrypts a cookie value on read / locks it on write, chosen per platform.
 pub enum Keys {
-    /// Linux and Mac derive one AES key; `from_libsecret_v2` decides the label for an empty store.
+    /// Linux and Mac derive one AES key; `from_libsecret_v2` is the empty-store
+    /// v11 trust flag (Chromium with its own unlocked item only).
     Cbc { lock: Lock, from_libsecret_v2: bool },
     /// Windows uses the DPAPI master key.
     Gcm { lock: Lock },
@@ -170,6 +171,8 @@ fn open(path: &Path) -> Result<Connection> {
 }
 
 /// Read and decrypt every cookie. `value` is used when `encrypted_value` is empty (old rows).
+/// Rows locked to the browser itself (App-Bound) are left out: they cannot move, and the
+/// preview already names them as skipped, so one locked row must not fail the whole read.
 pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
     let (_scratch, copy) = crate::util::snapshot_db(path)?;
     let con = open(&copy)?;
@@ -202,7 +205,19 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
     let mut out = Vec::new();
     for row in rows {
         let (host, name, path, value, enc, exp, cre, acc, sec, http, ss, upd, tfs) = row.map_err(sql)?;
-        let value = if enc.is_empty() { value } else { keys.lock().decrypt(&host, &enc)? };
+        let value = if enc.is_empty() {
+            value
+        } else if enc.starts_with(b"v20") {
+            // Locked to the browser itself (App-Bound): it stays behind, as the
+            // preview promises, instead of failing the whole read.
+            continue;
+        } else {
+            match keys.lock().decrypt(&host, &enc) {
+                Ok(v) => v,
+                Err(Error::AppBound) => continue,
+                Err(e) => return Err(e),
+            }
+        };
         out.push(Cookie {
             host,
             name,
@@ -230,7 +245,31 @@ fn resolve_write_prefix(con: &Connection, keys: &Keys) -> Result<Option<LinuxPre
         .map_err(sql)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql)?;
-    Ok(Some(linux_write_prefix(vals.iter().map(|v| v.as_slice()), *from_libsecret_v2)))
+    let vote = linux_write_prefix(vals.iter().map(|v| v.as_slice()), *from_libsecret_v2);
+    Ok(Some(vote))
+}
+
+fn verify_write_key(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Result<()> {
+    let label: &[u8] = match prefix {
+        Some(LinuxPrefix::V11) => b"v11",
+        _ => b"v10",
+    };
+    let sample: Option<(String, Vec<u8>)> = con.query_row(
+        "SELECT host_key, encrypted_value FROM cookies WHERE substr(encrypted_value,1,3)=?1 LIMIT 1",
+        [label], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().map_err(sql)?;
+    if let Some((host, blob)) = sample {
+        keys.lock().decrypt(&host, &blob)?;
+    } else if prefix == Some(LinuxPrefix::V11) {
+        // No row to check against: an empty store is the fresh-browser case.
+        // Trust the key only when it came from this browser's unlocked v2
+        // keyring item; a fallback key must never seed v11 rows.
+        let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
+        if !trusted {
+            return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
+        }
+    }
+    Ok(())
 }
 
 fn default_for(col: &str, c: &Cookie) -> SqlValue {
@@ -260,8 +299,11 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
     if !cols.iter().any(|c| c == "top_frame_site_key") {
         return Err(Error::Corrupt("this Cookies database predates partition keys; it is too old to write".into()));
     }
-    let write_prefix = resolve_write_prefix(&con, keys)?;
     let tx = con.transaction().map_err(sql)?;
+    let write_prefix = resolve_write_prefix(&tx, keys)?;
+    if !incoming.is_empty() {
+        verify_write_key(&tx, keys, write_prefix)?;
+    }
     let mut stats = Stats::default();
     // Modeled columns and their value for this cookie, if the column exists in this schema.
     let modeled = |c: &Cookie, enc: Vec<u8>| -> Vec<(&'static str, SqlValue)> {
@@ -314,7 +356,24 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
         };
 
         if let Some((rowid, cre, acc, exp, upd, val, enc)) = &existing {
-            let value = if enc.is_empty() { val.clone() } else { keys.lock().decrypt(&c.host, enc)? };
+            let value = if enc.is_empty() {
+                val.clone()
+            } else if enc.starts_with(b"v20") {
+                // The row already there is locked to this browser itself: it
+                // cannot be read or compared from outside, so it stays untouched
+                // and the incoming row is dropped, never the other way round.
+                stats.kept_newer += 1;
+                continue;
+            } else {
+                match keys.lock().decrypt(&c.host, enc) {
+                    Ok(v) => v,
+                    Err(Error::AppBound) => {
+                        stats.kept_newer += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             let cur = Cookie {
                 host: c.host.clone(),
                 name: c.name.clone(),
@@ -387,13 +446,9 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
 
 fn lock_with_prefix(keys: &Keys, host: &str, value: &str, prefix: LinuxPrefix) -> Result<Vec<u8>> {
     let Keys::Cbc { lock, .. } = keys else { unreachable!() };
-    // Re-key is unnecessary: only the 3-byte label differs between v10 and v11.
-    let mut enc = lock.encrypt(host, value, HostTag::With)?;
-    enc[..3].copy_from_slice(match prefix {
-        LinuxPrefix::V10 => b"v10",
-        LinuxPrefix::V11 => b"v11",
-    });
-    Ok(enc)
+    // The label is the store's own convention, and the lock keys the body to match
+    // it: on Linux both labels share one key, on Mac they do not.
+    lock.encrypt_labelled(host, value, HostTag::With, prefix)
 }
 
 #[cfg(test)]
@@ -423,6 +478,175 @@ mod tests {
         let con = Connection::open(&p).unwrap();
         con.execute_batch(SCHEMA).unwrap();
         (t, p)
+    }
+
+    #[test]
+    fn linux_mixed_store_exports_and_writes_chromium_keys() {
+        use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        use sha2::{Digest, Sha256};
+        let (_t, p) = db();
+        let k = Keys::Cbc { lock: Lock::linux("keyring-secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        let con = Connection::open(&p).unwrap();
+        for (label, password, name) in [(b"v10", "peanuts", "old"), (b"v11", "keyring-secret", "new")] {
+            let mut key = [0u8; 16];
+            pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), b"saltysalt", 1, &mut key);
+            let plain = [Sha256::digest(b".a.com").as_slice(), name.as_bytes()].concat();
+            let body = cbc::Encryptor::<aes::Aes128>::new((&key).into(), (&[b' '; 16]).into())
+                .encrypt_padded_vec_mut::<Pkcs7>(&plain);
+            let blob = [label.as_slice(), body.as_slice()].concat();
+            con.execute("INSERT INTO cookies (creation_utc,host_key,name,path,encrypted_value) VALUES (1,'.a.com',?1,'/',?2)", (name, blob)).unwrap();
+        }
+        assert_eq!(export(&p, &k).unwrap().len(), 2);
+        import(&p, &[cookie(".a.com", "added", "value", 2)], &k).unwrap();
+        let written: Vec<u8> = con.query_row("SELECT encrypted_value FROM cookies WHERE name='added'", [], |r| r.get(0)).unwrap();
+        assert_eq!(&written[..3], b"v10");
+        assert_eq!(Lock::linux("peanuts", LinuxPrefix::V10).decrypt(".a.com", &written).unwrap(), "value");
+    }
+
+    #[test]
+    fn pure_inserts_verify_the_existing_cookie_key() {
+        let (_t, p) = db();
+        let right = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: true };
+        let seed = Lock::linux("secret", LinuxPrefix::V11).encrypt(".a.com", "seed", HostTag::With).unwrap();
+        Connection::open(&p).unwrap().execute(
+            "INSERT INTO cookies (creation_utc,host_key,name,path,encrypted_value) VALUES (1,'.a.com','seed','/',?1)", [seed]).unwrap();
+        let before = std::fs::read(&p).unwrap();
+        assert!(import(&p, &[cookie(".b.com", "new", "value", 2)], &keys()).is_err());
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        import(&p, &[cookie(".b.com", "new", "value", 2)], &right).unwrap();
+    }
+
+    #[test]
+    fn empty_v11_cookie_store_trusts_a_v2_keyring_key() {
+        let (_t, p) = db();
+        let keys = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: true };
+        import(&p, &[cookie(".b.com", "new", "value", 2)], &keys).unwrap();
+        let written: Vec<u8> = Connection::open(&p).unwrap().query_row("SELECT encrypted_value FROM cookies WHERE name='new'", [], |r| r.get(0)).unwrap();
+        assert_eq!(&written[..3], b"v11");
+        assert_eq!(export(&p, &keys).unwrap()[0].value, "value");
+        let (_t3, p3) = db();
+        let con = Connection::open(&p3).unwrap();
+        let fallback = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        assert!(verify_write_key(&con, &fallback, Some(LinuxPrefix::V11)).is_err());
+    }
+
+    #[test]
+    fn mac_follows_the_stores_label_and_keys_to_match() {
+        let mac = || Keys::Cbc { lock: Lock::mac("mac-test-safe-storage-pw"), from_libsecret_v2: false };
+        let raw = |p: &std::path::Path, name: &str| -> Vec<u8> {
+            Connection::open(p)
+                .unwrap()
+                .query_row("SELECT encrypted_value FROM cookies WHERE name=?1", [name], |r| r.get(0))
+                .unwrap()
+        };
+        // An empty store has no convention to mirror: the first write takes the
+        // lock's own v10 label, with the key that label names.
+        let (_t, p) = db();
+        import(&p, &[cookie(".a.com", "n", "one", 1)], &mac()).unwrap();
+        assert_eq!(&raw(&p, "n")[..3], b"v10");
+        assert_eq!(export(&p, &mac()).unwrap().len(), 1);
+
+        // A store that already speaks v11 is followed, and the body is keyed to
+        // match: byte-identical to the lock's own v11 writing of the same value.
+        let (_t2, p2) = db();
+        let seed_blob = Lock::mac("mac-test-safe-storage-pw")
+            .encrypt_labelled(".a.com", "seedv", HostTag::With, LinuxPrefix::V11)
+            .unwrap();
+        Connection::open(&p2)
+            .unwrap()
+            .execute(
+                "INSERT INTO cookies (creation_utc, host_key, name, value, encrypted_value, path) \
+                 VALUES (1, '.a.com', 'seed', '', ?1, '/')",
+                [seed_blob],
+            )
+            .unwrap();
+        import(&p2, &[cookie(".a.com", "n", "two", 2)], &mac()).unwrap();
+        let written = raw(&p2, "n");
+        assert_eq!(&written[..3], b"v11");
+        assert_eq!(
+            written,
+            Lock::mac("mac-test-safe-storage-pw")
+                .encrypt_labelled(".a.com", "two", HostTag::With, LinuxPrefix::V11)
+                .unwrap()
+        );
+        assert_eq!(export(&p2, &mac()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn linux_empty_store_label_is_per_browser_on_linux() {
+        let (_t, p) = db();
+        let chrome_v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        import(&p, &[cookie(".a.com", "c", "one", 1)], &chrome_v2).unwrap();
+        let c_blob: Vec<u8> = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='c'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&c_blob[..3], b"v10");
+        let (_t2, p2) = db();
+        let brave_v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        import(&p2, &[cookie(".a.com", "b", "one", 1)], &brave_v2).unwrap();
+        let b_blob: Vec<u8> = Connection::open(&p2)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='b'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&b_blob[..3], b"v10");
+        let (_t3, p3) = db();
+        let chromium_v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: true };
+        import(&p3, &[cookie(".a.com", "h", "one", 1)], &chromium_v2).unwrap();
+        let h_blob: Vec<u8> = Connection::open(&p3)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='h'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&h_blob[..3], b"v11");
+    }
+
+    #[test]
+    fn mac_empty_store_label_is_per_browser() {
+        let mac = |empty_v11: bool| Keys::Cbc {
+            lock: Lock::mac("mac-test-safe-storage-pw"),
+            from_libsecret_v2: empty_v11,
+        };
+        let label3 = |p: &std::path::Path, name: &str| -> [u8; 3] {
+            let v: Vec<u8> = Connection::open(p)
+                .unwrap()
+                .query_row("SELECT encrypted_value FROM cookies WHERE name=?1", [name], |r| r.get(0))
+                .unwrap();
+            v[..3].try_into().unwrap()
+        };
+        let (_t, p) = db();
+        import(&p, &[cookie(".a.com", "c", "one", 1)], &mac(false)).unwrap();
+        assert_eq!(label3(&p, "c"), *b"v10");
+        let (_t2, p2) = db();
+        import(&p2, &[cookie(".a.com", "b", "one", 1)], &mac(false)).unwrap();
+        assert_eq!(label3(&p2, "b"), *b"v10");
+        let (_t3, p3) = db();
+        import(&p3, &[cookie(".a.com", "h", "one", 1)], &mac(true)).unwrap();
+        assert_eq!(label3(&p3, "h"), *b"v11");
+    }
+
+    #[test]
+    fn mac_empty_store_under_a_local_state_writes_v10() {
+        // Regression: Mac legs 1 and 3 refused an empty store under a
+        // non-canonical root, because the folder location picked v11 and the
+        // verify guard then refused (a Mac key has no v2 provenance). The
+        // location no longer decides: an empty store writes v10, and a store
+        // that already speaks v11 is still followed (see the test above).
+        let mac = || Keys::Cbc { lock: Lock::mac("mac-test-safe-storage-pw"), from_libsecret_v2: false };
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Google").join("Chrome");
+        std::fs::create_dir_all(root.join("Default")).unwrap();
+        std::fs::write(root.join("Local State"), "{}").unwrap();
+        let p = root.join("Default").join("Cookies");
+        Connection::open(&p).unwrap().execute_batch(SCHEMA).unwrap();
+        import(&p, &[cookie(".a.com", "n", "one", 1)], &mac()).unwrap();
+        let raw = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name=?1", ["n"], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap();
+        assert_eq!(&raw[..3], b"v10");
+        assert_eq!(export(&p, &mac()).unwrap().len(), 1);
     }
 
     fn cookie(host: &str, name: &str, value: &str, cre: i64) -> Cookie {
@@ -458,6 +682,56 @@ mod tests {
             .query_row("SELECT encrypted_value FROM cookies WHERE host_key='.a.com'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(&raw[..3], b"v10");
+    }
+
+    #[test]
+    fn export_leaves_app_bound_rows_behind() {
+        let (_t, p) = db();
+        import(&p, &[cookie(".a.com", "sid", "hello", 100)], &keys()).unwrap();
+        // A row locked to the browser itself, planted raw the way it is written.
+        let con = Connection::open(&p).unwrap();
+        let mut blob = b"v20".to_vec();
+        blob.extend_from_slice(&[7u8; 40]);
+        con.execute(
+            "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.locked.example', 'sess', '/', ?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        drop(con);
+        let back = export(&p, &keys()).unwrap();
+        assert_eq!(back.len(), 1, "the locked row stays behind, the rest still reads");
+        assert_eq!(back[0].value, "hello");
+    }
+
+    #[test]
+    fn import_keeps_an_app_bound_row_and_lands_the_rest() {
+        let (_t, p) = db();
+        // The target already holds a locked row for one identity.
+        let con = Connection::open(&p).unwrap();
+        let mut blob = b"v20".to_vec();
+        blob.extend_from_slice(&[7u8; 40]);
+        con.execute(
+            "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (100, '.a.com', 'sid', '/', ?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        drop(con);
+        let s = import(
+            &p,
+            &[cookie(".a.com", "sid", "hello", 200), cookie(".b.com", "t", "world", 200)],
+            &keys(),
+        )
+        .unwrap();
+        assert_eq!(s, Stats { imported: 1, kept_newer: 1 });
+        // The locked row is still there, still locked; the other cookie landed.
+        let raw: Vec<u8> = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE host_key='.a.com'", [], |r| r.get(0))
+            .unwrap();
+        assert!(raw.starts_with(b"v20"), "the locked row is untouched");
+        let back = export(&p, &keys()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].value, "world");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::{Error, Result};
 pub const TXN_PREFIX: &str = ".moveit-txn-";
 const MANIFEST: &str = "manifest.json";
 const COMMITTED: &str = "COMMITTED";
+const UNDO_MANIFEST: &str = "undo.json";
 const UNDONE: &str = "UNDONE";
 const UNDOING: &str = "UNDOING";
 const LOCK_FILE: &str = ".moveit.lock";
@@ -136,7 +137,14 @@ pub fn digest(p: &Path) -> Result<(Kind, String)> {
 
 fn copy_file_synced(from: &Path, to: &Path) -> Result<()> {
     fs::copy(from, to).map_err(|e| io(e, "cannot copy", from))?;
-    fs::File::open(to).and_then(|f| f.sync_all()).map_err(|e| io(e, "cannot sync", to))
+    // The flush needs a writable handle: Windows refuses FlushFileBuffers
+    // on a read-only handle (access denied) where Linux fsync does not
+    // care, and every other sync in the engine uses a write handle for
+    // the same reason. A store file copied with read-only bits keeps the
+    // old behaviour through the read-only fallback, which still flushes
+    // fine on Linux.
+    let f = fs::OpenOptions::new().write(true).open(to).or_else(|_| fs::File::open(to));
+    f.and_then(|f| f.sync_all()).map_err(|e| io(e, "cannot sync", to))
 }
 
 /// Copy `from`'s own permission bits onto `to` (unix). Preserves modes like 0700 on directories,
@@ -215,8 +223,21 @@ fn read_manifest(txn_dir: &Path) -> Result<Manifest> {
     serde_json::from_slice(&raw).map_err(|_| Error::Corrupt(format!("journal {} is unreadable", p.display())))
 }
 
+fn read_undo_manifest(dir: &Path) -> Result<Manifest> {
+    if dir.join(UNDO_MANIFEST).exists() {
+        let raw = fs::read(dir.join(UNDO_MANIFEST)).map_err(|e| io(e, "cannot read undo", dir))?;
+        serde_json::from_slice(&raw).map_err(|_| Error::Corrupt("the undo manifest is unreadable".into()))
+    } else {
+        read_manifest(dir)
+    }
+}
+
 fn restore_all(txn_dir: &Path) -> Result<()> {
-    let m = read_manifest(txn_dir)?;
+    let m = if txn_dir.join(COMMITTED).exists() {
+        read_undo_manifest(txn_dir)?
+    } else {
+        read_manifest(txn_dir)?
+    };
     // Restore everything we can, then report the first failure.
     let mut first_err = None;
     for e in &m.entries {
@@ -251,6 +272,10 @@ pub enum Recovery {
 }
 
 /// One running Move It per browser folder. The OS drops the lock if we crash.
+/// The lock file itself is never deleted. It has to keep a single stable inode:
+/// if the path were unlinked on drop, a waiter that had already opened the old
+/// file could lock it while a newcomer created and locked a fresh one, and two
+/// owners would hold an "exclusive" lock on the same folder.
 struct FolderLock(#[allow(dead_code)] fs::File);
 
 fn lock_folder(root: &Path) -> Result<FolderLock> {
@@ -277,6 +302,14 @@ fn lock_folder(root: &Path) -> Result<FolderLock> {
 }
 
 /// Run on every start, before anything else touches the stores in `root`.
+/// True when a journal in `root` was left unfinished: a move (or an undo) was
+/// cut short there, so [`recover`] has something to put back. Read-only: it
+/// lists the folder but takes no lock and creates nothing.
+pub fn has_unfinished(root: &Path) -> bool {
+    let Ok(dirs) = txn_dirs(root) else { return false };
+    dirs.iter().any(|d| !d.join(COMMITTED).exists() || (d.join(UNDOING).exists() && !d.join(UNDONE).exists()))
+}
+
 pub fn recover(root: &Path) -> Result<Recovery> {
     let _lock = lock_folder(root)?;
     recover_locked(root)
@@ -338,7 +371,7 @@ pub fn undo_last(root: &Path, force: bool) -> Result<Undo> {
     if !force {
         let post: Vec<String> = serde_json::from_slice(&fs::read(d.join(COMMITTED)).unwrap_or_default())
             .map_err(|_| Error::Corrupt("the undo point is unreadable".into()))?;
-        let m = read_manifest(&d)?;
+        let m = read_undo_manifest(&d)?;
         let now: Result<Vec<String>> = m.entries.iter().map(|e| digest(&e.original).map(|x| x.1)).collect();
         if now? != post {
             return Ok(Undo::ChangedSince);
@@ -451,13 +484,44 @@ impl Txn {
     /// The marker records how the stores look now, so a later undo can tell if they changed.
     /// If the marker cannot be written, the move is rolled back and the error returned,
     /// so the user is never told "failed" while the data stays changed.
-    pub fn commit(mut self) -> Result<()> {
-        self.done = true;
+    pub fn commit(self) -> Result<()> {
+        self.commit_preserving(None)
+    }
+
+    /// A retry keeps the first round's snapshots as this move's undo baseline.
+    /// The ordinary manifest still rolls back just this round if it fails or crashes.
+    pub(crate) fn commit_preserving(mut self, previous: Option<&str>) -> Result<()> {
         let marked = (|| {
+            let mut undo = self.manifest.clone();
+            if let Some(name) = previous {
+                let prior = undo_point(&self.root)?.ok_or_else(|| Error::Refused("the move's undo point disappeared".into()))?;
+                if prior.file_name().and_then(|n| n.to_str()) != Some(name) {
+                    return Err(Error::Refused("the move's undo point changed".into()));
+                }
+                let mut baseline = read_undo_manifest(&prior)?;
+                for (i, entry) in baseline.entries.iter_mut().enumerate() {
+                    let snapshot = PathBuf::from(format!("previous{i}"));
+                    match entry.kind {
+                        Kind::File => copy_file_synced(&prior.join(&entry.snapshot), &self.dir.join(&snapshot))?,
+                        Kind::Dir => copy_tree(&prior.join(&entry.snapshot), &self.dir.join(&snapshot))?,
+                        Kind::Absent => {}
+                    }
+                    entry.snapshot = snapshot;
+                }
+                for entry in &self.manifest.entries {
+                    if !baseline.entries.iter().any(|e| entry.original == e.original
+                        || (matches!(e.kind, Kind::Dir | Kind::Absent) && entry.original.starts_with(&e.original))) {
+                        baseline.entries.push(entry.clone());
+                    }
+                }
+                undo = baseline;
+                mark(&self.dir, UNDO_MANIFEST, &serde_json::to_vec(&undo).map_err(|e| Error::Io(e.to_string()))?)?;
+            }
             let post: Result<Vec<String>> =
-                self.manifest.entries.iter().map(|e| digest(&e.original).map(|x| x.1)).collect();
+                undo.entries.iter().map(|e| digest(&e.original).map(|x| x.1)).collect();
             mark(&self.dir, COMMITTED, &serde_json::to_vec(&post?).map_err(|e| Error::Io(e.to_string()))?)
         })();
+        self.done = true;
         if let Err(e) = marked {
             let _ = fs::remove_file(self.dir.join(COMMITTED));
             restore_all(&self.dir)?;
@@ -547,6 +611,26 @@ mod tests {
         for w in writes.iter().take(upto) {
             w();
         }
+    }
+
+    #[test]
+    fn retry_keeps_the_first_round_undo_and_adds_new_stores() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a");
+        let b = t.path().join("b");
+        fs::write(&a, b"before").unwrap();
+        let first = Txn::begin(t.path(), &[("a", &a)]).unwrap();
+        let point = first.dir().file_name().unwrap().to_str().unwrap().to_string();
+        fs::write(&a, b"round one").unwrap();
+        first.commit().unwrap();
+        let second = Txn::begin(t.path(), &[("a", &a), ("b", &b)]).unwrap();
+        fs::write(&a, b"round two").unwrap();
+        fs::write(&b, b"new").unwrap();
+        second.commit_preserving(Some(&point)).unwrap();
+        assert_eq!(txn_dirs(t.path()).unwrap().len(), 1);
+        assert_eq!(undo_last(t.path(), false).unwrap(), Undo::Done);
+        assert_eq!(fs::read(&a).unwrap(), b"before");
+        assert!(!b.exists());
     }
 
     #[test]
@@ -686,6 +770,29 @@ mod tests {
             write_all_stores(&f.root, 4);
         }
         assert_eq!(snap(&f.root), before);
+    }
+
+    #[test]
+    fn a_dropped_lock_never_lets_two_owners_in() {
+        // Ported from a review reproducer. A waiter opens the lock file
+        // while the holder still owns it; when the holder lets go, the waiter
+        // takes the lock, and a newcomer arriving after that must be refused.
+        // This only holds while the lock file keeps one stable inode.
+        let f = fx();
+        let lock_path = f.root.join(LOCK_FILE);
+        let a = lock_folder(&f.root).unwrap();
+        let b = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(matches!(b.try_lock(), Err(fs::TryLockError::WouldBlock)));
+        drop(a);
+        b.try_lock().unwrap();
+        match lock_folder(&f.root) {
+            Err(Error::Busy) => {}
+            Ok(_) => panic!("newcomer locked the folder while the waiter still holds it"),
+            Err(e) => panic!("unexpected error from the newcomer attempt: {e:?}"),
+        }
+        assert!(lock_path.exists(), "dropping a lock guard must not delete the lock file");
+        drop(b);
+        let _c = lock_folder(&f.root).unwrap();
     }
 
     #[cfg(unix)]

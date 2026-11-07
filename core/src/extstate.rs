@@ -73,9 +73,30 @@ fn default_dir(profile: &Path) -> PathBuf {
     profile.join("Default")
 }
 
+fn slot_dir(profile: &Path, slot: &str) -> PathBuf {
+    profile.join(slot)
+}
+
+fn ids_at(default: &Path) -> Result<Vec<String>> {
+    subdir_names(&default.join("Extensions"))
+}
+
 /// Extension IDs installed in the profile: the subfolder names of `Default/Extensions`.
 pub fn installed_extension_ids(profile: &Path) -> Result<Vec<String>> {
-    subdir_names(&default_dir(profile).join("Extensions"))
+    ids_at(&default_dir(profile))
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn installed_extension_ids_in(profile: &Path, slot: &str) -> Result<Vec<String>> {
+    ids_at(&slot_dir(profile, slot))
+}
+
+fn candidates_at(default: &Path) -> Result<Vec<String>> {
+    let mut ids: BTreeSet<String> = ids_at(default)?.into_iter().collect();
+    for folder in EXT_STATE_FOLDERS {
+        ids.extend(subdir_names(&default.join(folder))?);
+    }
+    Ok(ids.into_iter().collect())
 }
 
 /// Extension IDs whose state this profile carries: installed folders plus the per-ID subfolders
@@ -83,22 +104,21 @@ pub fn installed_extension_ids(profile: &Path) -> Result<Vec<String>> {
 /// entry). IndexedDB units are only taken for IDs on this list, so a website origin sharing the
 /// IndexedDB folder can never be mistaken for extension state.
 pub fn extension_id_candidates(profile: &Path) -> Result<Vec<String>> {
-    let mut ids: BTreeSet<String> = installed_extension_ids(profile)?.into_iter().collect();
-    for folder in EXT_STATE_FOLDERS {
-        ids.extend(subdir_names(&default_dir(profile).join(folder))?);
-    }
-    Ok(ids.into_iter().collect())
+    candidates_at(&default_dir(profile))
 }
 
-/// The per-extension IndexedDB units present: (unit directory name, path), both shapes
-/// (`chrome-extension_<id>_0.indexeddb.leveldb` and `chrome-extension_<id>_0`).
-pub fn indexeddb_units(profile: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let idb = default_dir(profile).join(INDEXEDDB_STATE_FOLDER);
+/// The same, for a named profile slot inside the browser folder.
+pub fn extension_id_candidates_in(profile: &Path, slot: &str) -> Result<Vec<String>> {
+    candidates_at(&slot_dir(profile, slot))
+}
+
+fn units_at(default: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let idb = default.join(INDEXEDDB_STATE_FOLDER);
     if !real_dir(&idb)? {
         return Ok(Vec::new());
     }
     let mut units = Vec::new();
-    for id in extension_id_candidates(profile)? {
+    for id in candidates_at(default)? {
         for suffix in ["_0.indexeddb.leveldb", "_0"] {
             let name = format!("chrome-extension_{id}{suffix}");
             let path = idb.join(&name);
@@ -108,6 +128,12 @@ pub fn indexeddb_units(profile: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(units)
+}
+
+/// The per-extension IndexedDB units present: (unit directory name, path), both shapes
+/// (`chrome-extension_<id>_0.indexeddb.leveldb` and `chrome-extension_<id>_0`).
+pub fn indexeddb_units(profile: &Path) -> Result<Vec<(String, PathBuf)>> {
+    units_at(&default_dir(profile))
 }
 
 /// What a profile's extension state looks like: the manifest object and the file bytes by
@@ -153,7 +179,12 @@ fn take(prefix: &str, dir: &Path, rel: &str, files: &mut BTreeMap<String, Vec<u8
 /// excluded (a leveldb store is only coherent whole); the manifest records size + SHA-256 per
 /// file so the receiving side can verify before writing anything.
 pub fn collect(profile: &Path) -> Result<Collected> {
-    let default = default_dir(profile);
+    collect_in(profile, "Default")
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn collect_in(profile: &Path, slot: &str) -> Result<Collected> {
+    let default = slot_dir(profile, slot);
     let mut files = BTreeMap::new();
     let mut entries = Vec::new();
     let mut folders: Vec<String> = Vec::new();
@@ -165,7 +196,7 @@ pub fn collect(profile: &Path) -> Result<Collected> {
         folders.push(folder.to_string());
         take(folder, &base, "", &mut files, &mut entries)?;
     }
-    for (name, dir) in indexeddb_units(profile)? {
+    for (name, dir) in units_at(&default)? {
         if !folders.iter().any(|f| f == INDEXEDDB_STATE_FOLDER) {
             folders.push(INDEXEDDB_STATE_FOLDER.to_string());
         }
@@ -173,7 +204,7 @@ pub fn collect(profile: &Path) -> Result<Collected> {
     }
     let total: usize = files.values().map(Vec::len).sum();
     let mut manifest = Map::new();
-    manifest.insert("installed_ids".into(), json!(installed_extension_ids(profile)?));
+    manifest.insert("installed_ids".into(), json!(ids_at(&default)?));
     manifest.insert("folders".into(), json!(folders));
     manifest.insert("files".into(), Value::Array(entries));
     manifest.insert("total_bytes".into(), json!(total));
@@ -220,9 +251,14 @@ fn plan(ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Targe
 /// The folders an import would replace, for the caller to snapshot (`Txn::begin`) first.
 /// Validates the manifest the same way [`import`] does.
 pub fn target_dirs(profile: &Path, ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Vec<PathBuf>> {
+    target_dirs_in(profile, "Default", ext_manifest, files)
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn target_dirs_in(profile: &Path, slot: &str, ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Vec<PathBuf>> {
     Ok(plan(ext_manifest, files)?
         .keys()
-        .map(|(folder, id)| default_dir(profile).join(folder).join(id))
+        .map(|(folder, id)| slot_dir(profile, slot).join(folder).join(id))
         .collect())
 }
 
@@ -246,8 +282,13 @@ fn check_way(default: &Path, folder: &str, target: &Path) -> Result<()> {
 /// Replace each carried extension folder with the box's copy. Everything is validated before
 /// the first byte is written. Atomicity is the caller's `Txn`.
 pub fn import(profile: &Path, ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Stats> {
+    import_in(profile, "Default", ext_manifest, files)
+}
+
+/// The same, for a named profile slot inside the browser folder.
+pub fn import_in(profile: &Path, slot: &str, ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Stats> {
     let by_target = plan(ext_manifest, files)?;
-    let default = default_dir(profile);
+    let default = slot_dir(profile, slot);
     for ((folder, id), _) in &by_target {
         check_way(&default, folder, &default.join(folder).join(id))?;
     }

@@ -3,18 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Move It: 6 Browser open</title>
+<title>Move It: 6 Blocked</title>
 <link rel="stylesheet" href="../style/moveit.css">
 </head>
 <body class="screen-page">
 <div>
-  <div class="dev"><b>6 Browser open</b></div>
+  <div class="dev"><b>6 Blocked</b></div>
   <div class="app" data-screen="blocked">
-    <section class="state" data-state="blocked">
+    <section class="state" data-state="blocked" data-label="Browser open">
       <div class="top"><span class="wordmark">Move It</span></div>
       <div class="stage"><div class="lemur" data-lemur="wait"></div></div>
       <h1 class="title">Close <span data-bind="browser">Brave</span> and tap again</h1>
       <p class="sub">Move It can only move your things while <span data-bind="browser">Brave</span> is closed.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="retry">Try again</button></div>
+    </section>
+    <section class="state" data-state="never-launched" data-label="Never launched" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="wait"></div></div>
+      <h1 class="title">Open <span data-bind="browser">Brave</span> once, then come back</h1>
+      <p class="sub"><span data-bind="browser">Brave</span> has not been opened on this device yet. Open it once so it can set itself up, then come back to Move It.</p>
       <div class="actions"><button class="btn btn-primary" data-action="retry">Try again</button></div>
     </section>
   </div>

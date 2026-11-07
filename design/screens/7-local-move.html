@@ -69,6 +69,13 @@
       <p class="sub">Move It can only move your things while both browsers are closed.</p>
       <div class="actions"><button class="btn btn-primary" data-action="retry">Try again</button></div>
     </section>
+    <section class="state" data-state="never-launched" data-label="Never launched" hidden>
+      <div class="top"><span class="wordmark">Move It</span></div>
+      <div class="stage"><div class="lemur" data-lemur="wait"></div></div>
+      <h1 class="title">Open <span data-bind="browser">Chrome</span> once, then come back</h1>
+      <p class="sub"><span data-bind="browser">Chrome</span> has not been opened on this device yet. Open it once so it can set itself up, then come back to Move It.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="retry">Try again</button></div>
+    </section>
   </div>
 </div>
 <script src="../loader/frames/manifest.js"></script>

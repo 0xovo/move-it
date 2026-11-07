@@ -9,4 +9,6 @@ description = "Overnight stress test: fleets of virtual devices trade sealed box
 moveit-core = { path = "../core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1"
+# Same base64 (MIT/Apache-2.0) the core pins; decodes Local State keys on Windows.
+base64 = "=0.22.1"
 tempfile = "3"

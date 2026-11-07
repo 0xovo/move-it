@@ -11,15 +11,120 @@
 //! the engine gives the same result in either order, so conflicted boxes are simply read and
 //! merged too, then cleared on the next push. The person never sees a conflict.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
 pub const BOX_FILE: &str = "moveit-box.json";
 pub const FOLDER_NAME: &str = "Move It";
+/// Bound every git helper call so a hung fetch/push cannot hang the app.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const README: &str = "This folder holds Move It's sealed box: your browsers, sealed so only your own paired \
 devices can open it. On its own it is useless to anyone else. Do not edit it by hand.\n";
+
+/// Drop the userinfo from any `scheme://userinfo@host` fragment: a
+/// `user:pass@` pair and a bare token (`https://TOKEN@host`) alike.
+fn redact_git_full(raw: &str) -> String {
+    let mut s = raw.to_string();
+    let mut i = 0;
+    while let Some(rel) = s[i..].find("://") {
+        let start = i + rel + 3;
+        let rest = &s[start..];
+        let Some(at_rel) = rest.find('@') else { break };
+        let slash = rest.find('/').unwrap_or(usize::MAX);
+        if at_rel < slash && at_rel > 0 {
+            s.replace_range(start..start + at_rel, "***");
+            i = start + 3;
+            continue;
+        }
+        i = start;
+    }
+    s
+}
+
+/// Cap a message for display: a git error never shows a huge dump on a
+/// user-facing screen. Classification (lost race vs real refusal) always
+/// reads the uncapped text first; only the reported copy is cut.
+fn cap_git_msg(s: &str) -> String {
+    const MAX: usize = 400;
+    let count = s.chars().count();
+    if count > MAX {
+        format!("{}…", s.chars().take(MAX).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
+fn redact_git_msg(raw: &str) -> String {
+    cap_git_msg(&redact_git_full(raw))
+}
+
+/// Run a command with piped stdio, kill it if it exceeds `timeout`, and return its output.
+/// Kill the child and, on unix, its whole process group: the child was
+/// spawned in its own group, so a helper it started cannot outlive it.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        // SAFETY: killpg on the child's own group id; the group was made
+        // for this child at spawn and holds only its helpers.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+fn output_with_timeout(mut cmd: Command, timeout: Duration, label: &str) -> Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Io(format!("{label} is not available: {e}")))?;
+    let mut stdout_pipe = child.stdout.take().ok_or_else(|| Error::Io(format!("{label} produced no stdout pipe")))?;
+    let mut stderr_pipe = child.stderr.take().ok_or_else(|| Error::Io(format!("{label} produced no stderr pipe")))?;
+    let (tx_out, rx_out) = std::sync::mpsc::channel();
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        let _ = tx_out.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        let _ = tx_err.send(buf);
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                kill_tree(&mut child);
+                let _ = child.wait();
+                return Err(Error::Io(format!("{label} timed out")));
+            }
+            Err(e) => return Err(Error::Io(format!("{label} failed: {e}"))),
+        }
+    };
+    // The child has exited, but a grandchild can hold a pipe open past it:
+    // the drain gets whatever time is left, never less than a short grace,
+    // and then the run returns with what arrived.
+    let grace = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_secs(2));
+    let stdout = rx_out.recv_timeout(grace).unwrap_or_default();
+    let stderr = rx_err.recv_timeout(grace).unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
+}
 
 pub trait Pipe {
     /// Where the box and the pairing note live, after [`Pipe::refresh`].
@@ -58,11 +163,23 @@ pub fn boxes_in(place: &Path) -> Result<Vec<PathBuf>> {
     Ok(main)
 }
 
+/// True for the names sync apps give a conflicted copy of the main box
+/// ("moveit-box (1).json", "moveit-box (conflicted copy 2026-11-02).json").
+/// Named per-profile boxes ("moveit-box-brave-default.json") are NOT conflicts:
+/// they are live boxes other profiles still travel in.
+fn is_conflict_copy(name: &str) -> bool {
+    name.starts_with("moveit-box (") || name.contains("conflicted copy")
+}
+
 /// After a successful push of a merged box, clear the conflicted copies it absorbed.
+/// Only the sync apps' conflict names go; per-profile boxes are left alone.
 pub fn clear_conflicts(place: &Path) -> Result<usize> {
     let mut n = 0;
-    for p in boxes_in(place)?.into_iter().skip_while(|p| p.file_name().is_some_and(|f| f == BOX_FILE)) {
-        if std::fs::remove_file(&p).is_ok() {
+    for p in boxes_in(place)? {
+        let is_conflict = p
+            .file_name()
+            .is_some_and(|f| f != BOX_FILE && is_conflict_copy(&f.to_string_lossy()));
+        if is_conflict && std::fs::remove_file(&p).is_ok() {
             n += 1;
         }
     }
@@ -71,9 +188,18 @@ pub fn clear_conflicts(place: &Path) -> Result<usize> {
 
 /// Write the box: temp file then rename, so the sync app never uploads half a box.
 pub fn write_box_bytes(place: &Path, bytes: &[u8]) -> Result<()> {
+    write_named_box(place, BOX_FILE, bytes).map(|_| ())
+}
+
+/// Write one named box file (a per-profile box next to the main one), same
+/// temp-then-rename discipline. Returns true when the bytes on disk changed.
+pub fn write_named_box(place: &Path, name: &str, bytes: &[u8]) -> Result<bool> {
     std::fs::create_dir_all(place).map_err(|e| Error::Io(e.to_string()))?;
-    let target = place.join(BOX_FILE);
-    let tmp = place.join(format!("{BOX_FILE}.tmp-moveit"));
+    let target = place.join(name);
+    if std::fs::read(&target).is_ok_and(|old| old == bytes) {
+        return Ok(false);
+    }
+    let tmp = place.join(format!("{name}.tmp-moveit"));
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp).map_err(|e| Error::Io(e.to_string()))?;
@@ -89,7 +215,19 @@ pub fn write_box_bytes(place: &Path, bytes: &[u8]) -> Result<()> {
     if !readme.exists() {
         let _ = std::fs::write(readme, README);
     }
-    Ok(())
+    Ok(true)
+}
+
+/// The box file name one source profile travels in (the main box is the working
+/// profile's; every other profile gets its own named file).
+pub fn profile_box_name(browser: &str, slot_slug: &str) -> String {
+    format!("moveit-box-{browser}-{slot_slug}.json")
+}
+
+/// True for a per-profile box file name (as opposed to the main box or a
+/// sync app's conflicted copy of it).
+pub fn is_profile_box(name: &str) -> bool {
+    name.starts_with("moveit-box-") && name.ends_with(".json") && !name.contains("tmp-moveit")
 }
 
 pub struct FolderPipe {
@@ -136,16 +274,28 @@ impl GitPipe {
     }
 
     fn git(&self, args: &[&str]) -> Result<String> {
-        let out = Command::new("git")
-            .arg("-C")
+        self.git_classified(args)
+            .map_err(|e| match e {
+                Error::Io(m) => Error::Io(cap_git_msg(&m)),
+                other => other,
+            })
+    }
+
+    /// Like [`Pipe::git`], but the error keeps the full (redacted) stderr:
+    /// a caller classifying the failure reads all of it, not a cut copy.
+    fn git_classified(&self, args: &[&str]) -> Result<String> {
+        let label = format!("git {}", args.first().copied().unwrap_or("command"));
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(&self.repo)
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| Error::Io(format!("git is not available: {e}")))?;
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null());
+        let out = output_with_timeout(cmd, GIT_TIMEOUT, &label)?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr });
-            return Err(Error::Io(format!("git {} failed: {}", args[0], msg.trim())));
+            return Err(Error::Io(format!("{label} failed: {}", redact_git_full(msg.trim()))));
         }
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
@@ -208,7 +358,7 @@ impl Pipe for GitPipe {
         }
         self.git(&["commit", "-q", "-m", &format!("Move It: sync from {note}")])?;
         let b = self.branch()?;
-        match self.git(&["push", "origin", &format!("HEAD:{b}")]) {
+        match self.git_classified(&["push", "origin", &format!("HEAD:{b}")]) {
             Ok(_) => Ok(()),
             // A LOST RACE (someone pushed first) is the only case we retry as Busy. A push the
             // remote actively refuses (protected branch, hook, push protection) is a real error
@@ -221,6 +371,7 @@ impl Pipe for GitPipe {
             {
                 Err(Error::Busy)
             }
+            Err(Error::Io(m)) => Err(Error::Io(cap_git_msg(&m))),
             Err(e) => Err(e),
         }
     }
@@ -229,6 +380,27 @@ impl Pipe for GitPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_errors_hide_credentials_and_stay_short() {
+        let raw = "fatal: could not read from remote repository.\nhttps://alice:s3cret@github.com/o/r.git non-fast-forward";
+        let clean = redact_git_msg(raw);
+        assert!(!clean.contains("s3cret"), "password must not appear");
+        assert!(!clean.contains("alice:"), "user:pass form must not appear");
+        assert!(clean.contains("***@github.com"), "host kept so the error is still useful");
+        assert!(clean.contains("non-fast-forward"), "busy detection phrases must survive");
+        let long = "x".repeat(1000);
+        assert!(redact_git_msg(&long).chars().count() <= 401);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_helper_is_killed_and_returns_a_clean_error() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let err = output_with_timeout(cmd, Duration::from_millis(200), "sleep").unwrap_err();
+        assert!(matches!(err, Error::Io(ref m) if m.contains("timed out")), "{err:?}");
+    }
 
     #[test]
     fn conflicted_copies_are_found_and_cleared() {

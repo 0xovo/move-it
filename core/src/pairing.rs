@@ -31,7 +31,7 @@ use crate::{Error, Result};
 
 pub const OFFER_FILE: &str = "moveit-pairing.json";
 pub const PAIRED_FILE: &str = "moveit-paired.json";
-pub const OFFER_TTL_SECS: u64 = 7 * 24 * 3600;
+pub const OFFER_TTL_SECS: u64 = 600;
 pub const MAX_TRIES: u32 = 10;
 const KDF_MIB: u32 = 64;
 const KDF_PASSES: u32 = 3;
@@ -101,9 +101,7 @@ fn stretch(code: &str, salt: &[u8], m_kib: u32, t: u32) -> Result<[u8; 32]> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp-moveit");
-    std::fs::write(&tmp, bytes).map_err(|e| Error::Io(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::Io(e.to_string()))
+    crate::util::atomic_write(path, bytes)
 }
 
 /// Device A: leave an offer in `place` for `key`, guarded by `code`.
@@ -165,15 +163,51 @@ pub struct Tries {
 }
 
 impl Tries {
-    fn read(&self, offer_id: &str) -> u32 {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| s.split_once(' ').filter(|(id, _)| *id == offer_id).and_then(|(_, n)| n.trim().parse().ok()))
-            .unwrap_or(0)
+    fn read(&self, offer_id: &str) -> Result<u32> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(Error::Io(format!(
+                    "cannot read the pairing tries: {e}"
+                )))
+            }
+        };
+        let mut parts = text.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(id), Some(n)) if id == offer_id => n
+                .parse()
+                .map_err(|_| Error::Io("the pairing tries file is damaged".into())),
+            _ => Ok(0),
+        }
     }
-    fn write(&self, offer_id: &str, n: u32) {
-        let _ = std::fs::write(&self.path, format!("{offer_id} {n}"));
+
+    fn write(&self, offer_id: &str, n: u32) -> Result<()> {
+        // Fail closed: if the try count cannot be saved, refuse rather than letting
+        // wrong codes be retried without limit.
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io(format!("cannot record pairing tries: {e}")))?;
+        }
+        crate::util::atomic_write(&self.path, format!("{offer_id} {n}").as_bytes())
+            .map_err(|e| match e {
+                Error::Io(m) => Error::Io(format!("cannot record pairing tries: {m}")),
+                other => other,
+            })
     }
+}
+
+/// Tell device A who paired, sealed with the key both devices now share,
+/// so only A can read the name. Called by the accepting device only after
+/// the key is safely stored on it: a note without a stored key would tell
+/// A a pairing happened that this device cannot use.
+pub fn leave_paired_note(place: &Path, key: &SyncKey, this_device: &str) -> Result<()> {
+    let n = random::<12>()?;
+    let note = key.seal_small(&n, this_device.as_bytes())?;
+    let p = Paired { v: 1, nonce: B64.encode(n), data: B64.encode(note) };
+    write_atomic(
+        &place.join(PAIRED_FILE),
+        &serde_json::to_vec(&p).map_err(|e| Error::Io(e.to_string()))?,
+    )
 }
 
 /// Result of typing a code on device B.
@@ -186,16 +220,19 @@ pub enum Accept {
     Nothing,
 }
 
-/// Device B: try `code` against the offer; on success write the "paired" note.
-pub fn accept(place: &Path, code: &str, this_device: &str, tries: &Tries) -> Result<Accept> {
+/// Device B: open an offer. Callers that store keys use [`accept_and_store`].
+pub fn accept(place: &Path, code: &str, _this_device: &str, tries: &Tries) -> Result<Accept> {
     let Some(o) = read_offer(place)? else { return Ok(Accept::Nothing) };
     if now().saturating_sub(o.created) > OFFER_TTL_SECS {
         return Ok(Accept::NeedNewCode);
     }
-    let used = tries.read(&o.salt);
+    let used = tries.read(&o.salt)?;
     if used >= MAX_TRIES {
         return Ok(Accept::NeedNewCode);
     }
+    // The try is spent before the expensive stretch runs: killing the
+    // process mid-stretch must not hand the try back.
+    tries.write(&o.salt, used + 1)?;
     let dec = |s: &str| B64.decode(s).map_err(|_| Error::Corrupt("the pairing note is damaged".into()));
     let (salt, nonce, data) = (dec(&o.salt)?, dec(&o.nonce)?, dec(&o.data)?);
     if nonce.len() != 12 {
@@ -209,18 +246,28 @@ pub fn accept(place: &Path, code: &str, this_device: &str, tries: &Tries) -> Res
     let k = stretch(code, &salt, o.m_kib, o.t)?;
     let Ok(plain) = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&k)).decrypt(Nonce::from_slice(&nonce), data.as_slice())
     else {
-        tries.write(&o.salt, used + 1);
         let left = MAX_TRIES - used - 1;
         return Ok(if left == 0 { Accept::NeedNewCode } else { Accept::WrongCode { tries_left: left } });
     };
     let key = SyncKey::from_key_file_text(std::str::from_utf8(&plain).unwrap_or_default())?;
-    // Tell device A, sealed with the key we now share, so only A can read who paired.
-    let n = random::<12>()?;
-    let note = key.seal_small(&n, this_device.as_bytes())?;
-    let p = Paired { v: 1, nonce: B64.encode(n), data: B64.encode(note) };
-    write_atomic(&place.join(PAIRED_FILE), &serde_json::to_vec(&p).map_err(|e| Error::Io(e.to_string()))?)?;
-    let _ = std::fs::remove_file(&tries.path);
     Ok(Accept::Paired(key))
+}
+
+/// Accept and spend an offer only after the caller has durably stored its key.
+pub fn accept_and_store(
+    place: &Path,
+    code: &str,
+    this_device: &str,
+    tries: &Tries,
+    store: &dyn Fn(&SyncKey) -> Result<()>,
+) -> Result<Accept> {
+    let accepted = accept(place, code, this_device, tries)?;
+    if let Accept::Paired(key) = &accepted {
+        store(key)?;
+        let _ = std::fs::remove_file(place.join(OFFER_FILE));
+        let _ = std::fs::remove_file(&tries.path);
+    }
+    Ok(accepted)
 }
 
 /// Device A, on every start: if the other device has paired, delete the offer and return its name.
@@ -256,6 +303,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_key_store_keeps_the_offer_for_a_retry() {
+        let shared = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let key = SyncKey::generate().unwrap();
+        offer_cheap(shared.path(), &key, "482913");
+        let tries = Tries { path: state.path().join("tries") };
+        let fail = |_: &SyncKey| Err(Error::KeychainUnavailable("locked".into()));
+        assert!(accept_and_store(shared.path(), "482913", "b", &tries, &fail).is_err());
+        assert!(shared.path().join(OFFER_FILE).exists());
+        assert!(tries.path.exists());
+        let store = crate::keychain::MemoryStore::default();
+        let save = |key: &SyncKey| crate::keychain::KeyStore::store(&store, "b", key);
+        assert!(matches!(accept_and_store(shared.path(), "482913", "b", &tries, &save).unwrap(), Accept::Paired(_)));
+        assert!(crate::keychain::KeyStore::load(&store, "b").unwrap().is_some());
+        assert!(!shared.path().join(OFFER_FILE).exists());
+        assert!(!tries.path.exists());
+    }
+
+    #[test]
     fn full_pairing_through_a_shared_folder() {
         let shared = tempfile::tempdir().unwrap();
         let b_state = tempfile::tempdir().unwrap();
@@ -266,6 +332,8 @@ mod tests {
         let tries = Tries { path: b_state.path().join("tries") };
         let Accept::Paired(got) = accept(shared.path(), "482 913", "windows", &tries).unwrap() else { panic!() };
         assert_eq!(got.to_key_file_text(), key.to_key_file_text());
+        // The caller leaves the note only after the key is stored on its side.
+        leave_paired_note(shared.path(), &got, "windows").unwrap();
         assert_eq!(check_paired(shared.path(), &key).unwrap(), Some("windows".into()));
         assert_eq!(look(shared.path()).unwrap(), Found::Nothing, "offer is gone once paired");
     }
@@ -302,5 +370,22 @@ mod tests {
     #[test]
     fn shipped_kdf_cost_is_the_slow_one() {
         assert_eq!((KDF_MIB, KDF_PASSES), (64, 3));
+    }
+
+    #[test]
+    fn unwritable_try_count_fails_closed() {
+        let shared = tempfile::tempdir().unwrap();
+        let key = SyncKey::generate().unwrap();
+        offer_cheap(shared.path(), &key, "482913");
+        // Point the try counter at a path whose parent is a file: create_dir_all fails.
+        let blocker = shared.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let tries = Tries { path: blocker.join("tries") };
+        let err = accept(shared.path(), "000000", "b", &tries).unwrap_err();
+        assert!(matches!(err, Error::Io(ref m) if m.contains("pairing tries")), "{err:?}");
+        // A later attempt with a working counter still sees zero used tries (nothing was stored).
+        let ok_state = tempfile::tempdir().unwrap();
+        let tries = Tries { path: ok_state.path().join("tries") };
+        assert!(matches!(accept(shared.path(), "000000", "b", &tries).unwrap(), Accept::WrongCode { tries_left: 9 }));
     }
 }
