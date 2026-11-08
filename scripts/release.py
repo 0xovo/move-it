@@ -140,9 +140,17 @@ def verify():
                         str(Path(temp) / "SHA256SUMS"), "--clobber"], check=True)
 
 
+CLAMAV_MAX_BYTES = 2000 * 1024 * 1024
+
+
 def clamscan(path):
+    # clamscan skips files over --max-filesize (100M by default) and still exits
+    # 0, so raise the limits and refuse anything ClamAV cannot fully scan.
+    if path.stat().st_size > CLAMAV_MAX_BYTES:
+        raise ValueError(f"{path.name} is too large for ClamAV to scan")
     completed = subprocess.run(
-        ["clamscan", "--infected", "--no-summary", str(path)],
+        ["clamscan", "--infected", "--no-summary",
+         "--max-filesize=2000M", "--max-scansize=2000M", str(path)],
         capture_output=True,
         text=True,
     )

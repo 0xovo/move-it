@@ -1,0 +1,38 @@
+name: scan release
+
+# Re-runs the release malware gate on an existing draft without rebuilding it.
+# Same steps and script as the malware job in release.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag to scan (vX.Y.Z)
+        required: true
+        type: string
+
+# Draft releases are only visible to tokens with push access; this job
+# only reads the draft.
+permissions:
+  contents: write
+
+jobs:
+  malware:
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout 4.2.2, MIT, released 2024-10-23.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install ClamAV
+        run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
+      # The apt package starts the freshclam service, which holds the log and
+      # database lock; stop it so this step owns the update.
+      - name: Update virus definitions
+        run: |
+          sudo systemctl stop clamav-freshclam
+          sudo freshclam
+      - name: Scan draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: python3 scripts/release.py scan
+      - run: echo 'Malware gate passed. The release remains a draft until a maintainer publishes it.' >> "$GITHUB_STEP_SUMMARY"

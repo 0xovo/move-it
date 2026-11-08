@@ -226,3 +226,37 @@ class VirusTotalGate(unittest.TestCase):
         self.assertIsNone(calls[0][1])
         self.assertEqual(calls[1][0], "https://upload.fixture/large")
         self.assertEqual(calls[1][1], "POST")
+
+class ClamScanChecks(unittest.TestCase):
+    def test_limits_raised_so_large_installers_are_scanned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "app.AppImage"
+            path.write_bytes(b"x")
+            with patch.object(release.subprocess, "run") as run:
+                run.return_value.returncode = 0
+                release.clamscan(path)
+            args = run.call_args[0][0]
+            self.assertIn("--max-filesize=2000M", args)
+            self.assertIn("--max-scansize=2000M", args)
+
+    def test_file_too_large_to_scan_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "huge.AppImage"
+            with open(path, "wb") as f:
+                f.truncate(release.CLAMAV_MAX_BYTES + 1)
+            with patch.object(release.subprocess, "run") as run:
+                with self.assertRaises(ValueError):
+                    release.clamscan(path)
+            run.assert_not_called()
+
+    def test_detection_and_scanner_error_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "app.exe"
+            path.write_bytes(b"x")
+            for code in (1, 2):
+                with patch.object(release.subprocess, "run") as run:
+                    run.return_value.returncode = code
+                    run.return_value.stderr = run.return_value.stdout = ""
+                    with self.assertRaises(ValueError):
+                        release.clamscan(path)
+

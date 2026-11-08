@@ -140,16 +140,22 @@ jobs:
   malware:
     needs: [prepare, verify]
     runs-on: ubuntu-24.04
+    # Draft releases are only visible to tokens with push access; this job
+    # only reads the draft.
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ needs.prepare.outputs.sha }}
       - name: Install ClamAV
         run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
+      # The apt package starts the freshclam service, which holds the log and
+      # database lock; stop it so this step owns the update.
       - name: Update virus definitions
-        run: sudo freshclam
+        run: |
+          sudo systemctl stop clamav-freshclam
+          sudo freshclam
       - name: Scan draft release assets
         env:
           GH_TOKEN: ${{ github.token }}
