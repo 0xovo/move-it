@@ -1,0 +1,158 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+      id: ${{ steps.release.outputs.id }}
+    steps:
+      # actions/checkout 4.2.2, MIT, released 2024-10-23.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+      - name: Validate release inputs and create a draft
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/release.py prepare
+
+  dependencies:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.14.0'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      # dtolnay/rust-toolchain 1.90.0, MIT, released 2026-10-16.
+      - uses: dtolnay/rust-toolchain@7dcc700092a1a8b9c17ba0e140b4e34e93000946
+        with:
+          toolchain: 1.90.0
+      # cargo-audit 0.21.2, Apache-2.0/MIT, released 2025-03-18.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.21.2 --locked --force
+      - run: npm ci
+        working-directory: app
+      - run: npm audit --audit-level=high
+        working-directory: app
+      - run: cargo audit --locked
+
+  build:
+    needs: [prepare, dependencies]
+    # The action merges latest.json with the draft's existing platforms. Serialize
+    # uploads so two runners cannot overwrite one another's updater entries.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb,rpm
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      # actions/setup-node 4.4.0, MIT, released 2025-04-02.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.14.0'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@7dcc700092a1a8b9c17ba0e140b4e34e93000946
+        with:
+          toolchain: 1.90.0
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev patchelf libdbus-1-dev rpm
+      # rust-cache 2.8.1, MIT, released 2025-09-18.
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1
+      - run: npm ci
+        working-directory: app
+      - run: npm test
+        working-directory: app
+      - run: cargo test --workspace --locked
+      # tauri-action 0.5.23, MIT, released 2025-08-25.
+      - uses: tauri-apps/tauri-action@e834788a94591d81e3ae0bd9ec06366f5afb8994
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          releaseId: ${{ needs.prepare.outputs.id }}
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseDraft: true
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --locked --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  verify:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Validate updater assets and attach checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 scripts/release.py verify
+      - run: echo 'Draft verified. Review installers and platform smoke results before publishing the release.' >> "$GITHUB_STEP_SUMMARY"
+
+  malware:
+    needs: [prepare, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Install ClamAV
+        run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
+      - name: Update virus definitions
+        run: sudo freshclam
+      - name: Scan draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: python3 scripts/release.py scan
+      - run: echo 'Malware gate passed. The release remains a draft until a maintainer publishes it.' >> "$GITHUB_STEP_SUMMARY"

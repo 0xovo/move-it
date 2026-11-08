@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fail if any crate version in a Cargo.lock was published less than MIN_DAYS ago.
+set -euo pipefail
+
+MIN_DAYS="${MIN_DAYS:-14}"
+LOCK="${1:?usage: check-dep-age <Cargo.lock>}"
+UA="${CRATES_IO_USER_AGENT:-moveit-dep-age/1.0 (contact: dev@local)}"
+CUTOFF="$(python3 - "$MIN_DAYS" <<'PY'
+import sys
+from datetime import datetime, timedelta, timezone
+print((datetime.now(timezone.utc) - timedelta(days=int(sys.argv[1]))).isoformat())
+PY
+)"
+
+fail=0
+while read -r name version; do
+  name="${name//\"/}"
+  version="${version//\"/}"
+  encoded_version="$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$version")"
+  sleep 0.25
+  if ! response="$(curl -fsS -H "User-Agent: $UA" \
+    "https://crates.io/api/v1/crates/${name}/${encoded_version}")"; then
+    echo "lookup failed: $name $version" >&2
+    fail=1
+    continue
+  fi
+  created="$(python3 -c "import sys,json; d=json.loads(sys.argv[1]); v=d.get('version'); print(v['created_at'] if v else '')" "$response")"
+  if [[ -z "$created" ]]; then
+    echo "no publish date: $name $version" >&2
+    fail=1
+    continue
+  fi
+  if [[ "$created" > "$CUTOFF" ]]; then
+    echo "too new: $name $version (published $created)" >&2
+    fail=1
+  fi
+done < <(python3 - "$LOCK" <<'PY'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+for block in text.split("[[package]]")[1:]:
+    if 'source = "registry+' not in block:
+        continue
+    name = version = None
+    for line in block.splitlines():
+        if line.startswith("name = "):
+            name = line.split('"')[1]
+        elif line.startswith("version = "):
+            version = line.split('"')[1]
+    if name and version:
+        print(name, version)
+PY
+)
+
+exit "$fail"

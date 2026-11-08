@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Move It</title>
+<link rel="stylesheet" href="design/style/moveit.css"><link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main class="app" aria-busy="false">
+  <header class="top"><button class="wordmark link" id="home-link">Move It</button><button class="link" id="about-link">About</button></header>
+  <div id="update-notice" class="update-notice" role="region" aria-label="Update available" hidden>
+    <p id="update-notice-text"></p>
+    <div class="update-actions"><button class="btn btn-quiet" type="button" id="update-later">Later</button><button class="btn btn-primary" type="button" id="update-now">Update now</button></div>
+  </div>
+  <p id="error" class="notice error" role="alert" hidden></p>
+  <p id="status" class="notice" role="status" hidden></p>
+  <section id="welcome" class="state" hidden>
+    <div class="stage"><div class="lemur" data-mode="show"></div></div>
+    <h1 class="title">Your whole browser,<br>on every device.</h1>
+    <p class="sub">Bring your supported browser data with you.</p>
+    <div class="actions"><button class="btn btn-primary" id="start">Get started</button><button class="btn btn-quiet" data-nav="local">Move on this device</button></div>
+  </section>
+  <section id="home" class="state" hidden>
+    <div class="stage"><div class="lemur" data-mode="still"></div></div>
+    <h1 class="title" id="home-title">Your browser, ready to go</h1>
+    <p class="sub" id="last-sync"></p><p class="hint" id="device"></p>
+    <div class="actions"><button class="btn btn-primary" id="preview-button">Move It</button><button class="btn btn-quiet" id="undo" disabled>Undo last move</button></div>
+    <nav class="home-nav"><button class="link" id="pair-button">Pair a device</button><button class="link" data-nav="local">Move on this device</button><button class="link" data-nav="logs">Logs</button><button class="link" data-nav="pipe">Change folder</button></nav>
+    <p class="version" data-version></p>
+  </section>
+  <section id="pipe" class="state" hidden>
+    <h1 class="title at-top">Where should Move It keep your sealed box?</h1><p class="sub">Choose a folder already shared between your devices.</p>
+    <div class="options" id="pipe-options" role="radiogroup" aria-label="Shared folder"></div>
+    <p class="hint" id="pipe-path"></p><div class="spacer"></div>
+    <div class="actions"><button class="btn btn-primary" id="use-pipe" disabled>Use this folder</button></div>
+    <p class="note">For cloud folders, use your provider’s desktop app. For git, choose an existing clone.</p>
+  </section>
+  <section id="pair" class="state" hidden>
+    <h1 class="title at-top">Bring your devices together</h1><p class="sub">Use the same shared folder on both devices.</p>
+    <div id="show-code-panel"><div class="card pair-card"><span id="pair-code" class="code"></span></div><p class="hint">Type this code on your other device. It expires in ten minutes.</p><div class="actions"><button class="btn btn-primary" id="check-pair">Check pairing</button><button class="btn btn-quiet" id="have-code">I have a code</button></div></div>
+    <form id="pair-form" hidden><label for="code-input" class="group-label">Code from your other device</label><input class="code-input" id="code-input" inputmode="numeric" autocomplete="off" maxlength="15" required><div class="actions"><button class="btn btn-primary" type="submit">Pair devices</button><button class="btn btn-quiet" type="button" id="show-code">Show a code instead</button></div></form>
+  </section>
+  <section id="preview" class="state" hidden>
+    <h1 class="title at-top">Ready to move</h1><p class="sub" id="preview-target"></p>
+    <div id="profiles"></div><div id="totals" class="card rows"></div>
+    <div id="skipped"></div><p class="note">Keep your browsers closed. Review what cannot move before continuing.</p>
+    <div class="actions"><button class="btn btn-primary" id="move">Move It</button></div>
+  </section>
+  <section id="local" class="state" hidden>
+    <h1 class="title at-top">Move on this device</h1><p class="sub">From one browser to another. Everything stays here.</p>
+    <label class="group-label" for="source">From</label><select id="source"></select>
+    <label class="group-label" for="target">To</label><select id="target"></select>
+    <p class="hint" id="local-hint"></p><div class="spacer"></div>
+    <div class="actions"><button class="btn btn-primary" id="local-preview">Continue</button></div>
+  </section>
+  <section id="moving" class="state" hidden>
+    <div class="stage"><div class="lemur" data-mode="dance"></div></div><h1 class="title">Moving your things</h1><p class="sub" id="moving-line" role="status">Getting started</p><p class="note">Keep both browsers closed for a moment.</p>
+  </section>
+  <section id="done" class="state" hidden>
+    <div class="stage short"><div class="lemur" data-mode="still"></div></div><h1 class="title" id="done-title">Move finished</h1><div class="card rows" id="report"></div><div id="report-skips"></div><div class="actions"><button class="btn btn-primary" id="done-button">Done</button></div>
+  </section>
+  <section id="blocked" class="state" hidden>
+    <div class="stage"><div class="lemur" data-mode="wait"></div></div><h1 class="title" id="blocked-title">Close your browser and tap again</h1><p class="sub" id="blocked-sub">Move It needs your browsers closed before changing their data.</p><div class="actions"><button class="btn btn-primary" id="retry">Try again</button></div>
+  </section>
+  <section id="logs" class="state" hidden>
+    <h1 class="title at-top">Logs</h1><p class="sub">A record of this session. Review an export before sharing it.</p><div id="log-lines" class="card"></div><div class="actions"><button class="btn btn-primary" id="export-logs">Export logs</button><button class="btn btn-quiet" id="refresh-logs">Refresh</button></div>
+  </section>
+  <section id="about" class="state" hidden>
+    <div class="stage short"><div class="lemur" data-mode="still"></div></div><h1 class="title">Move It</h1><p class="sub">Your browser, on your devices.</p><p class="version" data-version></p><p class="note">Some protected data cannot move. Check each preview and report.</p><div class="actions"><button class="btn btn-primary" id="about-home">Back home</button></div>
+  </section>
+  <dialog id="undo-confirm"><h2>Your browser has changed</h2><p>Undo will replace changes made since the last move. Continue?</p><div class="actions"><button class="btn btn-primary" id="force-undo">Undo anyway</button><button class="btn btn-quiet" id="cancel-undo">Keep my changes</button></div></dialog>
+</main>
+<script src="design/loader/frames/manifest.js"></script><script src="design/loader/moveit-loader.js"></script><script type="module" src="app.js"></script>
+</body></html>

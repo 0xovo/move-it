@@ -12,7 +12,7 @@
 
 I dual boot and I use more than one computer, and my browser never came with me. Every switch meant logging in to everything again and setting my extensions up from zero. So I built Move It.
 
-It picks up your whole browser and sets it down on your other device. You stay logged in, your extensions keep their settings, and your bookmarks and history follow. The lemur fills up as your stuff moves, and when he is full, you are done.
+Move It transfers supported browser data between your devices: cookies, saved passwords, bookmarks, history, and extension state. Some protected data cannot move, and some sites ask you to sign in again. Preview shows what is available and the move report lists skips. The desktop app is being prepared for its first release.
 
 ## What comes with you
 
@@ -36,14 +36,14 @@ It picks up your whole browser and sets it down on your other device. You stay l
 </tr>
 </table>
 
-<img src="docs/img/icons/undo.svg" width="22" align="absmiddle" alt=""> &nbsp;Nothing gets deleted. Move It backs up before every change, and one button undoes the last sync.
+<img src="docs/img/icons/undo.svg" width="22" align="absmiddle" alt=""> &nbsp;Move It journals browser changes for recovery and keeps an undo point for the latest move. Review the report before reopening your browsers.
 
 ## Ways to use it
 
 <table>
 <tr>
-<td width="33%"><img src="docs/img/icons/move.svg" width="44" alt=""><br><b>Move once</b><br>New laptop, new machine, Linux to Windows. Pair the two and everything comes over in one go.</td>
-<td width="33%"><img src="docs/img/icons/sync.svg" width="44" alt=""><br><b>Keep in sync</b><br>Runs quietly when you sign in and out, so every machine is simply the same browser.</td>
+<td width="33%"><img src="docs/img/icons/move.svg" width="44" alt=""><br><b>Move once</b><br>New laptop, new machine, Linux to Windows. Pair the two and move the supported data in one go.</td>
+<td width="33%"><img src="docs/img/icons/sync.svg" width="44" alt=""><br><b>Keep in sync</b><br>Run another move to merge newer data. Automatic sign-in and sign-out scheduling is not part of the first release.</td>
 <td width="33%"><img src="docs/img/icons/swap.svg" width="44" alt=""><br><b>Switch browsers</b><br>Already on the machine you want? Move straight from one browser to another, Brave to Chrome, no pairing.</td>
 </tr>
 </table>
@@ -60,15 +60,30 @@ It picks up your whole browser and sets it down on your other device. You stay l
 
 ## Browsers
 
-| | Windows | Linux | macOS |
-|---|---|---|---|
-| Brave | Works | Works | Not yet |
-| Chrome | Testing | Works | Not yet |
-| Edge | Testing | Not yet | Not yet |
-| Chromium | Testing | Works | Not yet |
-| Firefox | Later | Later | Later |
+The engine targets Chromium-family profiles. These are implementation and
+verification states, not a promise that every login or extension will survive.
+The current release candidate still needs fresh-profile real-browser readback
+on each supported operating system.
 
-"Works" means proven against the real browser with a real login. A few strict sites tie a login to your device, so they may ask you to sign in once more.
+| Browser | Linux | Windows | macOS |
+|---|---|---|---|
+| Brave | v10/v11 implemented; release readback pending | DPAPI v10 implemented; release readback pending | Keychain v10/v11 implemented; release readback pending |
+| Chrome | v10/v11 implemented; release readback pending | DPAPI v10 implemented; App-Bound v20 skipped | Keychain v10/v11 implemented; release readback pending |
+| Edge | Profile discovery and v10/v11 implemented; release readback pending | DPAPI v10 implemented; App-Bound v20 skipped | Keychain support implemented; release readback pending |
+| Chromium | v10/v11 implemented; release readback pending | DPAPI v10 implemented; release readback pending | Keychain v10/v11 implemented; release readback pending |
+| Firefox | Not supported | Not supported | Not supported |
+
+- App-Bound (`v20`) cookies and saved passwords are skipped wherever found,
+  including Brave or Chromium builds that enable it. Other supported data can
+  still move; Move It does not bypass App-Bound protection.
+- A fresh Linux v11 store accepts a key retrieved from that browser's unlocked
+  v2 keyring item. A missing item can use the browser's v10 fallback; a locked or
+  unavailable keyring fails closed. Never-launched profiles still need live proof.
+- Unit and fixture tests verify engine behavior, not acceptance by a real
+  browser. Session validity, extension compatibility, and cross-OS readback
+  need separate verification.
+- Firefox profiles, passkeys, and device-bound credentials are not transferred.
+  See [SECURITY.md](SECURITY.md) for encryption, pairing, and local-backup limits.
 
 <details>
 <summary><b>Under the hood</b></summary>
@@ -77,13 +92,24 @@ It picks up your whole browser and sets it down on your other device. You stay l
 
 - Rust core, one self-contained binary per platform. Tauri shell with a small web UI (`design/`).
 - Pairing creates a random 256-bit secret that lives in the OS keychain. You never see or type it.
-- The sealed box is one file with authenticated encryption (AES-256-GCM or XChaCha20-Poly1305) and a fresh nonce every time. Your storage provider only ever holds ciphertext.
+- The sealed box is one file with authenticated encryption (AES-256-GCM) and a fresh nonce every time. Payload contents are encrypted; filenames, sizes, timing, and pairing metadata remain visible.
 - Each device reads its own browser locally with that system's native scheme (DPAPI on Windows, the v10 and v11 store on Linux) and re-encrypts on import with the target's own scheme.
 - Per cookie, the newest wins, and both sides merge instead of overwriting.
-- The browser must be closed for every write, there is a backup before each one, and anything the engine cannot fully read is left alone.
+- The browser must be closed for every write, there is a backup before each one, and unreadable or protected data is reported as skipped or blocks the move.
 
 
 </details>
+
+## Desktop downloads
+
+Install Move It only from the
+[official GitHub Releases page](https://github.com/0xovo/move-it/releases).
+Each release ships a `SHA256SUMS` file listing the SHA256 digest of every asset.
+Verify your download before opening the installer (`sha256sum -c SHA256SUMS
+--ignore-missing` on Linux, or compare with `Get-FileHash` on Windows). In-app
+updates verify signed packages; checksums are an extra check for manual downloads.
+See [SECURITY.md](SECURITY.md) for reporting issues and why third-party mirrors
+are unsafe.
 
 ## Support
 

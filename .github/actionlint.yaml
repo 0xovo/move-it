@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # GitHub documents macos-15-intel for Intel macOS builds; actionlint lags the catalog.
+  labels:
+    - macos-15-intel
