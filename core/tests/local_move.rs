@@ -494,6 +494,7 @@ fn crash_mid_move_helper() {
 }
 
 
+#[cfg(unix)]
 #[test]
 fn welcome_start_leaves_an_open_browsers_unfinished_move_alone() {
     pin_browser_password();
