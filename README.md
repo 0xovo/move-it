@@ -12,6 +12,8 @@
 
 I dual boot and I use more than one computer, and my browser never came with me. Every switch meant logging in to everything again and setting my extensions up from zero. So I built Move It.
 
+**Built by [0xovo](https://github.com/0xovo)**
+
 Move It transfers supported browser data between your devices: cookies, saved passwords, bookmarks, history, and extension state. Some protected data cannot move, and some sites ask you to sign in again. Preview shows what is available and the move report lists skips. The desktop app is being prepared for its first release.
 
 ## What comes with you
