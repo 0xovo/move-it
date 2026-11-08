@@ -4,6 +4,8 @@
 //! profile on either device changed, and one undo must take the whole move back
 //! out across every browser it touched.
 
+#![cfg(target_os = "linux")] // browser trees are planted under XDG config paths
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
