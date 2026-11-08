@@ -49,14 +49,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@7dcc700092a1a8b9c17ba0e140b4e34e93000946
         with:
           toolchain: 1.90.0
-      # cargo-audit 0.21.2, Apache-2.0/MIT, released 2025-03-18.
+      # cargo-audit 0.22.2, Apache-2.0/MIT, released 2026-06-05. Reads CVSS 4.0 advisories.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.21.2 --locked --force
+        run: cargo install cargo-audit --version 0.22.2 --locked --force
       - run: npm ci
         working-directory: app
       - run: npm audit --audit-level=high
         working-directory: app
-      - run: cargo audit --locked
+      - run: cargo audit
+      - run: cargo audit --file app/src-tauri/Cargo.lock
 
   build:
     needs: [prepare, dependencies]
@@ -118,7 +119,7 @@ jobs:
           releaseDraft: true
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          args: --locked --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
 
   verify:
     needs: [prepare, build]

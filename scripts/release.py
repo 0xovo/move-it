@@ -75,9 +75,17 @@ def prepare():
         subprocess.run(["gh", "release", "create", tag, "--repo", REPO, "--verify-tag",
                         "--draft", "--title", f"Move It {tag[1:]}", "--notes",
                         "Review the installers, checksums, signed updater feed, and platform smoke results before publishing."], check=True)
-    # REST numeric release id is what tauri-action expects.
-    releases = json.loads(run("gh", "api", "--paginate", "--slurp", f"repos/{REPO}/releases"))
-    release = next(r for page in releases for r in page if r["tag_name"] == tag)
+    # REST numeric release id is what tauri-action expects. The list can lag a
+    # fresh draft by a few seconds, so look again before giving up.
+    release = None
+    for attempt in range(10):
+        releases = json.loads(run("gh", "api", "--paginate", "--slurp", f"repos/{REPO}/releases"))
+        release = next((r for page in releases for r in page if r["tag_name"] == tag), None)
+        if release:
+            break
+        time.sleep(3)
+    if not release:
+        raise ValueError("draft release did not appear")
     if not release["draft"]:
         raise ValueError("release must remain a draft")
     with open(os.environ["GITHUB_OUTPUT"], "a") as out:

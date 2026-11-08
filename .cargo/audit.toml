@@ -1,0 +1,15 @@
+# cargo audit settings for the release gate.
+[advisories]
+# zip: all four advisories are about ZipArchive::extract / ZipStreamReader::extract
+# writing an archive to disk. moveit-core only writes zips and reads named entries
+# into memory (core/src/sealed.rs); it never calls extract. tauri-plugin-updater
+# only extracts on Windows, only after download_and_install has checked the
+# minisign signature, and our Windows update is a signed .exe, not a zip.
+# Fixed zip releases (9.x) are all younger than our two-week dependency rule.
+# Drop these once zip >= 9 is old enough to pin.
+ignore = [
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+]
