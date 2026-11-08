@@ -512,8 +512,8 @@ impl App {
     fn keys_for(&self, browser: &str) -> Result<Keys> {
         // Integration tests plant Linux-style v10 stores and pin MOVEIT_LINUX_PASSWORD;
         // on macOS CI there is no Safe Storage item, so honour the pin without touching
-        // the real Keychain. Not compiled into release builds.
-        #[cfg(test)]
+        // the real Keychain. `cfg(test)` is off for integration-test builds; debug only.
+        #[cfg(debug_assertions)]
         if std::env::var(crate::oscrypt::LINUX_PASSWORD_ENV)
             .ok()
             .is_some_and(|p| !p.is_empty())
