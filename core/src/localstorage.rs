@@ -381,6 +381,13 @@ fn ldb(e: rusty_leveldb::Status) -> Error {
     if e.code == StatusCode::LockError {
         return Error::BrowserOpen;
     }
+    #[cfg(windows)]
+    if let StatusCode::Errno(errno::Errno(n)) = e.code {
+        // rusty-leveldb reports a held LOCK file as Errno on Windows, not LockError.
+        if matches!(n, 32 | 33) {
+            return Error::BrowserOpen;
+        }
+    }
     Error::Io(format!("Local Storage leveldb error: {e}"))
 }
 
