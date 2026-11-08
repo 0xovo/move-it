@@ -2463,6 +2463,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "cbc",
+ "errno 0.2.8",
  "getrandom 0.2.17",
  "keyring",
  "libc",

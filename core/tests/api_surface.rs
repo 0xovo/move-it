@@ -681,6 +681,8 @@ fn corrupt_or_deleted_config_fails_closed() {
     assert!(open_place_boxes(&pipe_dir, &app_key(&state_a)).is_empty());
 }
 
+// Enumerates Brave and Chrome under $XDG_CONFIG_HOME; profile scanning is Linux-only today.
+#[cfg(target_os = "linux")]
 #[test]
 fn browsers_move_side_by_side_and_colliding_names_do_not_collide() {
     pin_browser_password();

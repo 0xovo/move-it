@@ -510,6 +510,25 @@ impl App {
 
     /// The per-profile store keys, from live password discovery (Linux).
     fn keys_for(&self, browser: &str) -> Result<Keys> {
+        // Integration tests plant Linux-style v10 stores and pin MOVEIT_LINUX_PASSWORD;
+        // on macOS CI there is no Safe Storage item, so honour the pin without touching
+        // the real Keychain. `cfg(test)` is off for integration-test builds, so a
+        // test-only feature gates it; the desktop app never enables it.
+        #[cfg(feature = "test-keys")]
+        if std::env::var(crate::oscrypt::LINUX_PASSWORD_ENV)
+            .ok()
+            .is_some_and(|p| !p.is_empty())
+        {
+            let b = LinuxBrowser::from_name(browser).ok_or_else(|| {
+                Error::Refused(format!("{} is not a browser Move It can read yet", browser_display(browser)))
+            })?;
+            let (password, from_trusted) = crate::oscrypt::linux_browser_password_for(b)?;
+            let from_libsecret_v2 = b.empty_store_v11_from_trusted_item(from_trusted);
+            return Ok(Keys::Cbc {
+                lock: Lock::linux(&password, LinuxPrefix::V10),
+                from_libsecret_v2,
+            });
+        }
         if Platform::current() != Platform::Linux {
             return Err(Error::Refused(
                 "reading a browser's own password is implemented for Linux only so far".into(),

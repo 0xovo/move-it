@@ -40,7 +40,14 @@ ruzstd = "=0.9.1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Tests only: lets integration tests pin the Linux v10 store password on every
+# OS, so macOS and Windows CI never need a real Keychain item. The desktop app
+# never turns this on.
+test-keys = []
+
 [dev-dependencies]
+moveit-core = { path = ".", features = ["test-keys"] }
 
 # secret-service 4 (MIT OR Apache-2.0): D-Bus Secret Service client, replaces
 # the secret-tool CLI so a missing tool can no longer silently fall back.
@@ -61,3 +68,4 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+errno = "0.2.8"
