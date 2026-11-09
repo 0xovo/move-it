@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method, SharedHttp};
 use crate::cloud::index::{load_index, save_index, RemoteFile, RemoteIndex};
-use crate::cloud::sync_files::{is_cloud_file, local_cloud_files, remove_stale_locals, write_cloud_file};
+use crate::cloud::sync_files::{
+    classify_cloud_file_name, ingest_remote_cloud_file, is_cloud_file, local_cloud_files,
+    remove_stale_locals, skip_rejected_remote_name, CloudFileKind,
+};
 use crate::pairing;
 use crate::pipe::{Pipe, BOX_FILE};
 use crate::{Error, Result};
@@ -29,12 +32,18 @@ impl Pipe for GoogleDrivePipe {
         let mut index = RemoteIndex::default();
         let mut kept = Vec::new();
         for remote in self.list_remote()? {
-            if !is_cloud_file(&remote.name) {
-                continue;
+            match classify_cloud_file_name(&remote.name) {
+                CloudFileKind::Unrelated => continue,
+                CloudFileKind::RejectedBox => {
+                    skip_rejected_remote_name(&remote.name);
+                    continue;
+                }
+                CloudFileKind::Pairing | CloudFileKind::Box => {}
             }
             let bytes = self.download(&remote.id)?;
-            write_cloud_file(&self.place, &remote.name, &bytes)?;
-            kept.push(remote.name.clone());
+            if ingest_remote_cloud_file(&self.place, &remote.name, &bytes)? {
+                kept.push(remote.name.clone());
+            }
             index.files.insert(
                 remote.name,
                 RemoteFile {

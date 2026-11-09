@@ -460,6 +460,54 @@ mod tests {
         let place = tempfile::tempdir().unwrap();
         assert!(crate::pipe::write_named_box(place.path(), "moveit-box/../x.json", b"x").is_err());
         assert!(!place.path().join("x.json").exists());
+        assert!(!crate::pipe::allowed_box_file_name("moveit-box - Copy.json"));
+        assert!(!crate::pipe::allowed_box_file_name("moveit-box:stream.json"));
+        assert!(!crate::pipe::allowed_box_file_name("moveit-boxold.json"));
+        assert!(crate::pipe::allowed_box_file_name("moveit-box-brave-default.json"));
+    }
+
+    #[test]
+    fn refresh_skips_invalid_remote_box_names_dropbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let http = Arc::new(MockHttp::default());
+        let place = tmp.path().join("staging");
+        let sealed = b"valid-sealed-box";
+        http.push_ok_json(
+            r#"{"entries":[{".tag":"file","id":"bad","name":"moveit-box - Copy.json","rev":"r0"},{".tag":"file","id":"good","name":"moveit-box.json","rev":"r1"}]}"#,
+        );
+        http.push_bytes(200, sealed.to_vec());
+        let pipe = DropboxPipe::new(place.clone(), http.clone(), "access".into()).unwrap();
+        pipe.refresh().unwrap();
+        assert_eq!(std::fs::read(place.join(BOX_FILE)).unwrap().as_slice(), sealed);
+        assert!(!place.join("moveit-box - Copy.json").exists());
+        let downloads: usize = http
+            .recorded()
+            .into_iter()
+            .filter(|r| r.url.contains("/files/download"))
+            .count();
+        assert_eq!(downloads, 1, "invalid name must not be downloaded");
+    }
+
+    #[test]
+    fn refresh_skips_invalid_remote_box_names_google() {
+        let tmp = tempfile::tempdir().unwrap();
+        let http = Arc::new(MockHttp::default());
+        let place = tmp.path().join("staging");
+        let sealed = b"gdrive-box";
+        http.push_ok_json(
+            r#"{"files":[{"id":"bad","name":"moveit-box - Copy.json"},{"id":"good","name":"moveit-box.json","md5Checksum":"e1"}]}"#,
+        );
+        http.push_bytes(200, sealed.to_vec());
+        let pipe = GoogleDrivePipe::new(place.clone(), http.clone(), "tok".into()).unwrap();
+        pipe.refresh().unwrap();
+        assert_eq!(std::fs::read(place.join(BOX_FILE)).unwrap().as_slice(), sealed);
+        assert!(!place.join("moveit-box - Copy.json").exists());
+        let downloads: usize = http
+            .recorded()
+            .into_iter()
+            .filter(|r| r.url.contains("alt=media"))
+            .count();
+        assert_eq!(downloads, 1);
     }
 
     #[test]

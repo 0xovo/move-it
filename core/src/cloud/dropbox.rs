@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method, SharedHttp};
 use crate::cloud::index::{load_index, save_index, RemoteFile, RemoteIndex};
-use crate::cloud::sync_files::{is_cloud_file, local_cloud_files, remove_stale_locals, write_cloud_file};
+use crate::cloud::sync_files::{
+    classify_cloud_file_name, ingest_remote_cloud_file, is_cloud_file, local_cloud_files,
+    remove_stale_locals, skip_rejected_remote_name, CloudFileKind,
+};
 use crate::pipe::Pipe;
 use crate::{Error, Result};
 
@@ -28,12 +31,18 @@ impl Pipe for DropboxPipe {
         let mut index = RemoteIndex::default();
         let mut kept = Vec::new();
         for item in self.list_folder()? {
-            if !is_cloud_file(&item.name) {
-                continue;
+            match classify_cloud_file_name(&item.name) {
+                CloudFileKind::Unrelated => continue,
+                CloudFileKind::RejectedBox => {
+                    skip_rejected_remote_name(&item.name);
+                    continue;
+                }
+                CloudFileKind::Pairing | CloudFileKind::Box => {}
             }
             let bytes = self.download(&format!("/{}", item.name))?;
-            write_cloud_file(&self.place, &item.name, &bytes)?;
-            kept.push(item.name.clone());
+            if ingest_remote_cloud_file(&self.place, &item.name, &bytes)? {
+                kept.push(item.name.clone());
+            }
             index.files.insert(
                 item.name.clone(),
                 RemoteFile {

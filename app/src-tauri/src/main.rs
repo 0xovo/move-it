@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -20,6 +20,7 @@ struct PendingSignIn {
     outcome: SignInOutcome,
     provider: String,
     byok: bool,
+    attempt: u64,
 }
 
 // One engine instance retains its redacted log and configuration across commands.
@@ -29,6 +30,7 @@ struct Desktop {
     pending_sign_in: Arc<Mutex<Option<PendingSignIn>>>,
     sign_in_cancel: Arc<AtomicBool>,
     sign_in_loopback: Arc<Mutex<Option<String>>>,
+    sign_in_attempt: Arc<AtomicU64>,
 }
 
 fn poke_loopback(redirect_uri: &str) {
@@ -200,6 +202,10 @@ async fn pipe_sign_in_begin(
     byok: bool,
 ) -> Result<serde_json::Value, String> {
     state.sign_in_cancel.store(false, Ordering::Release);
+    let attempt = state
+        .sign_in_attempt
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     if state
         .pending_sign_in
         .lock()
@@ -221,6 +227,7 @@ async fn pipe_sign_in_begin(
         outcome,
         provider: provider.clone(),
         byok,
+        attempt,
     });
     tauri::async_runtime::spawn_blocking(move || open::that(&url)).await.ok();
     Ok(serde_json::json!({ "status": "waiting" }))
@@ -237,22 +244,27 @@ async fn pipe_sign_in_finish(state: State<'_, Desktop>) -> Reply {
     let engine = state.engine.clone();
     let cancel = state.sign_in_cancel.clone();
     let loopback_slot = state.sign_in_loopback.clone();
-    let (provider, byok, outcome) = (pending.provider, pending.byok, pending.outcome);
+    let (provider, byok, outcome, attempt) = (pending.provider, pending.byok, pending.outcome, pending.attempt);
     let provider_for_finish = provider.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let waited = App::wait_cloud_sign_in_code(outcome, SIGN_IN_TIMEOUT, Some(&cancel))
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("sign-in was cancelled".into());
+        }
         let (redirect_uri, verifier, code) = waited;
         let app = engine
-            .try_lock()
-            .map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
+            .lock()
+            .map_err(|_| "Could not finish sign-in.".to_string())?;
         app.finish_cloud_sign_in_after_code(&provider_for_finish, byok, &redirect_uri, &verifier, &code)
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))
     })
     .await
     .map_err(|_| "Sign-in did not finish.".to_string())??;
-    *loopback_slot.lock().map_err(|_| "Could not finish sign-in.".to_string())? = None;
-    state.sign_in_cancel.store(false, Ordering::Release);
+    if state.sign_in_attempt.load(Ordering::Acquire) == attempt {
+        *loopback_slot.lock().map_err(|_| "Could not finish sign-in.".to_string())? = None;
+        state.sign_in_cancel.store(false, Ordering::Release);
+    }
     Ok(serde_json::json!({ "status": "connected", "provider": provider }))
 }
 
@@ -352,6 +364,7 @@ fn main() {
                 pending_sign_in: Arc::new(Mutex::new(None)),
                 sign_in_cancel: Arc::new(AtomicBool::new(false)),
                 sign_in_loopback: Arc::new(Mutex::new(None)),
+                sign_in_attempt: Arc::new(AtomicU64::new(0)),
             });
             updater::spawn_checker(app.handle().clone());
             Ok(())
@@ -406,6 +419,7 @@ mod sign_in_wait {
             pending_sign_in: Arc::new(Mutex::new(None)),
             sign_in_cancel: Arc::new(AtomicBool::new(false)),
             sign_in_loopback: Arc::new(Mutex::new(Some(start.redirect.redirect_uri.clone()))),
+            sign_in_attempt: Arc::new(AtomicU64::new(1)),
         };
         let cancel = desktop.sign_in_cancel.clone();
         let engine_arc = desktop.engine.clone();
@@ -455,6 +469,39 @@ mod sign_in_wait {
         assert!(err.contains("cancelled"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     }
+
+    #[test]
+    fn token_exchange_waits_for_blocking_engine_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(App::open(dir.path()).unwrap()));
+        let engine2 = engine.clone();
+        let hold = engine.lock().unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished2 = finished.clone();
+        let wait = std::thread::spawn(move || {
+            let _guard = engine2.lock().expect("exchange must block on engine, not fail");
+            finished2.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!finished.load(Ordering::Acquire), "try_lock would have failed instantly");
+        drop(hold);
+        wait.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn finish_clears_cancel_only_for_matching_attempt() {
+        let attempt = Arc::new(AtomicU64::new(2));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let loopback = Arc::new(Mutex::new(Some("http://127.0.0.1:1".to_string())));
+        let finished_attempt = 1u64;
+        if attempt.load(Ordering::Acquire) == finished_attempt {
+            *loopback.lock().unwrap() = None;
+            cancel.store(false, Ordering::Release);
+        }
+        assert!(loopback.lock().unwrap().is_some(), "newer begin keeps loopback");
+        assert!(cancel.load(Ordering::Acquire), "newer begin keeps cancel");
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +520,7 @@ mod install_gate {
             pending_sign_in: Arc::new(Mutex::new(None)),
             sign_in_cancel: Arc::new(AtomicBool::new(false)),
             sign_in_loopback: Arc::new(Mutex::new(None)),
+            sign_in_attempt: Arc::new(AtomicU64::new(0)),
         };
         let held = desktop.engine.try_lock().expect("engine starts free");
         assert!(!desktop.engine_idle());
