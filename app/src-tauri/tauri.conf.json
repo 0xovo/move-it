@@ -22,7 +22,7 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ], "createUpdaterArtifacts": true, "shortDescription": "Move your browser between devices", "category": "Utility" },
+    ], "createUpdaterArtifacts": true, "macOS": { "signingIdentity": "-" }, "shortDescription": "Move your browser between devices", "category": "Utility" },
   "plugins": {
     "updater": {
       "endpoints": ["https://github.com/0xovo/move-it/releases/latest/download/latest.json"],
