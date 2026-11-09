@@ -32,15 +32,22 @@ impl LoopbackRedirect {
                 return Err(Error::Refused("sign-in did not finish; try again".into()));
             }
             match self.listener.accept() {
-                Ok((mut stream, _)) => match read_redirect(&mut stream, expected_state) {
-                    Ok(code) => {
-                        let _ = respond_ok(&mut stream);
-                        return Ok(code);
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    match read_redirect(&mut stream, expected_state) {
+                        Ok(code) => {
+                            let _ = respond_ok(&mut stream);
+                            return Ok(code);
+                        }
+                        Err(e) => {
+                            let _ = respond_err(&mut stream);
+                            let msg = e.to_string();
+                            if msg.contains("cancelled") || msg.contains("declined") {
+                                return Err(e);
+                            }
+                        }
                     }
-                    Err(_) => {
-                        let _ = respond_err(&mut stream);
-                    }
-                },
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -71,6 +78,9 @@ fn read_redirect(stream: &mut TcpStream, expected_state: &str) -> Result<String>
         })
         .collect();
     if let Some(err) = params.get("error") {
+        if err == "access_denied" {
+            return Err(Error::Refused("sign-in was cancelled".into()));
+        }
         return Err(Error::Refused(format!("sign-in was declined ({err})")));
     }
     let state = params.get("state").ok_or_else(|| Error::Refused("sign-in response missing state".into()))?;

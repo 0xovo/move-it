@@ -1,0 +1,14 @@
+{
+  "dropbox": {
+    "app_key": "example-dropbox-key",
+    "flow": "pkce",
+    "scopes": ["files.metadata.read", "files.content.read", "files.content.write"],
+    "access": "app_folder"
+  },
+  "google": {
+    "client_id": "example.apps.googleusercontent.com",
+    "client_file": "google-client.json",
+    "flow": "pkce",
+    "scopes": ["https://www.googleapis.com/auth/drive.file"]
+  }
+}

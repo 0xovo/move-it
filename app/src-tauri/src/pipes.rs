@@ -1,4 +1,4 @@
-//! Pipe picker: local folders, git, and cloud sign-in rows (Google Drive / Dropbox).
+//! Pipe picker: local folders, git, cloud sign-in (Google Drive / Dropbox), and BYOK.
 
 use std::path::{Path, PathBuf};
 use serde::Serialize;
@@ -12,13 +12,18 @@ pub struct Candidate {
     pub connected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byok: Option<bool>,
 }
 
 #[derive(Serialize, Debug, Clone)]
 pub struct CloudStatus {
     pub google_connected: bool,
     pub dropbox_connected: bool,
+    pub google_byok_connected: bool,
+    pub dropbox_byok_connected: bool,
     pub byok_installed: bool,
+    pub active_byok: bool,
 }
 
 pub fn candidates(
@@ -36,6 +41,7 @@ pub fn candidates(
                 path: Some(path),
                 connected: None,
                 cloud: None,
+                byok: None,
             });
         }
     };
@@ -77,12 +83,26 @@ pub fn candidates(
     }
     found.sort_by(|a, b| a.label.cmp(&b.label).then(a.path.cmp(&b.path)));
 
-    let google_label = if cloud.google_connected {
+    let use_byok_keys = cloud.byok_installed
+        && (cloud.active_byok
+            || ((!cloud.google_connected && !cloud.dropbox_connected)
+                && (cloud.google_byok_connected || cloud.dropbox_byok_connected)));
+    let google_connected = if use_byok_keys {
+        cloud.google_byok_connected
+    } else {
+        cloud.google_connected
+    };
+    let dropbox_connected = if use_byok_keys {
+        cloud.dropbox_byok_connected
+    } else {
+        cloud.dropbox_connected
+    };
+    let google_label = if google_connected {
         "Google Drive (connected)"
     } else {
         "Sign in with Google Drive"
     };
-    let dropbox_label = if cloud.dropbox_connected {
+    let dropbox_label = if dropbox_connected {
         "Dropbox (connected)"
     } else {
         "Sign in with Dropbox"
@@ -92,15 +112,17 @@ pub fn candidates(
         label: google_label.into(),
         kind: "google".into(),
         path: None,
-        connected: Some(cloud.google_connected),
+        connected: Some(google_connected),
         cloud: Some(true),
+        byok: Some(use_byok_keys),
     });
     list.push(Candidate {
         label: dropbox_label.into(),
         kind: "dropbox".into(),
         path: None,
-        connected: Some(cloud.dropbox_connected),
+        connected: Some(dropbox_connected),
         cloud: Some(true),
+        byok: Some(use_byok_keys),
     });
     list.push(Candidate {
         label: "Git repository".into(),
@@ -108,6 +130,7 @@ pub fn candidates(
         path: None,
         connected: None,
         cloud: None,
+        byok: None,
     });
     list.push(Candidate {
         label: "Another folder".into(),
@@ -115,6 +138,7 @@ pub fn candidates(
         path: None,
         connected: None,
         cloud: None,
+        byok: None,
     });
   list.push(Candidate {
         label: "Advanced".into(),
@@ -122,6 +146,7 @@ pub fn candidates(
         path: None,
         connected: None,
         cloud: None,
+        byok: None,
     });
     list.push(Candidate {
         label: if cloud.byok_installed {
@@ -131,8 +156,9 @@ pub fn candidates(
         },
         kind: "byok".into(),
         path: None,
-        connected: None,
+        connected: Some(cloud.byok_installed),
         cloud: Some(true),
+        byok: None,
     });
     list
 }
@@ -150,7 +176,10 @@ mod tests {
             CloudStatus {
                 google_connected: false,
                 dropbox_connected: true,
+                google_byok_connected: false,
+                dropbox_byok_connected: false,
                 byok_installed: false,
+                active_byok: false,
             },
         );
         assert!(list.iter().any(|c| c.kind == "google" && c.connected == Some(false)));

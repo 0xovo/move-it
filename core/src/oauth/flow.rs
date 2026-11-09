@@ -6,6 +6,7 @@ use crate::keychain::TokenStore;
 use crate::oauth::config::{resolve_google_secret, OAuthFile};
 use crate::oauth::loopback::LoopbackRedirect;
 use crate::oauth::pkce::{new_pkce, random_state};
+use crate::oauth::access_cache;
 use crate::oauth::tokens::{store_provider_token, Provider, ProviderToken};
 use crate::{Error, Result};
 
@@ -50,6 +51,9 @@ pub fn complete_sign_in(
         Provider::Google => exchange_google(http, oauth, oauth_dir, &redirect_uri, &code, &verifier)?,
         Provider::Dropbox => exchange_dropbox(http, oauth, &redirect_uri, &code, &verifier)?,
     };
+    if let Some(access) = &token.access_token {
+        access_cache::put(provider, byok, access.clone(), token.expires_at_unix);
+    }
     store_provider_token(store, provider, byok, &token)?;
     Ok(token)
 }

@@ -1,11 +1,9 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 
 use crate::keychain::TokenStore;
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
     Google,
     Dropbox,
@@ -47,7 +45,12 @@ pub struct ProviderToken {
 }
 
 pub fn store_provider_token(store: &dyn TokenStore, provider: Provider, byok: bool, token: &ProviderToken) -> Result<()> {
-    let text = serde_json::to_string(token).map_err(|e| Error::Corrupt(e.to_string()))?;
+    let stored = ProviderToken {
+        refresh_token: token.refresh_token.clone(),
+        access_token: None,
+        expires_at_unix: None,
+    };
+    let text = serde_json::to_string(&stored).map_err(|e| Error::Corrupt(e.to_string()))?;
     store.store_token(token_account(provider, byok), &text)
 }
 
@@ -64,13 +67,7 @@ pub fn delete_provider_token(store: &dyn TokenStore, provider: Provider, byok: b
     store.delete_token(token_account(provider, byok))
 }
 
-pub fn access_from_stored(token: &ProviderToken) -> Result<Option<String>> {
-    if let (Some(access), Some(exp)) = (&token.access_token, token.expires_at_unix) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        if now + 60 < exp {
-            return Ok(Some(access.clone()));
-        }
-    }
+pub fn access_from_stored(_token: &ProviderToken) -> Result<Option<String>> {
     Ok(None)
 }
 

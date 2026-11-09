@@ -11,12 +11,14 @@ mod tests {
     use crate::api::App;
     use crate::cloud::dropbox::DropboxPipe;
     use crate::cloud::google::GoogleDrivePipe;
-    use crate::cloud::http::MockHttp;
+    use crate::cloud::http::{HttpRequest, Method, MockHttp};
     use crate::cloud::index::{RemoteFile, RemoteIndex};
     use crate::keychain::MemoryStore;
     use crate::oauth::config::{install_byok_config, load_builtin_oauth};
     use crate::oauth::flow::{begin_sign_in, complete_sign_in};
+    use crate::oauth::loopback::LoopbackRedirect;
     use crate::oauth::tokens::{load_provider_token, Provider};
+    use crate::pairing::OFFER_FILE;
     use crate::pipe::{Pipe, BOX_FILE};
     use crate::sealed::SyncKey;
 
@@ -89,6 +91,8 @@ mod tests {
         for provider in [Provider::Google, Provider::Dropbox] {
             sign_in_provider(&store, &http, provider, false);
             assert!(load_provider_token(&*store, provider, false).unwrap().is_some());
+            let saved = load_provider_token(&*store, provider, false).unwrap().unwrap();
+            assert!(saved.access_token.is_none(), "refresh-only in keychain");
         }
     }
 
@@ -104,18 +108,35 @@ mod tests {
         std::fs::create_dir_all(&place_a).unwrap();
         crate::pipe::write_named_box(&place_a, BOX_FILE, &sealed).unwrap();
 
-        http.push_ok_json(r#"{"files":[]}"#);
+        for _ in 0..2 {
+            http.push_ok_json(r#"{"files":[]}"#);
+        }
         http.push_ok_json(r#"{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}"#);
-        let pipe_a = GoogleDrivePipe::new(place_a, http.clone(), "tok".into()).unwrap();
+        http.push_ok_json(r#"{"files":[{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}]}"#);
+        let pipe_a = GoogleDrivePipe::new(place_a.clone(), http.clone(), "tok".into()).unwrap();
         pipe_a.publish("note").unwrap();
+        let upload = http.recorded().into_iter().find(|r| r.url.contains("upload")).expect("upload");
+        assert_eq!(upload.method, Method::Post);
 
+        http.clear_recorded();
         http.push_ok_json(r#"{"files":[{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}]}"#);
         http.push_bytes(200, sealed.clone());
-        let pipe_b = GoogleDrivePipe::new(place_b.clone(), http, "tok".into()).unwrap();
+        let pipe_b = GoogleDrivePipe::new(place_b.clone(), http.clone(), "tok".into()).unwrap();
         pipe_b.refresh().unwrap();
         let back = std::fs::read(place_b.join(BOX_FILE)).unwrap();
         assert_eq!(back, sealed);
         assert_eq!(key.open_small(&[1u8; 12], &back).unwrap(), b"roundtrip");
+
+        http.clear_recorded();
+        for _ in 0..5 {
+            http.push_ok_json(r#"{"files":[{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}]}"#);
+        }
+        http.push_ok_json(r#"{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}"#);
+        crate::pipe::write_named_box(&place_a, BOX_FILE, &sealed).unwrap();
+        let pipe_a2 = GoogleDrivePipe::new(place_a, http.clone(), "tok".into()).unwrap();
+        pipe_a2.publish("note").unwrap();
+        let update = http.recorded().into_iter().find(|r| r.url.contains("uploadType=media")).expect("patch upload");
+        assert_eq!(update.method, Method::Patch);
     }
 
     #[test]
@@ -130,6 +151,7 @@ mod tests {
         std::fs::create_dir_all(&place_a).unwrap();
         crate::pipe::write_named_box(&place_a, BOX_FILE, &sealed).unwrap();
 
+        http.push_ok_json(r#"{"entries":[]}"#);
         http.push_ok_json(r#"{"entries":[]}"#);
         http.push_ok_json(r#"{}"#);
         http.push_ok_json(
@@ -146,6 +168,55 @@ mod tests {
         pipe_b.refresh().unwrap();
         let back = std::fs::read(place_b.join(BOX_FILE)).unwrap();
         assert_eq!(back, sealed);
+    }
+
+    #[test]
+    fn pairing_files_round_trip_google() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let offer = br#"{"v":1}"#;
+        let http = Arc::new(MockHttp::default());
+        let place_a = tmp.path().join("ga");
+        let place_b = tmp.path().join("gb");
+        std::fs::create_dir_all(&place_a).unwrap();
+        std::fs::write(place_a.join(OFFER_FILE), offer).unwrap();
+        for _ in 0..2 {
+            http.push_ok_json(r#"{"files":[]}"#);
+        }
+        http.push_ok_json(r#"{"id":"p1","name":"moveit-pairing.json","md5Checksum":"e1"}"#);
+        http.push_ok_json(r#"{"files":[{"id":"p1","name":"moveit-pairing.json","md5Checksum":"e1"}]}"#);
+        let pipe_a = GoogleDrivePipe::new(place_a, http.clone(), "tok".into()).unwrap();
+        pipe_a.publish("note").unwrap();
+
+        http.push_ok_json(r#"{"files":[{"id":"p1","name":"moveit-pairing.json","md5Checksum":"e1"}]}"#);
+        http.push_bytes(200, offer.to_vec());
+        let pipe_b = GoogleDrivePipe::new(place_b, http, "tok".into()).unwrap();
+        pipe_b.refresh().unwrap();
+        assert_eq!(std::fs::read(pipe_b.place().join(OFFER_FILE)).unwrap(), offer);
+    }
+
+    #[test]
+    fn pairing_files_round_trip_dropbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let offer = br#"{"v":1}"#;
+        let http = Arc::new(MockHttp::default());
+        let place_a = tmp.path().join("da");
+        let place_b = tmp.path().join("db");
+        std::fs::create_dir_all(&place_a).unwrap();
+        std::fs::write(place_a.join(OFFER_FILE), offer).unwrap();
+        http.push_ok_json(r#"{"entries":[]}"#);
+        http.push_ok_json(r#"{"entries":[]}"#);
+        http.push_ok_json(r#"{}"#);
+        http.push_ok_json(r#"{"entries":[{".tag":"file","id":"p1","name":"moveit-pairing.json","rev":"r1"}]}"#);
+        let pipe_a = DropboxPipe::new(place_a, http.clone(), "tok".into()).unwrap();
+        pipe_a.publish("note").unwrap();
+
+        http.push_ok_json(r#"{"entries":[{".tag":"file","id":"p1","name":"moveit-pairing.json","rev":"r1"}]}"#);
+        http.push_bytes(200, offer.to_vec());
+        let pipe_b = DropboxPipe::new(place_b, http, "tok".into()).unwrap();
+        pipe_b.refresh().unwrap();
+        assert_eq!(std::fs::read(pipe_b.place().join(OFFER_FILE)).unwrap(), offer);
     }
 
     #[test]
@@ -178,6 +249,8 @@ mod tests {
         assert!(load_provider_token(&*store, Provider::Dropbox, false).unwrap().is_none());
         http.clear_recorded();
         assert!(app.use_cloud_pipe("dropbox", false).is_err());
+        http.clear_recorded();
+        assert!(app.pair_show_code().is_err());
         assert!(http.recorded().is_empty(), "not-connected publish path makes no calls");
     }
 
@@ -195,14 +268,16 @@ mod tests {
         sign_in_provider(&store, &http, Provider::Google, true);
         assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_some());
 
+        let http2 = Arc::new(MockHttp::default());
+        sign_in_provider(&store, &http2, Provider::Google, false);
         let mut app = app_with(&state, store.clone(), http);
-        app.abandon_byok().unwrap();
-        assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_none());
-        assert!(!state.join("config").join("oauth-byok.json").exists());
+        app.use_cloud_pipe("google", false).unwrap();
+        assert!(state.join("config").join("oauth-byok.json").exists());
+        assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_some());
     }
 
     #[test]
-    fn lost_race_refuses_publish() {
+    fn lost_race_refuses_publish_dropbox_and_google() {
         let tmp = tempfile::tempdir().unwrap();
         let http = Arc::new(MockHttp::default());
         let place = tmp.path().join("staging");
@@ -213,7 +288,7 @@ mod tests {
             BOX_FILE.to_string(),
             RemoteFile {
                 id: "id1".into(),
-                etag: None,
+                etag: Some("etag-old".into()),
                 modified: None,
                 rev: Some("rev-old".into()),
             },
@@ -223,8 +298,67 @@ mod tests {
         http.push_ok_json(
             r#"{"entries":[{".tag":"file","name":"moveit-box.json","rev":"rev-new","id":"id1"}]}"#,
         );
-        let pipe = DropboxPipe::new(place, http, "access".into()).unwrap();
+        http.push_ok_json(
+            r#"{"entries":[{".tag":"file","name":"moveit-box.json","rev":"rev-new","id":"id1"}]}"#,
+        );
+        let pipe = DropboxPipe::new(place.clone(), http.clone(), "access".into()).unwrap();
         assert_eq!(pipe.publish("x").unwrap_err(), crate::Error::Busy);
+
+        http.clear_recorded();
+        http.push_ok_json(
+            r#"{"files":[{"id":"id1","name":"moveit-box.json","md5Checksum":"etag-new"}]}"#,
+        );
+        http.push_ok_json(
+            r#"{"files":[{"id":"id1","name":"moveit-box.json","md5Checksum":"etag-new"}]}"#,
+        );
+        let gpipe = GoogleDrivePipe::new(place, http, "access".into()).unwrap();
+        assert_eq!(gpipe.publish("x").unwrap_err(), crate::Error::Busy);
+    }
+
+    #[test]
+    fn loopback_redirect_matrix() {
+        let redirect = LoopbackRedirect::bind().unwrap();
+        let port = redirect.redirect_uri.rsplit(':').next().unwrap();
+        let state = "expected-state";
+        std::thread::spawn({
+            let port = port.to_string();
+            move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let req = "GET /wrong?code=x&state=bad HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+                    let _ = s.write_all(req.as_bytes());
+                }
+                std::thread::sleep(Duration::from_millis(40));
+                let req = format!(
+                    "GET /?error=access_denied&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                );
+                if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+                    let _ = s.write_all(req.as_bytes());
+                }
+            }
+        });
+        let err = redirect
+            .wait_for_code(state, Duration::from_secs(2))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cancelled"), "access_denied ends wait: {err}");
+
+        let redirect2 = LoopbackRedirect::bind().unwrap();
+        let port2 = redirect2.redirect_uri.rsplit(':').next().unwrap();
+        std::thread::spawn({
+            let port = port2.to_string();
+            let state = state.to_string();
+            move || {
+                std::thread::sleep(Duration::from_millis(30));
+                let req = format!(
+                    "GET /?code=good&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                );
+                if let Ok(mut s) = TcpStream::connect(format!("127.0.0.1:{port}")) {
+                    let _ = s.write_all(req.as_bytes());
+                }
+            }
+        });
+        assert_eq!(redirect2.wait_for_code(state, Duration::from_secs(2)).unwrap(), "good");
     }
 
     #[test]
@@ -246,5 +380,20 @@ mod tests {
         });
         http.push_ok_json(r#"{"access_token":"a","expires_in":60,"refresh_token":"r"}"#);
         complete_sign_in(&store, Provider::Google, false, &oauth, &dir, &http, start).unwrap();
+    }
+
+    #[test]
+    fn refresh_invalid_grant_surfaces_sign_in_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let http = Arc::new(MockHttp::default());
+        let store = Arc::new(MemoryStore::default());
+        sign_in_provider(&store, &http, Provider::Google, false);
+        crate::oauth::access_cache::clear_provider(Provider::Google);
+        http.clear_recorded();
+        http.push_status_body(400, r#"{"error":"invalid_grant"}"#);
+        let mut app = app_with(tmp.path(), store, http);
+        let err = app.use_cloud_pipe("google", false).unwrap_err().to_string();
+        assert!(err.contains("sign in again"), "{err}");
     }
 }

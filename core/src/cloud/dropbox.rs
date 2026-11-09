@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method, SharedHttp};
 use crate::cloud::index::{load_index, save_index, RemoteFile, RemoteIndex};
-use crate::pipe::{self, Pipe, BOX_FILE};
+use crate::cloud::sync_files::{is_cloud_file, local_cloud_files, remove_stale_locals, write_cloud_file};
+use crate::pipe::Pipe;
 use crate::{Error, Result};
 
 pub struct DropboxPipe {
@@ -25,12 +26,14 @@ impl Pipe for DropboxPipe {
 
     fn refresh(&self) -> Result<()> {
         let mut index = RemoteIndex::default();
+        let mut kept = Vec::new();
         for item in self.list_folder()? {
-            if !is_box_name(&item.name) {
+            if !is_cloud_file(&item.name) {
                 continue;
             }
             let bytes = self.download(&format!("/{}", item.name))?;
-            pipe::write_named_box(&self.place, &item.name, &bytes)?;
+            write_cloud_file(&self.place, &item.name, &bytes)?;
+            kept.push(item.name.clone());
             index.files.insert(
                 item.name.clone(),
                 RemoteFile {
@@ -40,26 +43,36 @@ impl Pipe for DropboxPipe {
                     rev: item.rev.clone(),
                 },
             );
+            save_index(&self.place, &index)?;
         }
+        remove_stale_locals(&self.place, &kept)?;
         save_index(&self.place, &index)?;
         Ok(())
     }
 
     fn publish(&self, _note: &str) -> Result<()> {
         let mut index = load_index(&self.place)?;
-        let local_names = box_names(&self.place)?;
+        let local_names = local_cloud_files(&self.place)?;
+        self.guard_remote_quiet(&index, &local_names)?;
         let remote = self.list_folder()?;
+
         for name in &local_names {
-            let bytes = std::fs::read(self.place.join(name)).map_err(|e| Error::Io(e.to_string()))?;
+            let bytes =
+                std::fs::read(self.place.join(name)).map_err(|e| Error::Io(e.to_string()))?;
             let path = format!("/{name}");
             if let Some(existing) = remote.iter().find(|f| f.name == *name) {
                 if let Some(saved) = index.files.get(name) {
                     if saved.rev.as_deref() != existing.rev.as_deref() {
                         return Err(Error::Busy);
                     }
+                } else {
+                    return Err(Error::Busy);
                 }
                 self.upload_update(&path, &bytes, existing.rev.as_deref())?;
             } else {
+                if index.files.contains_key(name) {
+                    return Err(Error::Busy);
+                }
                 self.upload_add(&path, &bytes)?;
             }
             if let Some(item) = self.list_folder()?.into_iter().find(|f| f.name == *name) {
@@ -73,19 +86,42 @@ impl Pipe for DropboxPipe {
                     },
                 );
             }
+            save_index(&self.place, &index)?;
         }
+
         for item in remote {
-            if is_box_name(&item.name) && !local_names.iter().any(|n| n == &item.name) {
+            if !is_cloud_file(&item.name) {
+                continue;
+            }
+            if local_names.iter().any(|n| n == &item.name) {
+                continue;
+            }
+            if index.files.contains_key(&item.name) {
                 self.delete(&format!("/{}", item.name))?;
                 index.files.remove(&item.name);
+                save_index(&self.place, &index)?;
             }
         }
-        save_index(&self.place, &index)?;
         Ok(())
     }
 }
 
 impl DropboxPipe {
+    fn guard_remote_quiet(&self, index: &RemoteIndex, local: &[String]) -> Result<()> {
+        for item in self.list_folder()? {
+            if !is_cloud_file(&item.name) {
+                continue;
+            }
+            if local.iter().any(|n| n == &item.name) {
+                continue;
+            }
+            if !index.files.contains_key(&item.name) {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+
     fn api_headers(&self, json: bool) -> Vec<(String, String)> {
         let mut h = vec![("Authorization".into(), format!("Bearer {}", self.access))];
         if json {
@@ -186,21 +222,4 @@ struct DropboxMeta {
     name: String,
     rev: Option<String>,
     content_hash: Option<String>,
-}
-
-fn box_names(place: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for path in pipe::boxes_in(place)? {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            names.push(name.to_string());
-        }
-    }
-    if names.is_empty() {
-        names.push(BOX_FILE.to_string());
-    }
-    Ok(names)
-}
-
-fn is_box_name(name: &str) -> bool {
-    name == BOX_FILE || (name.starts_with("moveit-box") && name.ends_with(".json"))
 }

@@ -72,7 +72,11 @@ async function pipes(next = 'preview') {
         if (installed?.status === 'installed') usingByokKeys = true;
         return pipes(next);
       }
-      if (!candidate.cloud) usingByokKeys = false;
+      if (candidate.cloud) {
+        if (candidate.byok != null) usingByokKeys = candidate.byok;
+      } else {
+        usingByokKeys = false;
+      }
       let path = candidate.path;
       if (!path && !candidate.cloud) path = await call('pick_folder');
       if (!path && !candidate.cloud) return;
@@ -231,7 +235,7 @@ on('use-pipe', async () => {
       await call('pipe_sign_in_begin', { provider: selectedPipe.kind, byok });
       const finish = await call('pipe_sign_in_finish');
       signInWaiting = false;
-      if (finish.status !== 'connected') { notice('Sign-in did not finish; try again.', true); return; }
+      if (finish.status !== 'connected') { await call('pipe_sign_in_cancel'); notice('Sign-in did not finish; try again.', true); return; }
     }
     await call('use_cloud_pipe', { provider: selectedPipe.kind, byok });
     startInfo.pipeSet = true;

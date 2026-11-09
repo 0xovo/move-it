@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use crate::cloud::dropbox::DropboxPipe;
 use crate::cloud::google::GoogleDrivePipe;
-use crate::cloud::http::{HttpClient, SharedHttp, UreqClient};
+use crate::cloud::http::{HttpClient, SharedHttp};
 use crate::cloud::session::open_session;
 use crate::keychain::TokenStore;
+use crate::oauth::access_cache;
 use crate::oauth::config::{byok_oauth_path, install_byok_config, load_builtin_oauth, load_oauth_file, builtin_oauth_path, OAuthFile};
 use crate::oauth::flow::{begin_sign_in, complete_sign_in, revoke_tokens, SignInOutcome};
 use crate::oauth::tokens::{delete_provider_token, load_provider_token, Provider};
@@ -19,6 +20,16 @@ pub struct CloudPaths {
     pub byok_config: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct CloudPipeStatus {
+    pub google_connected: bool,
+    pub dropbox_connected: bool,
+    pub google_byok_connected: bool,
+    pub dropbox_byok_connected: bool,
+    pub byok_installed: bool,
+    pub active_byok: bool,
+}
+
 impl App {
     pub fn cloud_status_paths(&self) -> Option<CloudPaths> {
         let dir = self.app_config_dir.as_ref()?;
@@ -26,6 +37,22 @@ impl App {
             byok_config: byok_oauth_path(dir),
         })
     }
+
+    pub fn cloud_pipe_status(&self) -> CloudPipeStatus {
+        let byok_installed = self
+            .cloud_status_paths()
+            .map(|p| p.byok_config.exists())
+            .unwrap_or(false);
+        CloudPipeStatus {
+            google_connected: self.cloud_connected("google", false).unwrap_or(false),
+            dropbox_connected: self.cloud_connected("dropbox", false).unwrap_or(false),
+            google_byok_connected: self.cloud_connected("google", true).unwrap_or(false),
+            dropbox_byok_connected: self.cloud_connected("dropbox", true).unwrap_or(false),
+            byok_installed,
+            active_byok: self.config.pipe_byok.unwrap_or(false),
+        }
+    }
+
     pub(crate) fn http(&self) -> SharedHttp {
         self.http.clone()
     }
@@ -67,7 +94,6 @@ impl App {
         Ok(())
     }
 
-    /// Parts needed to finish sign-in without holding the engine mutex during the browser wait.
     pub fn cloud_sign_in_clones(
         &self,
         provider: &str,
@@ -78,13 +104,13 @@ impl App {
         Ok((p, oauth, dir, self.token_store.clone(), self.http.clone()))
     }
 
-    /// Drop BYOK config and tokens when returning to the built-in provider apps.
     pub fn abandon_byok(&mut self) -> Result<()> {
         if let Some(dir) = &self.app_config_dir {
             let _ = std::fs::remove_file(byok_oauth_path(dir));
         }
         for p in [Provider::Google, Provider::Dropbox] {
             let _ = delete_provider_token(self.token_store.as_ref(), p, true);
+            access_cache::clear_provider(p);
         }
         Ok(())
     }
@@ -106,9 +132,6 @@ impl App {
     }
 
     pub fn use_cloud_pipe(&mut self, provider: &str, byok: bool) -> Result<PipeInfo> {
-        if !byok {
-            self.abandon_byok()?;
-        }
         let p = Provider::parse(provider)?;
         if load_provider_token(self.token_store.as_ref(), p, byok)?.is_none() {
             return Err(Error::Refused("sign in to this provider first".into()));
@@ -128,35 +151,25 @@ impl App {
 
     pub fn pipe_sign_out(&mut self, provider: &str) -> Result<()> {
         let p = Provider::parse(provider)?;
-        let byok = self.config.pipe_byok.unwrap_or(false);
-        let (oauth, dir) = self.oauth_for(byok)?;
-        if let Some(token) = load_provider_token(self.token_store.as_ref(), p, byok)? {
-            let revoke = token
-                .access_token
-                .as_deref()
-                .unwrap_or(token.refresh_token.as_str());
-            let _ = revoke_tokens(p, self.http.as_ref(), revoke);
+        for byok in [false, true] {
+            if let Some(token) = load_provider_token(self.token_store.as_ref(), p, byok)? {
+                let material = access_cache::get(p, byok).unwrap_or_else(|| token.refresh_token.clone());
+                let _ = revoke_tokens(p, self.http.as_ref(), &material);
+            }
+            let _ = delete_provider_token(self.token_store.as_ref(), p, byok);
+            if let Ok(staging) = self.cloud_staging(p, byok) {
+                if staging.exists() {
+                    let _ = std::fs::remove_dir_all(staging);
+                }
+            }
         }
-        delete_provider_token(self.token_store.as_ref(), p, byok)?;
+        access_cache::clear_provider(p);
         if self.config.pipe_kind.as_deref() == Some(p.as_str()) {
-            let staging = self
-                .config
-                .pipe_path
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| self.cloud_staging(p, byok).unwrap_or_default());
-            let _ = std::fs::remove_dir_all(staging.parent().unwrap_or(&staging));
             self.config.pipe_kind = None;
             self.config.pipe_path = None;
             self.config.pipe_byok = None;
             self.save_config()?;
         }
-        if byok {
-            if let Some(dir) = &self.app_config_dir {
-                let _ = std::fs::remove_file(byok_oauth_path(dir));
-            }
-        }
-        let _ = (oauth, dir);
         Ok(())
     }
 

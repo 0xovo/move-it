@@ -1449,6 +1449,7 @@ impl App {
         };
         self.config.pipe_kind = Some(kind.clone());
         self.config.pipe_path = Some(path.to_string_lossy().into_owned());
+        self.config.pipe_byok = None;
         self.save_config()?;
         Ok(PipeInfo { kind, place: place.to_string_lossy().into_owned() })
     }

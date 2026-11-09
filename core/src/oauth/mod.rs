@@ -1,8 +1,9 @@
 //! Provider sign-in: PKCE, loopback redirect, token storage. No async runtime.
 
+pub mod access_cache;
 pub mod config;
 pub mod flow;
-mod loopback;
+pub mod loopback;
 mod pkce;
 pub mod tokens;
 

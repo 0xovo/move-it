@@ -1,10 +1,10 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method};
 use crate::keychain::TokenStore;
+use crate::oauth::access_cache;
 use crate::oauth::config::{resolve_google_secret, OAuthFile};
-use crate::oauth::tokens::{access_from_stored, load_provider_token, store_provider_token, Provider, ProviderToken};
+use crate::oauth::tokens::{load_provider_token, Provider, ProviderToken};
 use crate::{Error, Result};
 
 pub struct CloudSession {
@@ -20,18 +20,16 @@ pub fn open_session(
     oauth_dir: &Path,
     http: &dyn HttpClient,
 ) -> Result<CloudSession> {
-    let mut stored = load_provider_token(store, provider, byok)?
+    let stored = load_provider_token(store, provider, byok)?
         .ok_or_else(|| Error::Refused("this cloud provider is not signed in".into()))?;
-    if let Some(access) = access_from_stored(&stored)? {
+    if let Some(access) = access_cache::get(provider, byok) {
         return Ok(CloudSession { access, refreshed: None });
     }
     let updated = refresh_access(provider, http, oauth, oauth_dir, &stored)?;
-    stored.access_token = Some(updated.access.clone());
-    stored.expires_at_unix = updated.expires_at_unix;
-    store_provider_token(store, provider, byok, &stored)?;
+    access_cache::put(provider, byok, updated.access.clone(), updated.expires_at_unix);
     Ok(CloudSession {
         access: updated.access,
-        refreshed: Some(stored),
+        refreshed: None,
     })
 }
 
@@ -93,8 +91,8 @@ fn refresh_access(
         .ok_or_else(|| Error::Refused("provider token refresh returned no access token".into()))?
         .to_string();
     let expires_at_unix = v.get("expires_in").and_then(|x| x.as_u64()).map(|secs| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() + secs)
             .unwrap_or(0)
     });

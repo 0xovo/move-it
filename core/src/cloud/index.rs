@@ -25,7 +25,7 @@ pub struct RemoteFile {
 }
 
 pub fn index_path(place: &Path) -> PathBuf {
-    place.parent().unwrap_or(place).join(INDEX_FILE)
+    place.join(INDEX_FILE)
 }
 
 pub fn load_index(place: &Path) -> Result<RemoteIndex> {
@@ -40,6 +40,8 @@ pub fn load_index(place: &Path) -> Result<RemoteIndex> {
 
 pub fn save_index(place: &Path, index: &RemoteIndex) -> Result<()> {
     let path = index_path(place);
+    let tmp = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(index).map_err(|e| Error::Io(e.to_string()))?;
-    std::fs::write(path, bytes).map_err(|e| Error::Io(e.to_string()))
+    std::fs::write(&tmp, bytes).map_err(|e| Error::Io(e.to_string()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| Error::Io(e.to_string()))
 }

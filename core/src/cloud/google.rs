@@ -2,21 +2,21 @@ use std::path::{Path, PathBuf};
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method, SharedHttp};
 use crate::cloud::index::{load_index, save_index, RemoteFile, RemoteIndex};
-use crate::pipe::{self, Pipe, BOX_FILE};
+use crate::cloud::sync_files::{is_cloud_file, local_cloud_files, remove_stale_locals, write_cloud_file};
+use crate::pairing;
+use crate::pipe::{Pipe, BOX_FILE};
 use crate::{Error, Result};
 
 pub struct GoogleDrivePipe {
     place: PathBuf,
     http: SharedHttp,
     access: String,
-    index: RemoteIndex,
 }
 
 impl GoogleDrivePipe {
     pub fn new(place: PathBuf, http: SharedHttp, access: String) -> Result<Self> {
         std::fs::create_dir_all(&place).map_err(|e| Error::Io(e.to_string()))?;
-        let index = load_index(&place)?;
-        Ok(Self { place, http, access, index })
+        Ok(Self { place, http, access })
     }
 }
 
@@ -27,36 +27,44 @@ impl Pipe for GoogleDrivePipe {
 
     fn refresh(&self) -> Result<()> {
         let mut index = RemoteIndex::default();
-        let names = box_names(&self.place)?;
-        for name in names {
-            if let Some(remote) = self.find_remote(&name)? {
-                let bytes = self.download(&remote.id)?;
-                pipe::write_named_box(&self.place, &name, &bytes)?;
-                index.files.insert(name, remote);
+        let mut kept = Vec::new();
+        for remote in self.list_remote()? {
+            if !is_cloud_file(&remote.name) {
+                continue;
             }
+            let bytes = self.download(&remote.id)?;
+            write_cloud_file(&self.place, &remote.name, &bytes)?;
+            kept.push(remote.name.clone());
+            index.files.insert(
+                remote.name,
+                RemoteFile {
+                    id: remote.id,
+                    etag: remote.etag,
+                    modified: remote.modified,
+                    rev: None,
+                },
+            );
+            save_index(&self.place, &index)?;
         }
-        // Remove stale local copies of remote files that disappeared.
-        for local in std::fs::read_dir(&self.place).map_err(|e| Error::Io(e.to_string()))?.flatten() {
-            let name = local.file_name().to_string_lossy().into_owned();
-            if is_box_name(&name) && !index.files.contains_key(&name) {
-                let _ = std::fs::remove_file(local.path());
-            }
-        }
+        remove_stale_locals(&self.place, &kept)?;
         save_index(&self.place, &index)?;
         Ok(())
     }
 
     fn publish(&self, _note: &str) -> Result<()> {
         let mut index = load_index(&self.place)?;
-        let local_names = box_names(&self.place)?;
-        let remote_names: Vec<String> = self.list_remote()?.into_iter().map(|f| f.name).collect();
+        let local_names = local_cloud_files(&self.place)?;
+        self.guard_remote_quiet(&index, &local_names)?;
 
         for name in &local_names {
-            let bytes = std::fs::read(self.place.join(name)).map_err(|e| Error::Io(e.to_string()))?;
+            let bytes =
+                std::fs::read(self.place.join(name)).map_err(|e| Error::Io(e.to_string()))?;
             match index.files.get(name) {
                 Some(remote) => {
                     let current = self.find_remote(name)?;
-                    if let (Some(old), Some(now)) = (remote.etag.as_ref(), current.as_ref().and_then(|c| c.etag.as_ref())) {
+                    if let (Some(old), Some(now)) =
+                        (remote.etag.as_ref(), current.as_ref().and_then(|c| c.etag.as_ref()))
+                    {
                         if old != now {
                             return Err(Error::Busy);
                         }
@@ -67,35 +75,63 @@ impl Pipe for GoogleDrivePipe {
                     }
                 }
                 None => {
+                    if self.find_remote(name)?.is_some() {
+                        return Err(Error::Busy);
+                    }
                     let created = self.create_file(name, &bytes)?;
                     index.files.insert(name.clone(), created);
                 }
             }
+            save_index(&self.place, &index)?;
         }
 
-        for remote_name in remote_names {
-            if !local_names.iter().any(|n| n == &remote_name) && is_box_name(&remote_name) {
-                if let Some(remote) = index.files.get(&remote_name) {
-                    self.delete_file(&remote.id)?;
-                }
-                index.files.remove(&remote_name);
+        let remote = self.list_remote()?;
+        for item in remote {
+            if !is_cloud_file(&item.name) {
+                continue;
+            }
+            if local_names.iter().any(|n| n == &item.name) {
+                continue;
+            }
+            if let Some(remote) = index.files.get(&item.name) {
+                self.delete_file(&remote.id)?;
+                index.files.remove(&item.name);
+                save_index(&self.place, &index)?;
             }
         }
-        save_index(&self.place, &index)?;
         Ok(())
     }
 }
 
 impl GoogleDrivePipe {
+    fn guard_remote_quiet(&self, index: &RemoteIndex, local: &[String]) -> Result<()> {
+        for remote in self.list_remote()? {
+            if !is_cloud_file(&remote.name) {
+                continue;
+            }
+            if local.iter().any(|n| n == &remote.name) {
+                continue;
+            }
+            if !index.files.contains_key(&remote.name) {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+
     fn auth_headers(&self) -> Vec<(String, String)> {
         vec![("Authorization".into(), format!("Bearer {}", self.access))]
     }
 
     fn list_remote(&self) -> Result<Vec<DriveListItem>> {
-        let q = "trashed=false and (name='moveit-box.json' or name contains 'moveit-box-')";
+        let q = format!(
+            "trashed=false and (name='{BOX_FILE}' or name contains 'moveit-box-' or name='{}' or name='{}')",
+            pairing::OFFER_FILE,
+            pairing::PAIRED_FILE
+        );
         let url = format!(
             "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id,name,modifiedTime,md5Checksum)",
-            pct_encode(q)
+            pct_encode(&q)
         );
         let resp = self.http.request(HttpRequest {
             method: Method::Get,
@@ -165,7 +201,7 @@ impl GoogleDrivePipe {
 
     fn update_file(&self, id: &str, bytes: &[u8]) -> Result<()> {
         let _ = self.http.request(HttpRequest {
-            method: Method::Post,
+            method: Method::Patch,
             url: format!("https://www.googleapis.com/upload/drive/v3/files/{id}?uploadType=media"),
             headers: [
                 self.auth_headers(),
@@ -203,23 +239,6 @@ fn parse_drive_file(body: &[u8]) -> Result<RemoteFile> {
         modified: v.get("modifiedTime").and_then(|x| x.as_str()).map(str::to_string),
         rev: None,
     })
-}
-
-fn box_names(place: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for path in pipe::boxes_in(place)? {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            names.push(name.to_string());
-        }
-    }
-    if names.is_empty() {
-        names.push(BOX_FILE.to_string());
-    }
-    Ok(names)
-}
-
-fn is_box_name(name: &str) -> bool {
-    name == BOX_FILE || (name.starts_with("moveit-box") && name.ends_with(".json"))
 }
 
 fn pct_encode(s: &str) -> String {

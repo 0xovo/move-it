@@ -62,11 +62,26 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn bundled_oauth_dir() -> Option<PathBuf> {
+    std::env::var_os("MOVEIT_BUNDLE_OAUTH_DIR").map(PathBuf::from)
+}
+
 pub fn builtin_oauth_path() -> PathBuf {
     if let Ok(dir) = std::env::var("MOVEIT_OAUTH_DIR") {
         return PathBuf::from(dir).join("oauth.json");
     }
+    if let Some(dir) = bundled_oauth_dir() {
+        return dir.join("oauth.json");
+    }
     moveit_config_dir().join("oauth.json")
+}
+
+fn validate_client_file_name(name: &str) -> Result<()> {
+    let file = Path::new(name);
+    if file.is_absolute() || name.contains("..") || name.contains('/') || name.contains('\\') {
+        return Err(Error::Refused("google client_file must be a simple file name in the config folder".into()));
+    }
+    Ok(())
 }
 
 pub fn byok_oauth_path(app_config: &Path) -> PathBuf {
@@ -158,14 +173,28 @@ pub fn resolve_google_secret(oauth: &OAuthFile, oauth_dir: &Path) -> Result<(Str
 /// Copy a user-chosen BYOK file into the app config dir with mode 600.
 pub fn install_byok_config(src: &Path, app_config: &Path) -> Result<PathBuf> {
     let parsed = load_oauth_file(src)?;
+    if let Some(g) = &parsed.google {
+        validate_client_file_name(&g.client_file)?;
+    }
     std::fs::create_dir_all(app_config).map_err(|e| Error::Io(e.to_string()))?;
     let dest = byok_oauth_path(app_config);
+    let src_canon = std::fs::canonicalize(src).map_err(|e| Error::Io(e.to_string()))?;
+    if let Ok(dest_canon) = std::fs::canonicalize(&dest) {
+        if src_canon == dest_canon {
+            return Err(Error::Refused("choose a different oauth config file".into()));
+        }
+    }
     std::fs::copy(src, &dest).map_err(|e| Error::Io(e.to_string()))?;
     restrict_permissions(&dest)?;
     if let Some(g) = &parsed.google {
         let sidecar = src.parent().unwrap_or(src).join(&g.client_file);
         if sidecar.is_file() {
             let target = app_config.join(&g.client_file);
+            if let (Ok(a), Ok(b)) = (std::fs::canonicalize(&sidecar), std::fs::canonicalize(&target)) {
+                if a == b {
+                    return Err(Error::Refused("google client_file must not point at itself".into()));
+                }
+            }
             std::fs::copy(&sidecar, &target).map_err(|e| Error::Io(e.to_string()))?;
             restrict_permissions(&target)?;
         }
