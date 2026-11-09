@@ -6,7 +6,6 @@ use crate::cloud::google::GoogleDrivePipe;
 use crate::cloud::http::{HttpClient, SharedHttp};
 use crate::cloud::session::open_session;
 use crate::keychain::TokenStore;
-use crate::oauth::access_cache;
 use crate::oauth::config::{
     builtin_oauth_dir, byok_oauth_path, install_byok_config, load_builtin_oauth, load_oauth_file, OAuthFile,
 };
@@ -72,8 +71,16 @@ impl App {
             let path = byok_oauth_path(dir);
             Ok((load_oauth_file(&path)?, dir.clone()))
         } else {
-            let dir = builtin_oauth_dir();
-            Ok((load_builtin_oauth().or_else(|_| load_oauth_file(&dir.join("oauth.json")))?, dir))
+            let dir = self
+                .builtin_oauth_dir
+                .clone()
+                .unwrap_or_else(builtin_oauth_dir);
+            let oauth = if self.builtin_oauth_dir.is_some() {
+                load_oauth_file(&dir.join("oauth.json"))?
+            } else {
+                load_builtin_oauth().or_else(|_| load_oauth_file(&dir.join("oauth.json")))?
+            };
+            Ok((oauth, dir))
         }
     }
 
@@ -92,18 +99,17 @@ impl App {
     pub fn finish_cloud_sign_in(&self, provider: &str, byok: bool, start: SignInOutcome) -> Result<()> {
         let p = Provider::parse(provider)?;
         let (oauth, dir) = self.oauth_for(byok)?;
-        let _token = complete_sign_in(self.token_store.as_ref(), p, byok, &oauth, &dir, self.http.as_ref(), start)?;
+        let _token = complete_sign_in(
+            &self.access_cache,
+            self.token_store.as_ref(),
+            p,
+            byok,
+            &oauth,
+            &dir,
+            self.http.as_ref(),
+            start,
+        )?;
         Ok(())
-    }
-
-    pub fn cloud_sign_in_clones(
-        &self,
-        provider: &str,
-        byok: bool,
-    ) -> Result<(Provider, OAuthFile, PathBuf, std::sync::Arc<dyn TokenStore + Send + Sync>, SharedHttp)> {
-        let p = Provider::parse(provider)?;
-        let (oauth, dir) = self.oauth_for(byok)?;
-        Ok((p, oauth, dir, self.token_store.clone(), self.http.clone()))
     }
 
     pub fn abandon_byok(&mut self) -> Result<()> {
@@ -112,7 +118,7 @@ impl App {
         }
         for p in [Provider::Google, Provider::Dropbox] {
             let _ = delete_provider_token(self.token_store.as_ref(), p, true);
-            access_cache::clear_provider(p);
+            self.access_cache.clear_provider(p);
         }
         Ok(())
     }
@@ -155,7 +161,10 @@ impl App {
         let p = Provider::parse(provider)?;
         for byok in [false, true] {
             if let Some(token) = load_provider_token(self.token_store.as_ref(), p, byok)? {
-                let material = access_cache::get(p, byok).unwrap_or_else(|| token.refresh_token.clone());
+                let material = self
+                    .access_cache
+                    .get(p, byok)
+                    .unwrap_or_else(|| token.refresh_token.clone());
                 let _ = revoke_tokens(p, self.http.as_ref(), &material);
             }
             let _ = delete_provider_token(self.token_store.as_ref(), p, byok);
@@ -165,7 +174,7 @@ impl App {
                 }
             }
         }
-        access_cache::clear_provider(p);
+        self.access_cache.clear_provider(p);
         if self.config.pipe_kind.as_deref() == Some(p.as_str()) {
             self.config.pipe_kind = None;
             self.config.pipe_path = None;
@@ -188,7 +197,15 @@ impl App {
         let byok = self.config.pipe_byok.unwrap_or(false);
         let provider = Provider::parse(kind)?;
         let (oauth, dir) = self.oauth_for(byok)?;
-        let session = open_session(self.token_store.as_ref(), provider, byok, &oauth, &dir, self.http.as_ref())?;
+        let session = open_session(
+            &self.access_cache,
+            self.token_store.as_ref(),
+            provider,
+            byok,
+            &oauth,
+            &dir,
+            self.http.as_ref(),
+        )?;
         let http = self.http();
         let pipe: Box<dyn Pipe> = match provider {
             Provider::Google => Box::new(GoogleDrivePipe::new(staging.to_path_buf(), http, session.access)?),

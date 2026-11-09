@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method};
 use crate::keychain::TokenStore;
-use crate::oauth::access_cache;
+use crate::oauth::access_cache::AccessCache;
 use crate::oauth::config::{resolve_google_secret, OAuthFile};
 use crate::oauth::tokens::{load_provider_token, Provider, ProviderToken};
 use crate::{Error, Result};
@@ -13,6 +13,7 @@ pub struct CloudSession {
 }
 
 pub fn open_session(
+    cache: &AccessCache,
     store: &dyn TokenStore,
     provider: Provider,
     byok: bool,
@@ -22,11 +23,11 @@ pub fn open_session(
 ) -> Result<CloudSession> {
     let stored = load_provider_token(store, provider, byok)?
         .ok_or_else(|| Error::Refused("this cloud provider is not signed in".into()))?;
-    if let Some(access) = access_cache::get(provider, byok) {
+    if let Some(access) = cache.get(provider, byok) {
         return Ok(CloudSession { access, refreshed: None });
     }
     let updated = refresh_access(provider, http, oauth, oauth_dir, &stored)?;
-    access_cache::put(provider, byok, updated.access.clone(), updated.expires_at_unix);
+    cache.put(provider, byok, updated.access.clone(), updated.expires_at_unix);
     Ok(CloudSession {
         access: updated.access,
         refreshed: None,

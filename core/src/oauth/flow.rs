@@ -6,7 +6,7 @@ use crate::keychain::TokenStore;
 use crate::oauth::config::{resolve_google_secret, OAuthFile};
 use crate::oauth::loopback::LoopbackRedirect;
 use crate::oauth::pkce::{new_pkce, random_state};
-use crate::oauth::access_cache;
+use crate::oauth::access_cache::AccessCache;
 use crate::oauth::tokens::{store_provider_token, Provider, ProviderToken};
 use crate::{Error, Result};
 
@@ -36,6 +36,7 @@ pub fn begin_sign_in(provider: Provider, oauth: &OAuthFile, _oauth_dir: &Path) -
 }
 
 pub fn complete_sign_in(
+    cache: &AccessCache,
     store: &dyn TokenStore,
     provider: Provider,
     byok: bool,
@@ -52,13 +53,14 @@ pub fn complete_sign_in(
         Provider::Dropbox => exchange_dropbox(http, oauth, &redirect_uri, &code, &verifier)?,
     };
     if let Some(access) = &token.access_token {
-        access_cache::put(provider, byok, access.clone(), token.expires_at_unix);
+        cache.put(provider, byok, access.clone(), token.expires_at_unix);
     }
     store_provider_token(store, provider, byok, &token)?;
     Ok(token)
 }
 
 pub fn sign_in(
+    cache: &AccessCache,
     store: &dyn TokenStore,
     provider: Provider,
     byok: bool,
@@ -68,7 +70,7 @@ pub fn sign_in(
 ) -> Result<(String, ProviderToken)> {
     let start = begin_sign_in(provider, oauth, oauth_dir)?;
     let url = start.authorize_url.clone();
-    let token = complete_sign_in(store, provider, byok, oauth, oauth_dir, http, start)?;
+    let token = complete_sign_in(cache, store, provider, byok, oauth, oauth_dir, http, start)?;
     Ok((url, token))
 }
 

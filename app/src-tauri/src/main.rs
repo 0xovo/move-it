@@ -3,7 +3,7 @@ mod pipes;
 mod updater;
 
 use moveit_core::api::{App, RouteChoice};
-use moveit_core::oauth::flow::{complete_sign_in, SignInOutcome};
+use moveit_core::oauth::flow::SignInOutcome;
 use pipes::CloudStatus;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -217,13 +217,12 @@ async fn pipe_sign_in_finish(state: State<'_, Desktop>) -> Reply {
         .ok_or_else(|| "No sign-in is in progress.".to_string())?;
     let engine = state.engine.clone();
     let (provider, byok, outcome) = (pending.provider, pending.byok, pending.outcome);
-    let clones = {
-        let app = engine.try_lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
-        app.cloud_sign_in_clones(&provider, byok).map_err(|e| e.to_string())?
-    };
+    let provider_for_finish = provider.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (p, oauth, dir, store, http) = clones;
-        complete_sign_in(store.as_ref(), p, byok, &oauth, &dir, http.as_ref(), outcome)
+        let app = engine
+            .lock()
+            .map_err(|_| "Could not finish sign-in.".to_string())?;
+        app.finish_cloud_sign_in(&provider_for_finish, byok, outcome)
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))
     })
     .await

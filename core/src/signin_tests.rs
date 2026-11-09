@@ -14,7 +14,8 @@ mod tests {
     use crate::cloud::http::{HttpRequest, Method, MockHttp};
     use crate::cloud::index::{RemoteFile, RemoteIndex};
     use crate::keychain::MemoryStore;
-    use crate::oauth::config::{install_byok_config, load_builtin_oauth};
+    use crate::oauth::config::{install_byok_config, load_oauth_file};
+    use crate::oauth::access_cache::AccessCache;
     use crate::oauth::flow::{begin_sign_in, complete_sign_in};
     use crate::oauth::loopback::LoopbackRedirect;
     use crate::oauth::tokens::{load_provider_token, Provider};
@@ -37,14 +38,11 @@ mod tests {
             br#"{"installed":{"client_id":"test-google","client_secret":"test-secret","redirect_uris":["http://127.0.0.1"]}}"#,
         )
         .unwrap();
-        // SAFETY: test-only env for fixture config paths.
-        unsafe { std::env::set_var("MOVEIT_OAUTH_DIR", dir) };
     }
 
-    fn oauth_pair() -> (crate::oauth::config::OAuthFile, std::path::PathBuf) {
-        let oauth = load_builtin_oauth().unwrap();
-        let dir = std::env::var("MOVEIT_OAUTH_DIR").map(std::path::PathBuf::from).unwrap();
-        (oauth, dir)
+    fn oauth_pair(dir: &Path) -> (crate::oauth::config::OAuthFile, std::path::PathBuf) {
+        let oauth = load_oauth_file(&dir.join("oauth.json")).unwrap();
+        (oauth, dir.to_path_buf())
     }
 
     fn simulate_redirect(redirect_uri: &str, state: &str, code: &str) {
@@ -65,21 +63,27 @@ mod tests {
         });
     }
 
-    fn sign_in_provider(store: &MemoryStore, http: &MockHttp, provider: Provider, byok: bool) {
-        let (oauth, dir) = oauth_pair();
+    fn queue_access_refresh(http: &MockHttp) {
+        http.push_ok_json(r#"{"access_token":"access-refreshed","expires_in":3600}"#);
+    }
+
+    fn sign_in_provider(oauth_dir: &Path, store: &MemoryStore, http: &MockHttp, provider: Provider, byok: bool) {
+        let cache = AccessCache::default();
+        let (oauth, dir) = oauth_pair(oauth_dir);
         let start = begin_sign_in(provider, &oauth, &dir).unwrap();
         http.push_ok_json(r#"{"access_token":"access-test","expires_in":3600,"refresh_token":"refresh-abc"}"#);
         simulate_redirect(&start.redirect.redirect_uri, &start.state, "auth-code");
-        complete_sign_in(store, provider, byok, &oauth, &dir, http, start).unwrap();
+        complete_sign_in(&cache, store, provider, byok, &oauth, &dir, http, start).unwrap();
     }
 
-    fn app_with(state: &Path, store: Arc<MemoryStore>, http: Arc<MockHttp>) -> App {
+    fn app_with(oauth_dir: &Path, state: &Path, store: Arc<MemoryStore>, http: Arc<MockHttp>) -> App {
         App::open(state)
             .unwrap()
             .with_key_store(store.clone())
             .with_token_store(store)
             .with_http(http)
             .with_app_config_dir(state.join("config"))
+            .with_builtin_oauth_dir(oauth_dir.to_path_buf())
     }
 
     #[test]
@@ -89,7 +93,7 @@ mod tests {
         let http = Arc::new(MockHttp::default());
         let store = Arc::new(MemoryStore::default());
         for provider in [Provider::Google, Provider::Dropbox] {
-            sign_in_provider(&store, &http, provider, false);
+            sign_in_provider(tmp.path(), &store, &http, provider, false);
             assert!(load_provider_token(&*store, provider, false).unwrap().is_some());
             let saved = load_provider_token(&*store, provider, false).unwrap().unwrap();
             assert!(saved.access_token.is_none(), "refresh-only in keychain");
@@ -225,10 +229,10 @@ mod tests {
         fixture_oauth(tmp.path());
         let http = Arc::new(MockHttp::default());
         let store = Arc::new(MemoryStore::default());
-        sign_in_provider(&store, &http, Provider::Google, false);
+        sign_in_provider(tmp.path(), &store, &http, Provider::Google, false);
 
         http.clear_recorded();
-        let app = app_with(tmp.path(), store.clone(), http.clone());
+        let app = app_with(tmp.path(), tmp.path(), store.clone(), http.clone());
         assert!(app.cloud_connected("google", false).unwrap());
         assert!(http.recorded().is_empty(), "restart check must not hit the network");
     }
@@ -239,10 +243,11 @@ mod tests {
         fixture_oauth(tmp.path());
         let http = Arc::new(MockHttp::default());
         let store = Arc::new(MemoryStore::default());
-        sign_in_provider(&store, &http, Provider::Dropbox, false);
+        sign_in_provider(tmp.path(), &store, &http, Provider::Dropbox, false);
         http.clear_recorded();
 
-        let mut app = app_with(tmp.path(), store.clone(), http.clone());
+        let mut app = app_with(tmp.path(), tmp.path(), store.clone(), http.clone());
+        queue_access_refresh(&http);
         app.use_cloud_pipe("dropbox", false).unwrap();
         http.clear_recorded();
         app.pipe_sign_out("dropbox").unwrap();
@@ -265,12 +270,13 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let state = tmp.path().join("state");
         install_byok_config(&byok_src, &state.join("config")).unwrap();
-        sign_in_provider(&store, &http, Provider::Google, true);
+        sign_in_provider(tmp.path(), &store, &http, Provider::Google, true);
         assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_some());
 
         let http2 = Arc::new(MockHttp::default());
-        sign_in_provider(&store, &http2, Provider::Google, false);
-        let mut app = app_with(&state, store.clone(), http);
+        sign_in_provider(tmp.path(), &store, &http2, Provider::Google, false);
+        let mut app = app_with(tmp.path(), &state, store.clone(), http.clone());
+        queue_access_refresh(&http);
         app.use_cloud_pipe("google", false).unwrap();
         assert!(state.join("config").join("oauth-byok.json").exists());
         assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_some());
@@ -367,7 +373,7 @@ mod tests {
         fixture_oauth(tmp.path());
         let http = MockHttp::default();
         let store = MemoryStore::default();
-        let (oauth, dir) = oauth_pair();
+        let (oauth, dir) = oauth_pair(tmp.path());
         let start = begin_sign_in(Provider::Google, &oauth, &dir).unwrap();
         simulate_redirect(&start.redirect.redirect_uri, "wrong-state", "code");
         std::thread::spawn({
@@ -379,7 +385,17 @@ mod tests {
             }
         });
         http.push_ok_json(r#"{"access_token":"a","expires_in":60,"refresh_token":"r"}"#);
-        complete_sign_in(&store, Provider::Google, false, &oauth, &dir, &http, start).unwrap();
+        complete_sign_in(
+            &AccessCache::default(),
+            &store,
+            Provider::Google,
+            false,
+            &oauth,
+            &dir,
+            &http,
+            start,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -388,11 +404,10 @@ mod tests {
         fixture_oauth(tmp.path());
         let http = Arc::new(MockHttp::default());
         let store = Arc::new(MemoryStore::default());
-        sign_in_provider(&store, &http, Provider::Google, false);
-        crate::oauth::access_cache::clear_provider(Provider::Google);
+        sign_in_provider(tmp.path(), &store, &http, Provider::Google, false);
         http.clear_recorded();
         http.push_status_body(400, r#"{"error":"invalid_grant"}"#);
-        let mut app = app_with(tmp.path(), store, http);
+        let mut app = app_with(tmp.path(), tmp.path(), store, http);
         let err = app.use_cloud_pipe("google", false).unwrap_err().to_string();
         assert!(err.contains("sign in again"), "{err}");
     }

@@ -235,6 +235,9 @@ pub struct App {
     /// the app's life even if the environment changes under it.
     base: Option<PathBuf>,
     local_profiles: Vec<DetectedProfile>,
+    access_cache: crate::oauth::access_cache::AccessCache,
+    /// Test harness: built-in OAuth files live here instead of the process default.
+    builtin_oauth_dir: Option<PathBuf>,
 }
 
 /// One move at a time per device: a lock file in the state folder, held for
@@ -314,6 +317,8 @@ impl App {
             profile_override: None,
             base: config_base(),
             local_profiles: Vec::new(),
+            access_cache: crate::oauth::access_cache::AccessCache::default(),
+            builtin_oauth_dir: None,
         })
     }
 
@@ -341,6 +346,11 @@ impl App {
 
     pub fn with_app_config_dir(mut self, dir: PathBuf) -> App {
         self.app_config_dir = Some(dir);
+        self
+    }
+
+    pub fn with_builtin_oauth_dir(mut self, dir: PathBuf) -> App {
+        self.builtin_oauth_dir = Some(dir);
         self
     }
 
