@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::cloud::http::{HttpClient, HttpRequest, Method};
@@ -47,16 +48,58 @@ pub fn complete_sign_in(
 ) -> Result<ProviderToken> {
     let redirect_uri = outcome.redirect.redirect_uri.clone();
     let verifier = outcome.pkce_verifier.clone();
-    let code = outcome.redirect.wait_for_code(&outcome.state, SIGN_IN_TIMEOUT)?;
+    let code = outcome
+        .redirect
+        .wait_for_code_cancel(&outcome.state, SIGN_IN_TIMEOUT, None)?;
+    exchange_and_store_token(
+        cache,
+        store,
+        provider,
+        byok,
+        oauth,
+        oauth_dir,
+        http,
+        &redirect_uri,
+        &verifier,
+        &code,
+    )
+}
+
+pub fn exchange_and_store_token(
+    cache: &AccessCache,
+    store: &dyn TokenStore,
+    provider: Provider,
+    byok: bool,
+    oauth: &OAuthFile,
+    oauth_dir: &Path,
+    http: &dyn HttpClient,
+    redirect_uri: &str,
+    verifier: &str,
+    code: &str,
+) -> Result<ProviderToken> {
     let token = match provider {
-        Provider::Google => exchange_google(http, oauth, oauth_dir, &redirect_uri, &code, &verifier)?,
-        Provider::Dropbox => exchange_dropbox(http, oauth, &redirect_uri, &code, &verifier)?,
+        Provider::Google => exchange_google(http, oauth, oauth_dir, redirect_uri, code, verifier)?,
+        Provider::Dropbox => exchange_dropbox(http, oauth, redirect_uri, code, verifier)?,
     };
     if let Some(access) = &token.access_token {
         cache.put(provider, byok, access.clone(), token.expires_at_unix);
     }
     store_provider_token(store, provider, byok, &token)?;
     Ok(token)
+}
+
+pub fn wait_sign_in_code(
+    outcome: SignInOutcome,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<(String, String, String)> {
+    let redirect_uri = outcome.redirect.redirect_uri.clone();
+    let verifier = outcome.pkce_verifier.clone();
+    let state = outcome.state.clone();
+    let code = outcome
+        .redirect
+        .wait_for_code_cancel(&state, timeout, cancel)?;
+    Ok((redirect_uri, verifier, code))
 }
 
 pub fn sign_in(

@@ -193,7 +193,18 @@ pub fn write_box_bytes(place: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Write one named box file (a per-profile box next to the main one), same
 /// temp-then-rename discipline. Returns true when the bytes on disk changed.
+fn validate_box_file_name(name: &str) -> Result<()> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(Error::Refused("box file name is not allowed".into()));
+    }
+    if name == BOX_FILE || is_conflict_copy(name) || is_profile_box(name) {
+        return Ok(());
+    }
+    Err(Error::Refused("box file name is not allowed".into()))
+}
+
 pub fn write_named_box(place: &Path, name: &str, bytes: &[u8]) -> Result<bool> {
+    validate_box_file_name(name)?;
     std::fs::create_dir_all(place).map_err(|e| Error::Io(e.to_string()))?;
     let target = place.join(name);
     if std::fs::read(&target).is_ok_and(|old| old == bytes) {

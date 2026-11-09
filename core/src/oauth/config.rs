@@ -88,23 +88,40 @@ pub fn is_placeholder_oauth(file: &OAuthFile) -> bool {
     false
 }
 
-/// Directory holding built-in `oauth.json` and the Google client sidecar.
-pub fn builtin_oauth_dir() -> PathBuf {
+/// Resolve the built-in OAuth directory from explicit paths (tests) or env (runtime).
+pub(crate) fn resolve_builtin_oauth_dir(
+    oauth_dir_override: Option<&Path>,
+    bundle_dir: Option<&Path>,
+) -> PathBuf {
     if cfg!(any(debug_assertions, test)) {
-        if let Ok(dir) = std::env::var("MOVEIT_OAUTH_DIR") {
-            return PathBuf::from(dir);
+        if let Some(dir) = oauth_dir_override {
+            return dir.to_path_buf();
         }
     }
-    if let Some(dir) = bundled_oauth_dir() {
+    if let Some(dir) = bundle_dir {
         if cfg!(any(debug_assertions, test)) {
-            if bundle_has_real_builtin_oauth(&dir) {
-                return dir;
+            if bundle_has_real_builtin_oauth(dir) {
+                return dir.to_path_buf();
             }
         } else {
-            return dir;
+            return dir.to_path_buf();
         }
     }
     moveit_config_dir()
+}
+
+/// Directory holding built-in `oauth.json` and the Google client sidecar.
+pub fn builtin_oauth_dir() -> PathBuf {
+  let oauth_override = if cfg!(any(debug_assertions, test)) {
+        std::env::var_os("MOVEIT_OAUTH_DIR").map(PathBuf::from)
+    } else {
+        None
+    };
+    let bundle = bundled_oauth_dir();
+    resolve_builtin_oauth_dir(
+        oauth_override.as_deref(),
+        bundle.as_deref(),
+    )
 }
 
 pub fn builtin_oauth_path() -> PathBuf {
@@ -277,11 +294,10 @@ mod tests {
         let bundle = tmp.path().join("bundle");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("oauth.json"), FIXTURE).unwrap();
-        unsafe {
-            std::env::remove_var("MOVEIT_OAUTH_DIR");
-            std::env::set_var("MOVEIT_BUNDLE_OAUTH_DIR", &bundle);
-        }
-        assert_eq!(super::builtin_oauth_dir(), bundle);
+        assert_eq!(
+            super::resolve_builtin_oauth_dir(None, Some(&bundle)),
+            bundle
+        );
     }
 
     #[test]
@@ -294,10 +310,6 @@ mod tests {
             br#"{"dropbox":{"app_key":"example-dropbox-key","flow":"pkce","scopes":["files.metadata.read"],"access":"app_folder"}}"#,
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("MOVEIT_OAUTH_DIR");
-            std::env::set_var("MOVEIT_BUNDLE_OAUTH_DIR", &bundle);
-        }
-        assert_ne!(super::builtin_oauth_dir(), bundle);
+        assert_ne!(super::resolve_builtin_oauth_dir(None, Some(&bundle)), bundle);
     }
 }

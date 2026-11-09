@@ -16,7 +16,7 @@ mod tests {
     use crate::keychain::MemoryStore;
     use crate::oauth::config::{install_byok_config, load_oauth_file};
     use crate::oauth::access_cache::AccessCache;
-    use crate::oauth::flow::{begin_sign_in, complete_sign_in};
+    use crate::oauth::flow::{begin_sign_in, complete_sign_in, wait_sign_in_code};
     use crate::oauth::loopback::LoopbackRedirect;
     use crate::oauth::tokens::{load_provider_token, Provider};
     use crate::pairing::OFFER_FILE;
@@ -337,7 +337,129 @@ mod tests {
         queue_access_refresh(&http);
         app.use_cloud_pipe("google", false).unwrap();
         assert!(!state.join("config").join("oauth-byok.json").exists());
+        assert!(!state.join("config").join("google-client.json").exists());
         assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn builtin_switch_without_builtin_token_keeps_byok() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let byok_src = tmp.path().join("user-oauth.json");
+        std::fs::write(&byok_src, std::fs::read(tmp.path().join("oauth.json")).unwrap()).unwrap();
+        let state = tmp.path().join("state");
+        install_byok_config(&byok_src, &state.join("config")).unwrap();
+        let http = Arc::new(MockHttp::default());
+        let store = Arc::new(MemoryStore::default());
+        sign_in_provider(tmp.path(), &store, &http, Provider::Google, true);
+
+        let mut app = app_with(tmp.path(), &state, store, http);
+        assert!(app.use_cloud_pipe("google", false).is_err());
+        let cfg = state.join("config");
+        assert!(cfg.join("oauth-byok.json").exists());
+        assert!(cfg.join("google-client.json").exists());
+    }
+
+    #[test]
+    fn dropbox_sign_out_revokes_with_fresh_access_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let http = Arc::new(MockHttp::default());
+        let store = Arc::new(MemoryStore::default());
+        sign_in_provider(tmp.path(), &store, &http, Provider::Dropbox, false);
+        http.clear_recorded();
+        http.push_ok_json(r#"{"access_token":"access-for-revoke","expires_in":3600}"#);
+        http.push_bytes(200, Vec::new());
+        let mut app = app_with(tmp.path(), tmp.path(), store, http.clone());
+        app.pipe_sign_out("dropbox").unwrap();
+        let calls = http.recorded();
+        let refresh = calls
+            .iter()
+            .find(|r| r.url.contains("oauth2/token") && r.body.as_ref().is_some_and(|b| b.windows(13).any(|w| w == b"refresh_token")))
+            .expect("refresh before revoke");
+        assert!(refresh.body.as_ref().unwrap().windows(11).any(|w| w == b"refresh-abc"));
+        let revoke = calls.iter().find(|r| r.url.contains("token/revoke")).expect("revoke call");
+        assert_eq!(
+            revoke.headers.iter().find(|(k, _)| k == "Authorization").map(|(_, v)| v.as_str()),
+            Some("Bearer access-for-revoke")
+        );
+    }
+
+    #[test]
+    fn google_sign_out_revoke_uses_refresh_in_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let http = Arc::new(MockHttp::default());
+        let store = Arc::new(MemoryStore::default());
+        sign_in_provider(tmp.path(), &store, &http, Provider::Google, false);
+        http.clear_recorded();
+        http.push_bytes(200, Vec::new());
+        let mut app = app_with(tmp.path(), tmp.path(), store, http.clone());
+        app.pipe_sign_out("google").unwrap();
+        let revoke = http
+            .recorded()
+            .into_iter()
+            .find(|r| r.url.contains("oauth2.googleapis.com/revoke"))
+            .expect("google revoke");
+        let body = String::from_utf8_lossy(revoke.body.as_deref().unwrap_or_default());
+        assert!(body.contains("token=refresh-abc"), "refresh token in revoke body: {body}");
+        assert!(
+            !revoke
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
+            "google revoke must not use bearer"
+        );
+    }
+
+    #[test]
+    fn loopback_cancel_ends_wait_quickly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let redirect = LoopbackRedirect::bind().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_timer = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            cancel_timer.store(true, Ordering::Release);
+        });
+        let start = std::time::Instant::now();
+        let err = redirect
+            .wait_for_code_cancel("state", Duration::from_secs(30), Some(cancel.as_ref()))
+            .unwrap_err()
+            .to_string();
+        handle.join().unwrap();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2), "cancel took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn wait_sign_in_code_leaves_engine_unlocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let (oauth, dir) = oauth_pair(tmp.path());
+        let start = begin_sign_in(Provider::Google, &oauth, &dir).unwrap();
+        let engine = Arc::new(std::sync::Mutex::new(()));
+        let engine_wait = engine.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_wait = cancel.clone();
+        let wait = std::thread::spawn(move || {
+            let _ = wait_sign_in_code(start, Duration::from_secs(30), Some(&cancel_wait));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(engine_wait.try_lock().is_ok(), "oauth wait must not hold the engine lock");
+        cancel.store(true, Ordering::Release);
+        wait.join().unwrap();
+    }
+
+    #[test]
+    fn write_named_box_rejects_hostile_names() {
+        let place = tempfile::tempdir().unwrap();
+        assert!(crate::pipe::write_named_box(place.path(), "moveit-box/../x.json", b"x").is_err());
+        assert!(!place.path().join("x.json").exists());
     }
 
     #[test]

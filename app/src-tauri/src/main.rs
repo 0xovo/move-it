@@ -3,10 +3,13 @@ mod pipes;
 mod updater;
 
 use moveit_core::api::{App, RouteChoice};
-use moveit_core::oauth::flow::SignInOutcome;
+use moveit_core::oauth::flow::{SignInOutcome, SIGN_IN_TIMEOUT};
 use pipes::CloudStatus;
 use serde::Serialize;
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -24,6 +27,19 @@ struct PendingSignIn {
 struct Desktop {
     engine: Arc<Mutex<App>>,
     pending_sign_in: Arc<Mutex<Option<PendingSignIn>>>,
+    sign_in_cancel: Arc<AtomicBool>,
+    sign_in_loopback: Arc<Mutex<Option<String>>>,
+}
+
+fn poke_loopback(redirect_uri: &str) {
+    let Some(port) = redirect_uri.rsplit(':').next() else {
+        return;
+    };
+    let _ = TcpStream::connect(format!("127.0.0.1:{port}")).and_then(|mut s| {
+        s.write_all(
+            b"GET /?error=access_denied&state=x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+    });
 }
 
 impl Desktop {
@@ -183,6 +199,7 @@ async fn pipe_sign_in_begin(
     provider: String,
     byok: bool,
 ) -> Result<serde_json::Value, String> {
+    state.sign_in_cancel.store(false, Ordering::Release);
     if state
         .pending_sign_in
         .lock()
@@ -198,6 +215,8 @@ async fn pipe_sign_in_begin(
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
         (url, outcome, provider)
     };
+    *state.sign_in_loopback.lock().map_err(|_| "Could not start sign-in.".to_string())? =
+        Some(outcome.redirect.redirect_uri.clone());
     *state.pending_sign_in.lock().map_err(|_| "Could not start sign-in.".to_string())? = Some(PendingSignIn {
         outcome,
         provider: provider.clone(),
@@ -216,26 +235,42 @@ async fn pipe_sign_in_finish(state: State<'_, Desktop>) -> Reply {
         .take()
         .ok_or_else(|| "No sign-in is in progress.".to_string())?;
     let engine = state.engine.clone();
+    let cancel = state.sign_in_cancel.clone();
+    let loopback_slot = state.sign_in_loopback.clone();
     let (provider, byok, outcome) = (pending.provider, pending.byok, pending.outcome);
     let provider_for_finish = provider.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let waited = App::wait_cloud_sign_in_code(outcome, SIGN_IN_TIMEOUT, Some(&cancel))
+            .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
+        let (redirect_uri, verifier, code) = waited;
         let app = engine
-            .lock()
-            .map_err(|_| "Could not finish sign-in.".to_string())?;
-        app.finish_cloud_sign_in(&provider_for_finish, byok, outcome)
+            .try_lock()
+            .map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
+        app.finish_cloud_sign_in_after_code(&provider_for_finish, byok, &redirect_uri, &verifier, &code)
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))
     })
     .await
     .map_err(|_| "Sign-in did not finish.".to_string())??;
+    *loopback_slot.lock().map_err(|_| "Could not finish sign-in.".to_string())? = None;
+    state.sign_in_cancel.store(false, Ordering::Release);
     Ok(serde_json::json!({ "status": "connected", "provider": provider }))
 }
 
 #[tauri::command]
 async fn pipe_sign_in_cancel(state: State<'_, Desktop>) -> Result<(), String> {
+    state.sign_in_cancel.store(true, Ordering::Release);
+    let uri = state
+        .sign_in_loopback
+        .lock()
+        .map_err(|_| "Could not cancel sign-in.".to_string())?
+        .clone();
     *state
         .pending_sign_in
         .lock()
         .map_err(|_| "Could not cancel sign-in.".to_string())? = None;
+    if let Some(uri) = uri {
+        poke_loopback(&uri);
+    }
     Ok(())
 }
 
@@ -315,6 +350,8 @@ fn main() {
             handle.manage(Desktop {
                 engine: Arc::new(Mutex::new(engine)),
                 pending_sign_in: Arc::new(Mutex::new(None)),
+                sign_in_cancel: Arc::new(AtomicBool::new(false)),
+                sign_in_loopback: Arc::new(Mutex::new(None)),
             });
             updater::spawn_checker(app.handle().clone());
             Ok(())
@@ -338,6 +375,89 @@ fn main() {
 }
 
 #[cfg(test)]
+mod sign_in_wait {
+    use super::*;
+    use moveit_core::oauth::flow::begin_sign_in;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn oauth_wait_does_not_hold_engine_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth_dir = dir.path().join("oauth");
+        std::fs::create_dir_all(&oauth_dir).unwrap();
+        std::fs::write(
+            oauth_dir.join("oauth.json"),
+            br#"{"google":{"client_id":"g","client_file":"g.json","flow":"pkce","scopes":["https://www.googleapis.com/auth/drive.file"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            oauth_dir.join("g.json"),
+            br#"{"installed":{"client_id":"g","client_secret":"s","redirect_uris":[]}}"#,
+        )
+        .unwrap();
+        let engine = App::open(dir.path())
+            .unwrap()
+            .with_builtin_oauth_dir(oauth_dir.clone());
+        let oauth = moveit_core::oauth::config::load_oauth_file(&oauth_dir.join("oauth.json")).unwrap();
+        let start = begin_sign_in(moveit_core::oauth::tokens::Provider::Google, &oauth, &oauth_dir).unwrap();
+        let desktop = Desktop {
+            engine: Arc::new(Mutex::new(engine)),
+            pending_sign_in: Arc::new(Mutex::new(None)),
+            sign_in_cancel: Arc::new(AtomicBool::new(false)),
+            sign_in_loopback: Arc::new(Mutex::new(Some(start.redirect.redirect_uri.clone()))),
+        };
+        let cancel = desktop.sign_in_cancel.clone();
+        let engine_arc = desktop.engine.clone();
+        let wait = std::thread::spawn(move || {
+            let _ = App::wait_cloud_sign_in_code(start, SIGN_IN_TIMEOUT, Some(&cancel));
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            engine_arc.try_lock().is_ok(),
+            "other commands must not see Busy during oauth wait"
+        );
+        desktop.sign_in_cancel.store(true, Ordering::Release);
+        wait.join().unwrap();
+    }
+
+    #[test]
+    fn cancel_ends_oauth_wait_within_one_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth_dir = dir.path().join("oauth");
+        std::fs::create_dir_all(&oauth_dir).unwrap();
+        std::fs::write(
+            oauth_dir.join("oauth.json"),
+            br#"{"google":{"client_id":"g","client_file":"g.json","flow":"pkce","scopes":["https://www.googleapis.com/auth/drive.file"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            oauth_dir.join("g.json"),
+            br#"{"installed":{"client_id":"g","client_secret":"s","redirect_uris":[]}}"#,
+        )
+        .unwrap();
+        let _engine = App::open(dir.path())
+            .unwrap()
+            .with_builtin_oauth_dir(oauth_dir.clone());
+        let oauth = moveit_core::oauth::config::load_oauth_file(&oauth_dir.join("oauth.json")).unwrap();
+        let start = begin_sign_in(moveit_core::oauth::tokens::Provider::Google, &oauth, &oauth_dir).unwrap();
+        let uri = start.redirect.redirect_uri.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_wait = cancel.clone();
+        let started = Instant::now();
+        let wait = std::thread::spawn(move || {
+            App::wait_cloud_sign_in_code(start, SIGN_IN_TIMEOUT, Some(&cancel_wait))
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        cancel.store(true, Ordering::Release);
+        poke_loopback(&uri);
+        let err = wait.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
 mod install_gate {
     use super::*;
     use moveit_core::api::App;
@@ -351,6 +471,8 @@ mod install_gate {
         let desktop = Desktop {
             engine: Arc::new(Mutex::new(app)),
             pending_sign_in: Arc::new(Mutex::new(None)),
+            sign_in_cancel: Arc::new(AtomicBool::new(false)),
+            sign_in_loopback: Arc::new(Mutex::new(None)),
         };
         let held = desktop.engine.try_lock().expect("engine starts free");
         assert!(!desktop.engine_idle());

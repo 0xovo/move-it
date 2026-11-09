@@ -9,7 +9,8 @@ use crate::keychain::TokenStore;
 use crate::oauth::config::{
     builtin_oauth_dir, byok_oauth_path, install_byok_config, load_builtin_oauth, load_oauth_file, OAuthFile,
 };
-use crate::oauth::flow::{begin_sign_in, complete_sign_in, revoke_tokens, SignInOutcome};
+use crate::cloud::session::refresh_access;
+use crate::oauth::flow::{begin_sign_in, exchange_and_store_token, revoke_tokens, wait_sign_in_code, SignInOutcome};
 use crate::oauth::tokens::{delete_provider_token, load_provider_token, Provider};
 use crate::pipe::Pipe;
 use crate::{Error, Result};
@@ -96,10 +97,25 @@ impl App {
         Ok((start.authorize_url.clone(), start))
     }
 
-    pub fn finish_cloud_sign_in(&self, provider: &str, byok: bool, start: SignInOutcome) -> Result<()> {
+    pub fn wait_cloud_sign_in_code(
+        start: SignInOutcome,
+        timeout: std::time::Duration,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(String, String, String)> {
+        wait_sign_in_code(start, timeout, cancel)
+    }
+
+    pub fn finish_cloud_sign_in_after_code(
+        &self,
+        provider: &str,
+        byok: bool,
+        redirect_uri: &str,
+        verifier: &str,
+        code: &str,
+    ) -> Result<()> {
         let p = Provider::parse(provider)?;
         let (oauth, dir) = self.oauth_for(byok)?;
-        let _token = complete_sign_in(
+        let _token = exchange_and_store_token(
             &self.access_cache,
             self.token_store.as_ref(),
             p,
@@ -107,14 +123,22 @@ impl App {
             &oauth,
             &dir,
             self.http.as_ref(),
-            start,
+            redirect_uri,
+            verifier,
+            code,
         )?;
         Ok(())
     }
 
     pub fn abandon_byok(&mut self) -> Result<()> {
         if let Some(dir) = &self.app_config_dir {
-            let _ = std::fs::remove_file(byok_oauth_path(dir));
+            let path = byok_oauth_path(dir);
+            if let Ok(oauth) = load_oauth_file(&path) {
+                if let Some(g) = &oauth.google {
+                    let _ = std::fs::remove_file(dir.join(&g.client_file));
+                }
+            }
+            let _ = std::fs::remove_file(path);
         }
         for p in [Provider::Google, Provider::Dropbox] {
             let _ = delete_provider_token(self.token_store.as_ref(), p, true);
@@ -140,12 +164,12 @@ impl App {
     }
 
     pub fn use_cloud_pipe(&mut self, provider: &str, byok: bool) -> Result<PipeInfo> {
-        if !byok {
-            self.abandon_byok()?;
-        }
         let p = Provider::parse(provider)?;
         if load_provider_token(self.token_store.as_ref(), p, byok)?.is_none() {
             return Err(Error::Refused("sign in to this provider first".into()));
+        }
+        if !byok {
+            self.abandon_byok()?;
         }
         let staging = self.cloud_staging(p, byok)?;
         std::fs::create_dir_all(&staging).map_err(|e| Error::Io(e.to_string()))?;
@@ -164,11 +188,9 @@ impl App {
         let p = Provider::parse(provider)?;
         for byok in [false, true] {
             if let Some(token) = load_provider_token(self.token_store.as_ref(), p, byok)? {
-                let material = self
-                    .access_cache
-                    .get(p, byok)
-                    .unwrap_or_else(|| token.refresh_token.clone());
-                let _ = revoke_tokens(p, self.http.as_ref(), &material);
+                if let Ok(material) = self.revoke_material(p, byok, &token) {
+                    let _ = revoke_tokens(p, self.http.as_ref(), &material);
+                }
             }
             let _ = delete_provider_token(self.token_store.as_ref(), p, byok);
             if let Ok(staging) = self.cloud_staging(p, byok) {
@@ -185,6 +207,20 @@ impl App {
             self.save_config()?;
         }
         Ok(())
+    }
+
+    fn revoke_material(&self, provider: Provider, byok: bool, token: &crate::oauth::tokens::ProviderToken) -> Result<String> {
+        if let Some(access) = self.access_cache.get(provider, byok) {
+            return Ok(access);
+        }
+        match provider {
+            Provider::Google => Ok(token.refresh_token.clone()),
+            Provider::Dropbox => {
+                let (oauth, dir) = self.oauth_for(byok)?;
+                let mint = refresh_access(provider, self.http.as_ref(), &oauth, &dir, token)?;
+                Ok(mint.access)
+            }
+        }
     }
 
     pub(crate) fn cloud_staging(&self, provider: Provider, byok: bool) -> Result<PathBuf> {

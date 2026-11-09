@@ -34,12 +34,12 @@ pub fn open_session(
     })
 }
 
-struct AccessMint {
-    access: String,
-    expires_at_unix: Option<u64>,
+pub(crate) struct AccessMint {
+    pub(crate) access: String,
+    pub(crate) expires_at_unix: Option<u64>,
 }
 
-fn refresh_access(
+pub(crate) fn refresh_access(
     provider: Provider,
     http: &dyn HttpClient,
     oauth: &OAuthFile,

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
@@ -26,8 +27,21 @@ impl LoopbackRedirect {
 
     /// Wait for one redirect, verify `state`, return the authorization `code`.
     pub fn wait_for_code(self, expected_state: &str, timeout: Duration) -> Result<String> {
+        self.wait_for_code_cancel(expected_state, timeout, None)
+    }
+
+    /// Like [`wait_for_code`], but returns promptly when `cancel` is set.
+    pub fn wait_for_code_cancel(
+        self,
+        expected_state: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<String> {
         let deadline = Instant::now() + timeout;
         loop {
+            if cancel.is_some_and(|f| f.load(Ordering::Acquire)) {
+                return Err(Error::Refused("sign-in was cancelled".into()));
+            }
             if Instant::now() >= deadline {
                 return Err(Error::Refused("sign-in did not finish; try again".into()));
             }
