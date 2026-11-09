@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod bookmarks;
+pub mod cloud;
 pub mod cookies;
 pub mod engine;
 pub mod extstate;
@@ -10,6 +11,7 @@ pub mod keychain;
 pub mod localstorage;
 pub mod logbuf;
 pub mod logins;
+pub mod oauth;
 pub mod paths;
 pub mod oscrypt;
 pub mod pairing;
@@ -18,6 +20,9 @@ pub mod profiles;
 pub mod sealed;
 pub mod txn;
 mod util;
+
+#[cfg(test)]
+mod signin_tests;
 
 /// Every failure the engine reports. The app maps each kind to a friendly screen.
 #[derive(Debug, thiserror::Error, PartialEq)]

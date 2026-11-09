@@ -19,6 +19,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+# ureq 3.4.0 (MIT/Apache-2.0): blocking HTTP client for provider APIs and OAuth token exchange.
+ureq = "=3.4.0"
 # zip (MIT): the v2 payload container, deflate only.
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 

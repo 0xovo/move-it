@@ -30,7 +30,12 @@ use crate::oscrypt::{HostTag, LinuxBrowser, LinuxPrefix, Lock, Platform};
 use crate::sealed::{Payload, SyncKey};
 use crate::pipe::Pipe as _;
 use crate::{bookmarks, engine, extstate, history, logins, pairing, paths, pipe, profiles, txn};
+use crate::cloud::http::{SharedHttp, UreqClient};
+use crate::keychain::TokenStore;
 use crate::{Error, Result};
+
+#[path = "api_cloud.rs"]
+mod api_cloud;
 
 const CONFIG_FILE: &str = "config.json";
 const LEGACY_KEY_FILE: &str = "sync-key.txt";
@@ -59,9 +64,11 @@ pub struct Config {
     /// name, but a box only ever belongs to the id that sealed it.
     #[serde(default)]
     pub device_id: Option<String>,
-    /// "folder" or "git".
+    /// "folder", "git", "google", or "dropbox".
     #[serde(default)]
     pub pipe_kind: Option<String>,
+    #[serde(default)]
+    pub pipe_byok: Option<bool>,
     /// The folder the person picked, or the git clone path.
     #[serde(default)]
     pub pipe_path: Option<String>,
@@ -218,6 +225,9 @@ pub struct App {
     state_dir: PathBuf,
     config: Config,
     key_store: std::sync::Arc<dyn crate::keychain::KeyStore + Send + Sync>,
+    token_store: std::sync::Arc<dyn TokenStore + Send + Sync>,
+    http: SharedHttp,
+    app_config_dir: Option<PathBuf>,
     /// The app's own log, behind the Logs screen (see logbuf).
     logs: crate::logbuf::LogBuffer,
     profile_override: Option<(String, PathBuf)>,
@@ -297,6 +307,9 @@ impl App {
             state_dir: state_dir.to_path_buf(),
             config,
             key_store: std::sync::Arc::new(crate::keychain::OsKeychain),
+            token_store: std::sync::Arc::new(crate::keychain::OsKeychain),
+            http: std::sync::Arc::new(UreqClient),
+            app_config_dir: None,
             logs: crate::logbuf::LogBuffer::default(),
             profile_override: None,
             base: config_base(),
@@ -313,6 +326,21 @@ impl App {
         store: std::sync::Arc<dyn crate::keychain::KeyStore + Send + Sync>,
     ) -> App {
         self.key_store = store;
+        self
+    }
+
+    pub fn with_token_store(mut self, store: std::sync::Arc<dyn TokenStore + Send + Sync>) -> App {
+        self.token_store = store;
+        self
+    }
+
+    pub fn with_http(mut self, http: SharedHttp) -> App {
+        self.http = http;
+        self
+    }
+
+    pub fn with_app_config_dir(mut self, dir: PathBuf) -> App {
+        self.app_config_dir = Some(dir);
         self
     }
 
@@ -457,7 +485,7 @@ impl App {
     fn place_path(&self) -> Option<PathBuf> {
         let path = self.config.pipe_path.as_ref()?;
         match self.config.pipe_kind.as_deref() {
-            Some("git") => Some(PathBuf::from(path)),
+            Some("git") | Some("google") | Some("dropbox") => Some(PathBuf::from(path)),
             _ => Some(PathBuf::from(path).join(pipe::FOLDER_NAME)),
         }
     }
@@ -469,6 +497,7 @@ impl App {
         };
         let p: Box<dyn pipe::Pipe> = match kind {
             "git" => Box::new(pipe::GitPipe::new(Path::new(path))?),
+            "google" | "dropbox" => self.build_cloud_pipe(kind, Path::new(path))?,
             _ => Box::new(pipe::FolderPipe::new(Path::new(path))?),
         };
         Ok(Some(p))

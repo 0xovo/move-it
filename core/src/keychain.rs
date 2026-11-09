@@ -55,7 +55,7 @@ fn timed<T: Send + 'static>(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod os {
-    use super::{timed, KeyStore, SERVICE};
+    use super::{timed, KeyStore, TokenStore, SERVICE};
     use crate::sealed::SyncKey;
     use crate::{Error, Result};
 
@@ -91,6 +91,48 @@ mod os {
                 Err(e) => Err(Error::KeychainUnavailable(format!("keychain delete: {e}"))),
             })
         }
+    }
+
+    impl TokenStore for super::OsKeychain {
+        fn store_token(&self, account: &str, value: &str) -> Result<()> {
+            let account = account.to_string();
+            let value = value.to_string();
+            timed("store token", move || {
+                entry(&account)?
+                    .set_password(&value)
+                    .map_err(|e| Error::KeychainUnavailable(format!("keychain store: {e}")))
+            })
+        }
+
+        fn load_token(&self, account: &str) -> Result<Option<String>> {
+            let account = account.to_string();
+            timed("load token", move || match entry(&account)?.get_password() {
+                Ok(text) => Ok(Some(text)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(Error::KeychainUnavailable(format!("keychain load: {e}"))),
+            })
+        }
+
+        fn delete_token(&self, account: &str) -> Result<()> {
+            let account = account.to_string();
+            timed("delete token", move || match entry(&account)?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(Error::KeychainUnavailable(format!("keychain delete: {e}"))),
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+impl TokenStore for OsKeychain {
+    fn store_token(&self, _account: &str, _value: &str) -> Result<()> {
+        Err(crate::Error::Refused("no keychain backend is built for this platform".into()))
+    }
+    fn load_token(&self, _account: &str) -> Result<Option<String>> {
+        Err(crate::Error::Refused("no keychain backend is built for this platform".into()))
+    }
+    fn delete_token(&self, _account: &str) -> Result<()> {
+        Err(crate::Error::Refused("no keychain backend is built for this platform".into()))
     }
 }
 
@@ -158,6 +200,27 @@ pub fn store_key(device: &str, key: &SyncKey) -> Result<()> {
 /// Remove `device`'s sync key from the OS keychain.
 pub fn delete_key(device: &str) -> Result<()> {
     OsKeychain.delete(device)
+}
+
+/// Provider OAuth tokens: same OS keychain service, different account names.
+pub trait TokenStore {
+    fn store_token(&self, account: &str, value: &str) -> Result<()>;
+    fn load_token(&self, account: &str) -> Result<Option<String>>;
+    fn delete_token(&self, account: &str) -> Result<()>;
+}
+
+impl TokenStore for MemoryStore {
+    fn store_token(&self, account: &str, value: &str) -> Result<()> {
+        self.0.lock().unwrap().insert(account.to_string(), value.to_string());
+        Ok(())
+    }
+    fn load_token(&self, account: &str) -> Result<Option<String>> {
+        Ok(self.0.lock().unwrap().get(account).cloned())
+    }
+    fn delete_token(&self, account: &str) -> Result<()> {
+        self.0.lock().unwrap().remove(account);
+        Ok(())
+    }
 }
 
 /// The device's key, generating and storing a fresh one when it has none.
