@@ -7,7 +7,9 @@ use crate::cloud::http::{HttpClient, SharedHttp};
 use crate::cloud::session::open_session;
 use crate::keychain::TokenStore;
 use crate::oauth::access_cache;
-use crate::oauth::config::{byok_oauth_path, install_byok_config, load_builtin_oauth, load_oauth_file, builtin_oauth_path, OAuthFile};
+use crate::oauth::config::{
+    builtin_oauth_dir, byok_oauth_path, install_byok_config, load_builtin_oauth, load_oauth_file, OAuthFile,
+};
 use crate::oauth::flow::{begin_sign_in, complete_sign_in, revoke_tokens, SignInOutcome};
 use crate::oauth::tokens::{delete_provider_token, load_provider_token, Provider};
 use crate::pipe::Pipe;
@@ -70,8 +72,8 @@ impl App {
             let path = byok_oauth_path(dir);
             Ok((load_oauth_file(&path)?, dir.clone()))
         } else {
-            let path = builtin_oauth_path();
-            Ok((load_builtin_oauth().or_else(|_| load_oauth_file(&path))?, path.parent().unwrap_or(Path::new(".")).to_path_buf()))
+            let dir = builtin_oauth_dir();
+            Ok((load_builtin_oauth().or_else(|_| load_oauth_file(&dir.join("oauth.json")))?, dir))
         }
     }
 

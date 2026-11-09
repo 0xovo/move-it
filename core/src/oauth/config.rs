@@ -66,14 +66,21 @@ pub fn bundled_oauth_dir() -> Option<PathBuf> {
     std::env::var_os("MOVEIT_BUNDLE_OAUTH_DIR").map(PathBuf::from)
 }
 
-pub fn builtin_oauth_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("MOVEIT_OAUTH_DIR") {
-        return PathBuf::from(dir).join("oauth.json");
+/// Directory holding built-in `oauth.json` and the Google client sidecar.
+pub fn builtin_oauth_dir() -> PathBuf {
+    if cfg!(any(debug_assertions, test)) {
+        if let Ok(dir) = std::env::var("MOVEIT_OAUTH_DIR") {
+            return PathBuf::from(dir);
+        }
     }
     if let Some(dir) = bundled_oauth_dir() {
-        return dir.join("oauth.json");
+        return dir;
     }
-    moveit_config_dir().join("oauth.json")
+    moveit_config_dir()
+}
+
+pub fn builtin_oauth_path() -> PathBuf {
+    builtin_oauth_dir().join("oauth.json")
 }
 
 fn validate_client_file_name(name: &str) -> Result<()> {
@@ -228,5 +235,17 @@ mod tests {
     fn validates_fixture_shape() {
         let file: OAuthFile = serde_json::from_str(FIXTURE).unwrap();
         validate(&file).unwrap();
+    }
+
+    #[test]
+    fn bundled_oauth_dir_wins_when_fixture_env_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        unsafe {
+            std::env::remove_var("MOVEIT_OAUTH_DIR");
+            std::env::set_var("MOVEIT_BUNDLE_OAUTH_DIR", &bundle);
+        }
+        assert_eq!(super::builtin_oauth_dir(), bundle);
     }
 }

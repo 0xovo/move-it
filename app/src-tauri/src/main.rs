@@ -183,6 +183,14 @@ async fn pipe_sign_in_begin(
     provider: String,
     byok: bool,
 ) -> Result<serde_json::Value, String> {
+    if state
+        .pending_sign_in
+        .lock()
+        .map_err(|_| "Could not start sign-in.".to_string())?
+        .is_some()
+    {
+        return Err("A sign-in is already in progress.".to_string());
+    }
     let (url, outcome, provider) = {
         let app = state.engine.try_lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
         let (url, outcome) = app
