@@ -2,7 +2,7 @@ import { countLabels, totals, reportLines } from './model.js';
 import { updateNoticeText, updatePrimaryLabel, shouldShowUpdateNotice, GITHUB_RELEASE } from './update.js';
 const $ = id => document.getElementById(id);
 const api = window.__TAURI__;
-let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview';
+let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview', signInWaiting = false, usingByokKeys = false;
 let pendingUpdate = null, dismissedUpdate = null, packageManaged = false, githubUrl = GITHUB_RELEASE;
 let local = false, excluded = [], routes = [], retryAction = null;
 const loaders = new Map();
@@ -39,19 +39,53 @@ async function home() {
   $('undo').disabled = !state.canUndo;
   $('device').textContent = startInfo?.otherDevice ? `${startInfo.device} · ${startInfo.otherDevice}` : startInfo?.device || '';
 }
+function pipeUseLabel(candidate) {
+  if (candidate.kind === 'group') return null;
+  if (candidate.cloud) {
+    if (candidate.kind === 'byok') return candidate.connected ? 'Use my keys' : 'Choose my app keys';
+    if (candidate.connected) return `Use ${candidate.label.replace(' (connected)', '')}`;
+    return `Sign in and use ${candidate.label.replace(/^Sign in with /, '')}`;
+  }
+  if (candidate.kind === 'git') return 'Use this git repo';
+  return 'Use this folder';
+}
 async function pipes(next = 'preview') {
-  afterPipe = next; selectedPipe = null; $('use-pipe').disabled = true; $('pipe-path').textContent = '';
+  afterPipe = next; selectedPipe = null; signInWaiting = false;
+  $('use-pipe').disabled = true; $('pipe-path').textContent = '';
+  $('pipe-disconnect').hidden = true;
   const candidates = await call('pipe_candidates'); const list = $('pipe-options'); list.replaceChildren();
   for (const candidate of candidates) {
-    const button = text('button', '', 'option'); button.type = 'button'; button.setAttribute('role', 'radio'); button.setAttribute('aria-checked', 'false');
-    const label = text('span', '', 'label'); label.append(text('b', candidate.label), text('small', candidate.path ? 'Found on this computer' : 'Choose a folder'));
+    if (candidate.kind === 'group') {
+      list.append(text('div', candidate.label, 'group-label'));
+      continue;
+    }
+    const button = text('button', '', candidate.cloud ? 'option' : 'option');
+    button.type = 'button'; button.setAttribute('role', 'radio'); button.setAttribute('aria-checked', 'false');
+    const hint = candidate.cloud
+      ? (candidate.connected ? 'Connected to Move It' : 'Sign in in your browser')
+      : (candidate.path ? 'Found on this computer' : 'Choose a folder');
+    const label = text('span', '', 'label'); label.append(text('b', candidate.label), text('small', hint));
     button.append(label, text('span', '', 'dot'));
     button.addEventListener('click', () => task(async () => {
-      const path = candidate.path || await call('pick_folder'); if (!path) return;
-      selectedPipe = { ...candidate, path };
-      for (const other of list.children) other.setAttribute('aria-checked', String(other === button));
-      $('pipe-path').textContent = path; $('use-pipe').disabled = false;
-    })); list.append(button);
+      if (candidate.kind === 'byok' && !candidate.path) {
+        const installed = await call('pipe_install_byok');
+        if (installed?.status === 'installed') usingByokKeys = true;
+        return pipes(next);
+      }
+      if (!candidate.cloud) usingByokKeys = false;
+      let path = candidate.path;
+      if (!path && !candidate.cloud) path = await call('pick_folder');
+      if (!path && !candidate.cloud) return;
+      selectedPipe = { ...candidate, path: path || null };
+      for (const other of list.querySelectorAll('[role="radio"]')) other.setAttribute('aria-checked', String(other === button));
+      $('pipe-path').textContent = path || '';
+      const action = pipeUseLabel(candidate);
+      const span = $('use-pipe').querySelector('span');
+      if (action && span) span.textContent = action;
+      $('use-pipe').disabled = false;
+      $('pipe-disconnect').hidden = !(candidate.cloud && candidate.connected);
+    }));
+    list.append(button);
   }
   show('pipe');
 }
@@ -189,10 +223,34 @@ on('start', home); on('home-link', home); on('about-home', home); on('about-link
 on('preview-button', () => preview(true)); on('pair-button', () => pairing()); on('undo', () => undo());
 on('use-pipe', async () => {
   if (!selectedPipe) return;
+  if (selectedPipe.cloud && ['google', 'dropbox'].includes(selectedPipe.kind)) {
+    const byok = usingByokKeys;
+    if (!selectedPipe.connected) {
+      signInWaiting = true;
+      notice('Finish signing in in your browser, then return here.');
+      await call('pipe_sign_in_begin', { provider: selectedPipe.kind, byok });
+      const finish = await call('pipe_sign_in_finish');
+      signInWaiting = false;
+      if (finish.status !== 'connected') { notice('Sign-in did not finish; try again.', true); return; }
+    }
+    await call('use_cloud_pipe', { provider: selectedPipe.kind, byok });
+    startInfo.pipeSet = true;
+    notice('');
+    if (afterPipe === 'pair' || afterPipe === 'enter-code') await pairing(afterPipe === 'enter-code'); else await preview(true);
+    return;
+  }
   const result = await call('use_pipe', { path: selectedPipe.path, expectedKind: selectedPipe.kind });
   if (selectedPipe.kind === 'git' && result.kind !== 'git') { notice('This folder is not a git clone. Choose an existing clone.', true); return; }
   startInfo.pipeSet = true;
   if (afterPipe === 'pair' || afterPipe === 'enter-code') await pairing(afterPipe === 'enter-code'); else await preview(true);
+});
+on('pipe-disconnect', async () => {
+  if (!selectedPipe?.cloud) return;
+  const provider = selectedPipe.kind === 'byok' ? 'google' : selectedPipe.kind;
+  if (!['google', 'dropbox'].includes(provider)) return;
+  await call('pipe_sign_out', { provider });
+  notice('Disconnected. You can sign in again at any time.');
+  await pipes(afterPipe);
 });
 on('have-code', () => pairing(true)); on('show-code', () => pairing());
 on('check-pair', async () => { startInfo = await call('welcome_start'); if (startInfo.otherDevice) { await preview(true); notice(`Paired with ${startInfo.otherDevice}.`); } else notice('Waiting for your other device to enter the code.'); });

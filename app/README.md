@@ -26,8 +26,9 @@ mutex, so logs and state survive navigation. A busy operation refuses another
 command, and closing the window waits while an engine operation is active.
 Browser-open checks run before moves and are also enforced by the engine.
 Undo never forces replacement of changed browser data without a confirmation.
-Cloud choices use existing local folders; there is no OAuth flow. Git uses an
-existing clone. The shell does not copy a browser profile merely to render a
+Cloud pipes can sign in with Google Drive or Dropbox (PKCE, loopback in the
+system browser, tokens in the OS keychain). Folder and git choices use local
+paths only. The shell does not copy a browser profile merely to render a
 screen.
 
 For an isolated debug smoke run, pass `--fixture-root <scratch-directory>` to

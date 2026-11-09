@@ -26,6 +26,11 @@ async function mock(page, paired = false) {
           case 'updater_context': return { packageManaged: false, githubUrl: 'https://github.com/0xovo/move-it/releases/latest' };
           case 'updater_check': return null;
           case 'engine_idle': return true;
+          case 'pipe_sign_in_begin': return { status: 'waiting', authorizeUrl: 'https://example.test/auth' };
+          case 'pipe_sign_in_finish': return { status: 'connected', provider: 'google' };
+          case 'use_cloud_pipe': return { kind: 'google', place: '/tmp/staging' };
+          case 'pipe_sign_out': return null;
+          case 'pipe_install_byok': return { status: 'installed' };
           default: throw new Error(`Unexpected command: ${name}`);
         }
       } }

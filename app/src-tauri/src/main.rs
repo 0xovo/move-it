@@ -3,6 +3,8 @@ mod pipes;
 mod updater;
 
 use moveit_core::api::{App, RouteChoice};
+use moveit_core::oauth::flow::{complete_sign_in, SignInOutcome};
+use pipes::CloudStatus;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,10 +13,17 @@ use tauri_plugin_dialog::DialogExt;
 
 type Reply = Result<serde_json::Value, String>;
 
+struct PendingSignIn {
+    outcome: SignInOutcome,
+    provider: String,
+    byok: bool,
+}
+
 // One engine instance retains its redacted log and configuration across commands.
 #[derive(Clone)]
 struct Desktop {
     engine: Arc<Mutex<App>>,
+    pending_sign_in: Arc<Mutex<Option<PendingSignIn>>>,
 }
 
 impl Desktop {
@@ -144,13 +153,112 @@ async fn pick_folder(handle: tauri::AppHandle) -> Result<Option<PathBuf>, String
     }).await.map_err(|_| "Could not open the folder picker.".to_string())?
 }
 #[tauri::command]
-async fn pipe_candidates(handle: tauri::AppHandle) -> Result<Vec<pipes::Candidate>, String> {
+async fn pipe_candidates(state: State<'_, Desktop>, handle: tauri::AppHandle) -> Result<Vec<pipes::Candidate>, String> {
     let home = handle.path().home_dir().map_err(|_| "Cannot find your home folder.".to_string())?;
+    let engine = state.engine.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
         let roaming = std::env::var_os("APPDATA").map(PathBuf::from);
-        pipes::candidates(&home, local.as_deref(), roaming.as_deref())
-    }).await.map_err(|_| "Could not check sync folders.".to_string())
+        let cloud = {
+            let app = engine.lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
+            let byok_installed = app
+                .cloud_status_paths()
+                .map(|p| p.byok_config.exists())
+                .unwrap_or(false);
+            CloudStatus {
+                google_connected: app.cloud_connected("google", false).unwrap_or(false),
+                dropbox_connected: app.cloud_connected("dropbox", false).unwrap_or(false),
+                byok_installed,
+            }
+        };
+        Ok(pipes::candidates(&home, local.as_deref(), roaming.as_deref(), cloud))
+    })
+    .await
+    .map_err(|_| "Could not check sync folders.".to_string())?
+}
+
+#[tauri::command]
+async fn pipe_sign_in_begin(
+    state: State<'_, Desktop>,
+    provider: String,
+    byok: bool,
+) -> Result<serde_json::Value, String> {
+    {
+        let mut pending = state.pending_sign_in.lock().map_err(|_| "Could not start sign-in.".to_string())?;
+        if pending.is_some() {
+            return Err("A sign-in is already in progress.".to_string());
+        }
+    }
+    let (url, outcome, provider) = {
+        let app = state.engine.lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
+        let (url, outcome) = app
+            .prepare_cloud_sign_in(&provider, byok)
+            .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
+        (url, outcome, provider)
+    };
+    *state.pending_sign_in.lock().map_err(|_| "Could not start sign-in.".to_string())? = Some(PendingSignIn {
+        outcome,
+        provider: provider.clone(),
+        byok,
+    });
+    tauri::async_runtime::spawn_blocking(move || open::that(&url)).await.ok();
+    Ok(serde_json::json!({ "status": "waiting" }))
+}
+
+#[tauri::command]
+async fn pipe_sign_in_finish(state: State<'_, Desktop>) -> Reply {
+    let pending = state
+        .pending_sign_in
+        .lock()
+        .map_err(|_| "Could not finish sign-in.".to_string())?
+        .take()
+        .ok_or_else(|| "No sign-in is in progress.".to_string())?;
+    let engine = state.engine.clone();
+    let (provider, byok, outcome) = (pending.provider, pending.byok, pending.outcome);
+    let clones = {
+        let app = engine.lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
+        app.cloud_sign_in_clones(&provider, byok).map_err(|e| e.to_string())?
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let (p, oauth, dir, store, http) = clones;
+        complete_sign_in(store.as_ref(), p, byok, &oauth, &dir, http.as_ref(), outcome)
+            .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))
+    })
+    .await
+    .map_err(|_| "Sign-in did not finish.".to_string())??;
+    Ok(serde_json::json!({ "status": "connected", "provider": provider }))
+}
+
+#[tauri::command]
+async fn pipe_sign_out(state: State<'_, Desktop>, provider: String) -> Reply {
+    run(state.inner().clone(), move |app| json(app.pipe_sign_out(&provider))).await
+}
+
+#[tauri::command]
+async fn use_cloud_pipe(state: State<'_, Desktop>, provider: String, byok: bool) -> Reply {
+    run(state.inner().clone(), move |app| json(app.use_cloud_pipe(&provider, byok))).await
+}
+
+#[tauri::command]
+async fn pipe_install_byok(state: State<'_, Desktop>, handle: tauri::AppHandle) -> Reply {
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .dialog()
+            .file()
+            .add_filter("JSON", &["json"])
+            .blocking_pick_file()
+    })
+    .await
+    .map_err(|_| "Could not open the file picker.".to_string())??;
+    let Some(file) = picked else {
+        return Ok(serde_json::json!({ "status": "cancelled" }));
+    };
+    let path = file.into_path().map_err(|_| "Choose a local file.".to_string())?;
+    run(state.inner().clone(), move |app| {
+        app.install_byok(&path).map_err(|e| e.to_string())?;
+        json(Ok(serde_json::json!({ "status": "installed" })))
+    })
+    .await
 }
 
 fn main() {
@@ -172,13 +280,23 @@ fn main() {
                 }
             }
             let state_dir = match &fixture { Some(root) => root.join("state"), None => handle.path().app_data_dir()? };
-            let mut engine = App::open(&state_dir)?;
+            let config_dir = match &fixture {
+                Some(root) => root.join("config"),
+                None => handle.path().app_config_dir()?,
+            };
+            let mut engine = App::open(&state_dir)?.with_app_config_dir(config_dir);
             if let Some(root) = fixture {
                 std::fs::create_dir_all(root.join("browsers"))?;
-                engine = engine.with_browser_base(&root.join("browsers"))
-                    .with_key_store(Arc::new(moveit_core::keychain::MemoryStore::default()));
+                let mem = Arc::new(moveit_core::keychain::MemoryStore::default());
+                engine = engine
+                    .with_browser_base(&root.join("browsers"))
+                    .with_key_store(mem.clone())
+                    .with_token_store(mem);
             }
-            handle.manage(Desktop { engine: Arc::new(Mutex::new(engine)) });
+            handle.manage(Desktop {
+                engine: Arc::new(Mutex::new(engine)),
+                pending_sign_in: Arc::new(Mutex::new(None)),
+            });
             updater::spawn_checker(app.handle().clone());
             Ok(())
         })
@@ -190,7 +308,8 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![welcome_start, home_state, browser_open_check,
-            pair_show_code, pair_enter_code, use_pipe, pipe_candidates, pick_folder,
+            pair_show_code, pair_enter_code, use_pipe, use_cloud_pipe, pipe_candidates, pick_folder,
+            pipe_sign_in_begin, pipe_sign_in_finish, pipe_sign_out, pipe_install_byok,
             preview_counts, move_start, undo_last, local_browsers, local_preview,
             local_open_check, local_move, logs_recent, export_logs, engine_idle,
             updater::updater_context, updater::updater_check, updater_install,
