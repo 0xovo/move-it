@@ -26,9 +26,40 @@ mutex, so logs and state survive navigation. A busy operation refuses another
 command, and closing the window waits while an engine operation is active.
 Browser-open checks run before moves and are also enforced by the engine.
 Undo never forces replacement of changed browser data without a confirmation.
-Cloud choices use existing local folders; there is no OAuth flow. Git uses an
-existing clone. The shell does not copy a browser profile merely to render a
+Cloud pipes can sign in with Google Drive or Dropbox (PKCE, loopback in the
+system browser, tokens in the OS keychain). Folder and git choices use local
+paths only. The shell does not copy a browser profile merely to render a
 screen.
+
+### Release OAuth bundle
+
+Release builds read provider client config from the Tauri bundle resource
+`oauth/` (written in CI from repository secrets, never committed). Dev builds
+fall back to `~/.config/moveit/oauth.json` and `google-client.json` (or
+`MOVEIT_OAUTH_DIR` in tests).
+
+Example shape (dummy values only):
+
+```json
+{
+  "dropbox": {
+    "app_key": "your-dropbox-app-key",
+    "flow": "pkce",
+    "scopes": ["files.metadata.read", "files.content.read", "files.content.write"],
+    "access": "app_folder"
+  },
+  "google": {
+    "client_id": "your-google-client-id.apps.googleusercontent.com",
+    "client_file": "google-client.json",
+    "flow": "pkce",
+    "scopes": ["https://www.googleapis.com/auth/drive.file"]
+  }
+}
+```
+
+`google-client.json` uses the standard Google installed-app JSON form with a
+`client_secret` field (not confidential for desktop clients, but still shipped
+only in the bundle or the user config dir).
 
 For an isolated debug smoke run, pass `--fixture-root <scratch-directory>` to
 the debug binary. Both browser discovery and app state stay beneath that root,

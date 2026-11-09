@@ -2,7 +2,7 @@ import { countLabels, totals, reportLines } from './model.js';
 import { updateNoticeText, updatePrimaryLabel, shouldShowUpdateNotice, GITHUB_RELEASE } from './update.js';
 const $ = id => document.getElementById(id);
 const api = window.__TAURI__;
-let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview';
+let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview', signInWaiting = false, signInAbort = false, signInNavAfterCancel = null, usingByokKeys = false;
 let pendingUpdate = null, dismissedUpdate = null, packageManaged = false, githubUrl = GITHUB_RELEASE;
 let local = false, excluded = [], routes = [], retryAction = null;
 const loaders = new Map();
@@ -39,19 +39,107 @@ async function home() {
   $('undo').disabled = !state.canUndo;
   $('device').textContent = startInfo?.otherDevice ? `${startInfo.device} · ${startInfo.otherDevice}` : startInfo?.device || '';
 }
+function pipeUseLabel(candidate) {
+  if (candidate.kind === 'group') return null;
+  if (candidate.cloud) {
+    if (candidate.kind === 'byok') return candidate.connected ? 'Use my keys' : 'Choose my app keys';
+    if (candidate.connected) return `Use ${candidate.label.replace(' (connected)', '')}`;
+    return `Sign in and use ${candidate.label.replace(/^Sign in with /, '')}`;
+  }
+  if (candidate.kind === 'git') return 'Use this git repo';
+  return 'Use this folder';
+}
+function setSignInUi(waiting) {
+  signInWaiting = waiting;
+  $('pipe-sign-in-cancel').hidden = !waiting;
+  if (waiting) $('use-pipe').disabled = true;
+  refreshUpdateNotice();
+}
+
+async function cancelActiveSignIn(afterCancel = null) {
+  if (!signInWaiting) return;
+  signInAbort = true;
+  if (afterCancel) signInNavAfterCancel = afterCancel;
+  await call('pipe_sign_in_cancel');
+}
+
+async function finishSignInCancelUi(finish, byok) {
+  const nav = signInNavAfterCancel;
+  signInNavAfterCancel = null;
+  setSignInUi(false);
+  if (signInAbort && finish?.status === 'connected') {
+    busy = true;
+    document.querySelector('main').setAttribute('aria-busy', 'true');
+  }
+  try {
+    if (signInAbort && finish?.status === 'connected') {
+      try {
+        await call('pipe_sign_in_discard', { provider: selectedPipe.kind, byok, attempt: finish.attempt });
+      } catch (error) {
+        notice(String(error), true);
+        if (nav) await nav();
+        else await pipes(afterPipe);
+        return;
+      }
+    }
+    if (nav) {
+      await nav();
+      return;
+    }
+    await pipes(afterPipe);
+    notice('Sign-in was cancelled.', true);
+  } finally {
+    if (signInAbort && finish?.status === 'connected') {
+      busy = false;
+      document.querySelector('main').setAttribute('aria-busy', 'false');
+      refreshUpdateNotice();
+    }
+  }
+}
+
 async function pipes(next = 'preview') {
-  afterPipe = next; selectedPipe = null; $('use-pipe').disabled = true; $('pipe-path').textContent = '';
+  afterPipe = next; selectedPipe = null; signInWaiting = false; signInAbort = false;
+  $('pipe-sign-in-cancel').hidden = true;
+  $('use-pipe').disabled = true; $('pipe-path').textContent = '';
+  $('pipe-disconnect').hidden = true;
   const candidates = await call('pipe_candidates'); const list = $('pipe-options'); list.replaceChildren();
   for (const candidate of candidates) {
-    const button = text('button', '', 'option'); button.type = 'button'; button.setAttribute('role', 'radio'); button.setAttribute('aria-checked', 'false');
-    const label = text('span', '', 'label'); label.append(text('b', candidate.label), text('small', candidate.path ? 'Found on this computer' : 'Choose a folder'));
+    if (candidate.kind === 'group') {
+      list.append(text('div', candidate.label, 'group-label'));
+      continue;
+    }
+    const button = text('button', '', candidate.cloud ? 'option' : 'option');
+    button.type = 'button'; button.setAttribute('role', 'radio'); button.setAttribute('aria-checked', 'false');
+    const hint = candidate.cloud
+      ? (candidate.connected ? 'Connected to Move It' : 'Sign in in your browser')
+      : (candidate.path ? 'Found on this computer' : 'Choose a folder');
+    const label = text('span', '', 'label'); label.append(text('b', candidate.label), text('small', hint));
     button.append(label, text('span', '', 'dot'));
     button.addEventListener('click', () => task(async () => {
-      const path = candidate.path || await call('pick_folder'); if (!path) return;
-      selectedPipe = { ...candidate, path };
-      for (const other of list.children) other.setAttribute('aria-checked', String(other === button));
-      $('pipe-path').textContent = path; $('use-pipe').disabled = false;
-    })); list.append(button);
+      if (signInWaiting) return;
+      if (candidate.kind === 'byok' && !candidate.path) {
+        const installed = await call('pipe_install_byok');
+        if (installed?.status === 'installed') usingByokKeys = true;
+        return pipes(next);
+      }
+      if (candidate.cloud) {
+        if (candidate.byok != null) usingByokKeys = candidate.byok;
+      } else {
+        usingByokKeys = false;
+      }
+      let path = candidate.path;
+      if (!path && !candidate.cloud) path = await call('pick_folder');
+      if (!path && !candidate.cloud) return;
+      selectedPipe = { ...candidate, path: path || null };
+      for (const other of list.querySelectorAll('[role="radio"]')) other.setAttribute('aria-checked', String(other === button));
+      $('pipe-path').textContent = path || '';
+      const action = pipeUseLabel(candidate);
+      const span = $('use-pipe').querySelector('span');
+      if (action && span) span.textContent = action;
+      $('use-pipe').disabled = false;
+      $('pipe-disconnect').hidden = !(candidate.cloud && candidate.connected);
+    }));
+    list.append(button);
   }
   show('pipe');
 }
@@ -185,14 +273,76 @@ async function undo(force = false) {
 }
 async function logs() { const lines = await call('logs_recent'); $('log-lines').replaceChildren(...lines.slice().reverse().map(line => text('p', `${new Date(line.at_unix * 1000).toLocaleString()} · ${line.level}: ${line.message}`))); if (!lines.length) $('log-lines').append(text('p', 'No activity in this session yet.')); show('logs'); }
 
-on('start', home); on('home-link', home); on('about-home', home); on('about-link', async () => show('about'));
+on('start', home); on('about-home', home); on('about-link', async () => show('about'));
+$('home-link').addEventListener('click', () => { if (signInWaiting) { void cancelActiveSignIn(() => task(home)); return; } task(home); });
 on('preview-button', () => preview(true)); on('pair-button', () => pairing()); on('undo', () => undo());
-on('use-pipe', async () => {
-  if (!selectedPipe) return;
-  const result = await call('use_pipe', { path: selectedPipe.path, expectedKind: selectedPipe.kind });
-  if (selectedPipe.kind === 'git' && result.kind !== 'git') { notice('This folder is not a git clone. Choose an existing clone.', true); return; }
-  startInfo.pipeSet = true;
-  if (afterPipe === 'pair' || afterPipe === 'enter-code') await pairing(afterPipe === 'enter-code'); else await preview(true);
+async function usePipe() {
+  if (busy || signInWaiting || !selectedPipe) return;
+  if (selectedPipe.cloud && ['google', 'dropbox'].includes(selectedPipe.kind)) {
+    const byok = usingByokKeys;
+    if (!selectedPipe.connected) {
+      signInAbort = false;
+      setSignInUi(true);
+      notice('Finish signing in in your browser, then return here.');
+      try {
+        await call('pipe_sign_in_begin', { provider: selectedPipe.kind, byok });
+        const finish = await call('pipe_sign_in_finish');
+        if (signInAbort || finish?.status !== 'connected') {
+          await finishSignInCancelUi(finish, byok);
+          return;
+        }
+        setSignInUi(false);
+      } catch (error) {
+        setSignInUi(false);
+        const nav = signInNavAfterCancel;
+        signInNavAfterCancel = null;
+        if (nav) { await nav(); return; }
+        if (signInAbort) notice('Sign-in was cancelled.', true);
+        else notice(String(error), true);
+        await pipes(afterPipe);
+        return;
+      }
+    }
+    busy = true;
+    document.querySelector('main').setAttribute('aria-busy', 'true');
+    try {
+      await call('use_cloud_pipe', { provider: selectedPipe.kind, byok });
+      startInfo.pipeSet = true;
+      notice('');
+      if (afterPipe === 'pair' || afterPipe === 'enter-code') await pairing(afterPipe === 'enter-code'); else await preview(true);
+    } catch (error) {
+      notice(String(error), true);
+    } finally {
+      busy = false;
+      document.querySelector('main').setAttribute('aria-busy', 'false');
+      refreshUpdateNotice();
+    }
+    return;
+  }
+  busy = true;
+  document.querySelector('main').setAttribute('aria-busy', 'true');
+  try {
+    const result = await call('use_pipe', { path: selectedPipe.path, expectedKind: selectedPipe.kind });
+    if (selectedPipe.kind === 'git' && result.kind !== 'git') { notice('This folder is not a git clone. Choose an existing clone.', true); return; }
+    startInfo.pipeSet = true;
+    if (afterPipe === 'pair' || afterPipe === 'enter-code') await pairing(afterPipe === 'enter-code'); else await preview(true);
+  } catch (error) {
+    notice(String(error), true);
+  } finally {
+    busy = false;
+    document.querySelector('main').setAttribute('aria-busy', 'false');
+    refreshUpdateNotice();
+  }
+}
+$('use-pipe').addEventListener('click', () => void usePipe());
+$('pipe-sign-in-cancel').addEventListener('click', () => void cancelActiveSignIn());
+on('pipe-disconnect', async () => {
+  if (!selectedPipe?.cloud) return;
+  const provider = selectedPipe.kind === 'byok' ? 'google' : selectedPipe.kind;
+  if (!['google', 'dropbox'].includes(provider)) return;
+  await call('pipe_sign_out', { provider });
+  notice('Disconnected. You can sign in again at any time.');
+  await pipes(afterPipe);
 });
 on('have-code', () => pairing(true)); on('show-code', () => pairing());
 on('check-pair', async () => { startInfo = await call('welcome_start'); if (startInfo.otherDevice) { await preview(true); notice(`Paired with ${startInfo.otherDevice}.`); } else notice('Waiting for your other device to enter the code.'); });
@@ -211,7 +361,16 @@ on('update-now', async () => {
   await call('updater_install');
   notice('Installing update. Move It will restart when ready.');
 });
-for (const button of document.querySelectorAll('[data-nav]')) button.addEventListener('click', () => task(() => ({ local: localPick, logs, pipe: pipes })[button.dataset.nav]()));
+for (const button of document.querySelectorAll('[data-nav]')) {
+  button.addEventListener('click', () => {
+    if (signInWaiting) {
+      const dest = button.dataset.nav;
+      void cancelActiveSignIn(() => task(() => ({ local: localPick, logs, pipe: pipes })[dest]()));
+      return;
+    }
+    task(() => ({ local: localPick, logs, pipe: pipes })[button.dataset.nav]());
+  });
+}
 
 const UPDATE_CHECK_MS = 8_000;
 

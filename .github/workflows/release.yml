@@ -106,6 +106,19 @@ jobs:
       - run: npm test
         working-directory: app
       - run: cargo test --workspace --locked
+      - name: Write bundled OAuth config
+        shell: bash
+        env:
+          MOVEIT_OAUTH_JSON: ${{ secrets.MOVEIT_OAUTH_JSON }}
+          MOVEIT_GOOGLE_CLIENT_JSON: ${{ secrets.MOVEIT_GOOGLE_CLIENT_JSON }}
+        run: |
+          if [ -z "$MOVEIT_OAUTH_JSON" ] || [ -z "$MOVEIT_GOOGLE_CLIENT_JSON" ]; then
+            echo "MOVEIT_OAUTH_JSON and MOVEIT_GOOGLE_CLIENT_JSON must be set for release builds"
+            exit 1
+          fi
+          mkdir -p app/src-tauri/oauth
+          printf '%s' "$MOVEIT_OAUTH_JSON" > app/src-tauri/oauth/oauth.json
+          printf '%s' "$MOVEIT_GOOGLE_CLIENT_JSON" > app/src-tauri/oauth/google-client.json
       # tauri-action 0.5.23, MIT, released 2025-08-25.
       - uses: tauri-apps/tauri-action@e834788a94591d81e3ae0bd9ec06366f5afb8994
         env:

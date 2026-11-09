@@ -32,8 +32,8 @@
     <h1 class="title at-top">Where should Move It keep your sealed box?</h1><p class="sub">Choose a folder already shared between your devices.</p>
     <div class="options" id="pipe-options" role="radiogroup" aria-label="Shared folder"></div>
     <p class="hint" id="pipe-path"></p><div class="spacer"></div>
-    <div class="actions"><button class="btn btn-primary" id="use-pipe" disabled>Use this folder</button></div>
-    <p class="note">For cloud folders, use your provider’s desktop app. For git, choose an existing clone.</p>
+    <div class="actions"><button class="btn btn-primary" id="use-pipe" disabled><span>Use this folder</span></button><button class="btn btn-quiet" type="button" id="pipe-sign-in-cancel" hidden>Cancel sign-in</button><button class="btn btn-quiet" type="button" id="pipe-disconnect" hidden>Disconnect</button></div>
+    <p class="note">Sign in with Google Drive or Dropbox to move your sealed box through the provider API. You can also use a folder or git repo on this device. Bring your own OAuth app keys under Advanced if you prefer.</p>
   </section>
   <section id="pair" class="state" hidden>
     <h1 class="title at-top">Bring your devices together</h1><p class="sub">Use the same shared folder on both devices.</p>
