@@ -39,4 +39,10 @@ impl AccessCache {
             g.remove(&(provider, true));
         }
     }
+
+    pub fn clear_variant(&self, provider: Provider, byok: bool) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.remove(&(provider, byok));
+        }
+    }
 }

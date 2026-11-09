@@ -2,7 +2,7 @@ import { countLabels, totals, reportLines } from './model.js';
 import { updateNoticeText, updatePrimaryLabel, shouldShowUpdateNotice, GITHUB_RELEASE } from './update.js';
 const $ = id => document.getElementById(id);
 const api = window.__TAURI__;
-let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview', signInWaiting = false, signInAbort = false, usingByokKeys = false;
+let busy = false, startInfo = null, selectedPipe = null, afterPipe = 'preview', signInWaiting = false, signInAbort = false, signInNavAfterCancel = null, usingByokKeys = false;
 let pendingUpdate = null, dismissedUpdate = null, packageManaged = false, githubUrl = GITHUB_RELEASE;
 let local = false, excluded = [], routes = [], retryAction = null;
 const loaders = new Map();
@@ -56,10 +56,45 @@ function setSignInUi(waiting) {
   refreshUpdateNotice();
 }
 
-async function cancelActiveSignIn() {
+async function cancelActiveSignIn(afterCancel = null) {
   if (!signInWaiting) return;
   signInAbort = true;
+  if (afterCancel) signInNavAfterCancel = afterCancel;
   await call('pipe_sign_in_cancel');
+}
+
+async function finishSignInCancelUi(finish, byok) {
+  const nav = signInNavAfterCancel;
+  signInNavAfterCancel = null;
+  setSignInUi(false);
+  if (signInAbort && finish?.status === 'connected') {
+    busy = true;
+    document.querySelector('main').setAttribute('aria-busy', 'true');
+  }
+  try {
+    if (signInAbort && finish?.status === 'connected') {
+      try {
+        await call('pipe_sign_in_discard', { provider: selectedPipe.kind, byok, attempt: finish.attempt });
+      } catch (error) {
+        notice(String(error), true);
+        if (nav) await nav();
+        else await pipes(afterPipe);
+        return;
+      }
+    }
+    if (nav) {
+      await nav();
+      return;
+    }
+    await pipes(afterPipe);
+    notice('Sign-in was cancelled.', true);
+  } finally {
+    if (signInAbort && finish?.status === 'connected') {
+      busy = false;
+      document.querySelector('main').setAttribute('aria-busy', 'false');
+      refreshUpdateNotice();
+    }
+  }
 }
 
 async function pipes(next = 'preview') {
@@ -239,7 +274,7 @@ async function undo(force = false) {
 async function logs() { const lines = await call('logs_recent'); $('log-lines').replaceChildren(...lines.slice().reverse().map(line => text('p', `${new Date(line.at_unix * 1000).toLocaleString()} · ${line.level}: ${line.message}`))); if (!lines.length) $('log-lines').append(text('p', 'No activity in this session yet.')); show('logs'); }
 
 on('start', home); on('about-home', home); on('about-link', async () => show('about'));
-$('home-link').addEventListener('click', () => { if (signInWaiting) { void cancelActiveSignIn(); return; } task(home); });
+$('home-link').addEventListener('click', () => { if (signInWaiting) { void cancelActiveSignIn(() => task(home)); return; } task(home); });
 on('preview-button', () => preview(true)); on('pair-button', () => pairing()); on('undo', () => undo());
 async function usePipe() {
   if (busy || signInWaiting || !selectedPipe) return;
@@ -252,17 +287,16 @@ async function usePipe() {
       try {
         await call('pipe_sign_in_begin', { provider: selectedPipe.kind, byok });
         const finish = await call('pipe_sign_in_finish');
-        setSignInUi(false);
         if (signInAbort || finish?.status !== 'connected') {
-          if (signInAbort && finish?.status === 'connected') {
-            await call('pipe_sign_out', { provider: selectedPipe.kind });
-          }
-          notice('Sign-in was cancelled.', true);
-          await pipes(afterPipe);
+          await finishSignInCancelUi(finish, byok);
           return;
         }
+        setSignInUi(false);
       } catch (error) {
         setSignInUi(false);
+        const nav = signInNavAfterCancel;
+        signInNavAfterCancel = null;
+        if (nav) { await nav(); return; }
         if (signInAbort) notice('Sign-in was cancelled.', true);
         else notice(String(error), true);
         await pipes(afterPipe);
@@ -329,7 +363,11 @@ on('update-now', async () => {
 });
 for (const button of document.querySelectorAll('[data-nav]')) {
   button.addEventListener('click', () => {
-    if (signInWaiting) { void cancelActiveSignIn(); return; }
+    if (signInWaiting) {
+      const dest = button.dataset.nav;
+      void cancelActiveSignIn(() => task(() => ({ local: localPick, logs, pipe: pipes })[dest]()));
+      return;
+    }
     task(() => ({ local: localPick, logs, pipe: pipes })[button.dataset.nav]());
   });
 }

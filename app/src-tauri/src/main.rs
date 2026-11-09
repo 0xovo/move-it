@@ -31,6 +31,8 @@ struct Desktop {
     sign_in_cancel: Arc<AtomicBool>,
     sign_in_loopback: Arc<Mutex<Option<String>>>,
     sign_in_attempt: Arc<AtomicU64>,
+    sign_in_finishing: Arc<AtomicBool>,
+    sign_in_last_finish_attempt: Arc<AtomicU64>,
 }
 
 fn poke_loopback(redirect_uri: &str) {
@@ -201,11 +203,9 @@ async fn pipe_sign_in_begin(
     provider: String,
     byok: bool,
 ) -> Result<serde_json::Value, String> {
-    state.sign_in_cancel.store(false, Ordering::Release);
-    let attempt = state
-        .sign_in_attempt
-        .fetch_add(1, Ordering::AcqRel)
-        .wrapping_add(1);
+    if state.sign_in_finishing.load(Ordering::Acquire) {
+        return Err("Sign-in is still finishing. Please wait.".to_string());
+    }
     if state
         .pending_sign_in
         .lock()
@@ -214,6 +214,11 @@ async fn pipe_sign_in_begin(
     {
         return Err("A sign-in is already in progress.".to_string());
     }
+    state.sign_in_cancel.store(false, Ordering::Release);
+    let attempt = state
+        .sign_in_attempt
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     let (url, outcome, provider) = {
         let app = state.engine.try_lock().map_err(|_| "Move It is busy. Please wait for it to finish.".to_string())?;
         let (url, outcome) = app
@@ -230,7 +235,7 @@ async fn pipe_sign_in_begin(
         attempt,
     });
     tauri::async_runtime::spawn_blocking(move || open::that(&url)).await.ok();
-    Ok(serde_json::json!({ "status": "waiting" }))
+    Ok(serde_json::json!({ "status": "waiting", "attempt": attempt }))
 }
 
 #[tauri::command]
@@ -244,28 +249,44 @@ async fn pipe_sign_in_finish(state: State<'_, Desktop>) -> Reply {
     let engine = state.engine.clone();
     let cancel = state.sign_in_cancel.clone();
     let loopback_slot = state.sign_in_loopback.clone();
+    let last_finish = state.sign_in_last_finish_attempt.clone();
+    let finishing = state.sign_in_finishing.clone();
+    finishing.store(true, Ordering::Release);
     let (provider, byok, outcome, attempt) = (pending.provider, pending.byok, pending.outcome, pending.attempt);
     let provider_for_finish = provider.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let waited = App::wait_cloud_sign_in_code(outcome, SIGN_IN_TIMEOUT, Some(&cancel))
             .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
         if cancel.load(Ordering::Acquire) {
-            return Err("sign-in was cancelled".into());
+            return Err::<(), String>("sign-in was cancelled".into());
         }
         let (redirect_uri, verifier, code) = waited;
-        let app = engine
+        let mut app = engine
             .lock()
             .map_err(|_| "Could not finish sign-in.".to_string())?;
+        if cancel.load(Ordering::Acquire) {
+            return Err("sign-in was cancelled".into());
+        }
         app.finish_cloud_sign_in_after_code(&provider_for_finish, byok, &redirect_uri, &verifier, &code)
-            .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))
+            .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
+        if cancel.load(Ordering::Acquire) {
+            let p = provider_for_finish.clone();
+            app.pipe_sign_in_discard(&p, byok)
+                .map_err(|e| moveit_core::oauth::tokens::redact_token_err(&e.to_string()))?;
+            return Err("sign-in was cancelled".into());
+        }
+        Ok(())
     })
     .await
-    .map_err(|_| "Sign-in did not finish.".to_string())??;
+    .map_err(|_| "Sign-in did not finish.".to_string())?;
+    finishing.store(false, Ordering::Release);
+    result?;
+    last_finish.store(attempt, Ordering::Release);
     if state.sign_in_attempt.load(Ordering::Acquire) == attempt {
         *loopback_slot.lock().map_err(|_| "Could not finish sign-in.".to_string())? = None;
         state.sign_in_cancel.store(false, Ordering::Release);
     }
-    Ok(serde_json::json!({ "status": "connected", "provider": provider }))
+    Ok(serde_json::json!({ "status": "connected", "provider": provider, "attempt": attempt }))
 }
 
 #[tauri::command]
@@ -290,6 +311,27 @@ async fn pipe_sign_in_cancel(state: State<'_, Desktop>) -> Result<(), String> {
 async fn pipe_sign_out(state: State<'_, Desktop>, provider: String) -> Reply {
     run(state.inner().clone(), move |app| json(app.pipe_sign_out(&provider))).await
 }
+
+#[tauri::command]
+async fn pipe_sign_in_discard(
+    state: State<'_, Desktop>,
+    provider: String,
+    byok: bool,
+    attempt: u64,
+) -> Reply {
+    if state.sign_in_last_finish_attempt.load(Ordering::Acquire) != attempt {
+        return Err("That sign-in attempt is no longer active.".to_string());
+    }
+    let last_finish = state.sign_in_last_finish_attempt.clone();
+    run(state.inner().clone(), move |app| {
+        app.pipe_sign_in_discard(&provider, byok)
+            .map_err(|e| e.to_string())?;
+        last_finish.store(0, Ordering::Release);
+        json(Ok(serde_json::json!({ "status": "discarded" })))
+    })
+    .await
+}
+
 
 #[tauri::command]
 async fn use_cloud_pipe(state: State<'_, Desktop>, provider: String, byok: bool) -> Reply {
@@ -365,6 +407,8 @@ fn main() {
                 sign_in_cancel: Arc::new(AtomicBool::new(false)),
                 sign_in_loopback: Arc::new(Mutex::new(None)),
                 sign_in_attempt: Arc::new(AtomicU64::new(0)),
+                sign_in_finishing: Arc::new(AtomicBool::new(false)),
+                sign_in_last_finish_attempt: Arc::new(AtomicU64::new(0)),
             });
             updater::spawn_checker(app.handle().clone());
             Ok(())
@@ -378,7 +422,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![welcome_start, home_state, browser_open_check,
             pair_show_code, pair_enter_code, use_pipe, use_cloud_pipe, pipe_candidates, pick_folder,
-            pipe_sign_in_begin, pipe_sign_in_finish, pipe_sign_in_cancel, pipe_sign_out, pipe_install_byok,
+            pipe_sign_in_begin, pipe_sign_in_finish, pipe_sign_in_cancel, pipe_sign_in_discard, pipe_sign_out, pipe_install_byok,
             preview_counts, move_start, undo_last, local_browsers, local_preview,
             local_open_check, local_move, logs_recent, export_logs, engine_idle,
             updater::updater_context, updater::updater_check, updater_install,
@@ -420,6 +464,8 @@ mod sign_in_wait {
             sign_in_cancel: Arc::new(AtomicBool::new(false)),
             sign_in_loopback: Arc::new(Mutex::new(Some(start.redirect.redirect_uri.clone()))),
             sign_in_attempt: Arc::new(AtomicU64::new(1)),
+            sign_in_finishing: Arc::new(AtomicBool::new(false)),
+            sign_in_last_finish_attempt: Arc::new(AtomicU64::new(0)),
         };
         let cancel = desktop.sign_in_cancel.clone();
         let engine_arc = desktop.engine.clone();
@@ -490,6 +536,38 @@ mod sign_in_wait {
     }
 
     #[test]
+    fn finish_honours_cancel_after_engine_lock() {
+        let engine = Arc::new(Mutex::new(()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let engine_hold = engine.clone();
+        let cancel_set = cancel.clone();
+        let hold = std::thread::spawn(move || {
+            let _g = engine_hold.lock().unwrap();
+            std::thread::sleep(Duration::from_millis(120));
+            cancel_set.store(true, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(40));
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let cancelled = {
+            let _g = engine.lock().unwrap();
+            cancel.load(Ordering::Acquire)
+        };
+        hold.join().unwrap();
+        assert!(cancelled, "cancel must be visible once the engine lock is held");
+    }
+
+    #[test]
+    fn begin_blocked_while_finish_in_flight() {
+        let finishing = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(finishing.load(Ordering::Acquire));
+        assert!(cancel.load(Ordering::Acquire), "cancel must not be reset while finishing");
+        finishing.store(false, Ordering::Release);
+        cancel.store(false, Ordering::Release);
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn finish_clears_cancel_only_for_matching_attempt() {
         let attempt = Arc::new(AtomicU64::new(2));
         let cancel = Arc::new(AtomicBool::new(true));
@@ -521,6 +599,8 @@ mod install_gate {
             sign_in_cancel: Arc::new(AtomicBool::new(false)),
             sign_in_loopback: Arc::new(Mutex::new(None)),
             sign_in_attempt: Arc::new(AtomicU64::new(0)),
+            sign_in_finishing: Arc::new(AtomicBool::new(false)),
+            sign_in_last_finish_attempt: Arc::new(AtomicU64::new(0)),
         };
         let held = desktop.engine.try_lock().expect("engine starts free");
         assert!(!desktop.engine_idle());

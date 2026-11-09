@@ -184,6 +184,24 @@ impl App {
         })
     }
 
+    /// Drop the token for one provider variant after the user cancels a connected sign-in attempt.
+    pub fn pipe_sign_in_discard(&mut self, provider: &str, byok: bool) -> Result<()> {
+        let p = Provider::parse(provider)?;
+        if let Some(token) = load_provider_token(self.token_store.as_ref(), p, byok)? {
+            if let Ok(material) = self.revoke_material(p, byok, &token) {
+                let _ = revoke_tokens(p, self.http.as_ref(), &material);
+            }
+        }
+        let _ = delete_provider_token(self.token_store.as_ref(), p, byok);
+        self.access_cache.clear_variant(p, byok);
+        if let Ok(staging) = self.cloud_staging(p, byok) {
+            if staging.exists() {
+                let _ = std::fs::remove_dir_all(staging);
+            }
+        }
+        Ok(())
+    }
+
     pub fn pipe_sign_out(&mut self, provider: &str) -> Result<()> {
         let p = Provider::parse(provider)?;
         for byok in [false, true] {

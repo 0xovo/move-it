@@ -296,6 +296,24 @@ mod tests {
     }
 
     #[test]
+    fn sign_in_discard_keeps_other_token_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        fixture_oauth(tmp.path());
+        let http = Arc::new(MockHttp::default());
+        let store = Arc::new(MemoryStore::default());
+        sign_in_provider(tmp.path(), &store, &http, Provider::Dropbox, false);
+        http.clear_recorded();
+        sign_in_provider(tmp.path(), &store, &http, Provider::Dropbox, true);
+        assert!(load_provider_token(&*store, Provider::Dropbox, false).unwrap().is_some());
+        assert!(load_provider_token(&*store, Provider::Dropbox, true).unwrap().is_some());
+
+        let mut app = app_with(tmp.path(), tmp.path(), store.clone(), http);
+        app.pipe_sign_in_discard("dropbox", true).unwrap();
+        assert!(load_provider_token(&*store, Provider::Dropbox, false).unwrap().is_some());
+        assert!(load_provider_token(&*store, Provider::Dropbox, true).unwrap().is_none());
+    }
+
+    #[test]
     fn disconnect_stops_api_access() {
         let tmp = tempfile::tempdir().unwrap();
         fixture_oauth(tmp.path());
