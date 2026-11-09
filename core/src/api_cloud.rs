@@ -78,7 +78,7 @@ impl App {
             let oauth = if self.builtin_oauth_dir.is_some() {
                 load_oauth_file(&dir.join("oauth.json"))?
             } else {
-                load_builtin_oauth().or_else(|_| load_oauth_file(&dir.join("oauth.json")))?
+                load_builtin_oauth()?
             };
             Ok((oauth, dir))
         }
@@ -140,6 +140,9 @@ impl App {
     }
 
     pub fn use_cloud_pipe(&mut self, provider: &str, byok: bool) -> Result<PipeInfo> {
+        if !byok {
+            self.abandon_byok()?;
+        }
         let p = Provider::parse(provider)?;
         if load_provider_token(self.token_store.as_ref(), p, byok)?.is_none() {
             return Err(Error::Refused("sign in to this provider first".into()));

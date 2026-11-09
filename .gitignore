@@ -9,3 +9,5 @@ app/dist/
 app/src-tauri/gen/
 app/test-results/
 app/playwright-report/
+app/src-tauri/oauth/oauth.json
+app/src-tauri/oauth/google-client.json

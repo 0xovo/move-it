@@ -121,6 +121,11 @@ mod tests {
         pipe_a.publish("note").unwrap();
         let upload = http.recorded().into_iter().find(|r| r.url.contains("upload")).expect("upload");
         assert_eq!(upload.method, Method::Post);
+        let up_body = upload.body.as_ref().expect("multipart body");
+        assert!(
+            up_body.windows(sealed.len()).any(|w| w == sealed.as_slice()),
+            "create upload must carry box bytes"
+        );
 
         http.clear_recorded();
         http.push_ok_json(r#"{"files":[{"id":"fid1","name":"moveit-box.json","md5Checksum":"etag1"}]}"#);
@@ -141,6 +146,7 @@ mod tests {
         pipe_a2.publish("note").unwrap();
         let update = http.recorded().into_iter().find(|r| r.url.contains("uploadType=media")).expect("patch upload");
         assert_eq!(update.method, Method::Patch);
+        assert_eq!(update.body.as_deref(), Some(sealed.as_slice()), "media patch body");
     }
 
     #[test]
@@ -161,11 +167,63 @@ mod tests {
         http.push_ok_json(
             r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r1"}]}"#,
         );
-        let pipe_a = DropboxPipe::new(place_a, http.clone(), "tok".into()).unwrap();
+        let pipe_a = DropboxPipe::new(place_a.clone(), http.clone(), "tok".into()).unwrap();
         pipe_a.publish("note").unwrap();
+        let add_upload = http
+            .recorded()
+            .into_iter()
+            .find(|r| r.url.contains("/files/upload"))
+            .expect("dropbox upload");
+        assert_eq!(add_upload.body.as_deref(), Some(sealed.as_slice()));
+        let add_arg = add_upload
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Dropbox-API-Arg")
+            .map(|(_, v)| v.as_str())
+            .expect("upload arg");
+        assert!(add_arg.contains(r#""mode":"add""#), "{add_arg}");
 
+        http.clear_recorded();
+        crate::pipe::write_named_box(&place_a, BOX_FILE, &sealed).unwrap();
+        let mut index = RemoteIndex::default();
+        index.files.insert(
+            BOX_FILE.to_string(),
+            RemoteFile {
+                id: "id1".into(),
+                etag: None,
+                modified: None,
+                rev: Some("r1".into()),
+            },
+        );
+        crate::cloud::index::save_index(&place_a, &index).unwrap();
+        for _ in 0..3 {
+            http.push_ok_json(
+                r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r1"}]}"#,
+            );
+        }
+        http.push_ok_json(r#"{}"#);
         http.push_ok_json(
-            r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r1"}]}"#,
+            r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r2"}]}"#,
+        );
+        pipe_a.publish("note").unwrap();
+        let update_upload = http
+            .recorded()
+            .into_iter()
+            .find(|r| r.url.contains("/files/upload"))
+            .expect("dropbox update upload");
+        assert_eq!(update_upload.body.as_deref(), Some(sealed.as_slice()));
+        let update_arg = update_upload
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Dropbox-API-Arg")
+            .map(|(_, v)| v.as_str())
+            .expect("update arg");
+        assert!(update_arg.contains("update_rev"), "{update_arg}");
+        assert!(update_arg.contains("r1"), "{update_arg}");
+
+        http.clear_recorded();
+        http.push_ok_json(
+            r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r2"}]}"#,
         );
         http.push_bytes(200, sealed.clone());
         let pipe_b = DropboxPipe::new(place_b.clone(), http, "tok".into()).unwrap();
@@ -278,8 +336,8 @@ mod tests {
         let mut app = app_with(tmp.path(), &state, store.clone(), http.clone());
         queue_access_refresh(&http);
         app.use_cloud_pipe("google", false).unwrap();
-        assert!(state.join("config").join("oauth-byok.json").exists());
-        assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_some());
+        assert!(!state.join("config").join("oauth-byok.json").exists());
+        assert!(load_provider_token(&*store, Provider::Google, true).unwrap().is_none());
     }
 
     #[test]
@@ -410,5 +468,165 @@ mod tests {
         let mut app = app_with(tmp.path(), tmp.path(), store, http);
         let err = app.use_cloud_pipe("google", false).unwrap_err().to_string();
         assert!(err.contains("sign in again"), "{err}");
+    }
+
+    fn expect_http_fail(status: u16, err: crate::Error) {
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("({status})")) || msg.contains("request failed"),
+            "expected http {status} error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn google_pipe_http_errors_on_list_download_create_update_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let place = tmp.path().join("gd");
+        std::fs::create_dir_all(&place).unwrap();
+        crate::pipe::write_named_box(&place, BOX_FILE, b"payload").unwrap();
+        let http = Arc::new(MockHttp::default());
+        let pipe = GoogleDrivePipe::new(place.clone(), http.clone(), "tok".into()).unwrap();
+
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            http.push_status_body(status, r#"{"error":{"message":"nope"}}"#);
+            expect_http_fail(status, pipe.refresh().unwrap_err());
+            assert_eq!(std::fs::read(place.join(BOX_FILE)).unwrap(), b"payload");
+        }
+
+        http.clear_recorded();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..2 {
+                http.push_status_body(status, r#"{"error":{"message":"nope"}}"#);
+            }
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
+
+        http.clear_recorded();
+        http.push_ok_json(r#"{"files":[{"id":"id1","name":"moveit-box.json","md5Checksum":"e"}]}"#);
+        http.push_status_body(403, r#"{"error":{"message":"nope"}}"#);
+        expect_http_fail(403, pipe.refresh().unwrap_err());
+
+        http.clear_recorded();
+        let mut index = RemoteIndex::default();
+        index.files.insert(
+            BOX_FILE.to_string(),
+            RemoteFile {
+                id: "id1".into(),
+                etag: Some("e".into()),
+                modified: None,
+                rev: None,
+            },
+        );
+        crate::cloud::index::save_index(&place, &index).unwrap();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..3 {
+                http.push_ok_json(r#"{"files":[{"id":"id1","name":"moveit-box.json","md5Checksum":"e"}]}"#);
+            }
+            http.push_status_body(status, r#"{"error":{"message":"nope"}}"#);
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
+
+        http.clear_recorded();
+        index.files.insert(
+            OFFER_FILE.to_string(),
+            RemoteFile {
+                id: "orphan".into(),
+                etag: None,
+                modified: None,
+                rev: None,
+            },
+        );
+        crate::cloud::index::save_index(&place, &index).unwrap();
+        std::fs::remove_file(place.join(BOX_FILE)).unwrap();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..2 {
+                http.push_ok_json(
+                    r#"{"files":[{"id":"orphan","name":"moveit-pairing.json","md5Checksum":"p"}]}"#,
+                );
+            }
+            http.push_status_body(status, r#"{"error":{"message":"nope"}}"#);
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
+    }
+
+    #[test]
+    fn dropbox_pipe_http_errors_on_list_download_create_update_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let place = tmp.path().join("db");
+        std::fs::create_dir_all(&place).unwrap();
+        crate::pipe::write_named_box(&place, BOX_FILE, b"payload").unwrap();
+        let http = Arc::new(MockHttp::default());
+        let pipe = DropboxPipe::new(place.clone(), http.clone(), "tok".into()).unwrap();
+
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            http.push_status_body(status, r#"{"error_summary":"nope"}"#);
+            expect_http_fail(status, pipe.refresh().unwrap_err());
+            assert_eq!(std::fs::read(place.join(BOX_FILE)).unwrap(), b"payload");
+        }
+
+        http.clear_recorded();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..2 {
+                http.push_status_body(status, r#"{"error_summary":"nope"}"#);
+            }
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
+
+        http.clear_recorded();
+        http.push_ok_json(r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r1"}]}"#);
+        http.push_status_body(403, r#"{"error_summary":"nope"}"#);
+        expect_http_fail(403, pipe.refresh().unwrap_err());
+
+        http.clear_recorded();
+        let mut index = RemoteIndex::default();
+        index.files.insert(
+            BOX_FILE.to_string(),
+            RemoteFile {
+                id: "id1".into(),
+                etag: None,
+                modified: None,
+                rev: Some("r1".into()),
+            },
+        );
+        crate::cloud::index::save_index(&place, &index).unwrap();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..3 {
+                http.push_ok_json(
+                    r#"{"entries":[{".tag":"file","id":"id1","name":"moveit-box.json","rev":"r1"}]}"#,
+                );
+            }
+            http.push_status_body(status, r#"{"error_summary":"nope"}"#);
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
+
+        http.clear_recorded();
+        index.files.insert(
+            OFFER_FILE.to_string(),
+            RemoteFile {
+                id: "p1".into(),
+                etag: None,
+                modified: None,
+                rev: Some("r9".into()),
+            },
+        );
+        crate::cloud::index::save_index(&place, &index).unwrap();
+        std::fs::remove_file(place.join(BOX_FILE)).unwrap();
+        for status in [403u16, 404] {
+            http.clear_recorded();
+            for _ in 0..2 {
+                http.push_ok_json(
+                    r#"{"entries":[{".tag":"file","id":"p1","name":"moveit-pairing.json","rev":"r9"}]}"#,
+                );
+            }
+            http.push_status_body(status, r#"{"error_summary":"nope"}"#);
+            expect_http_fail(status, pipe.publish("n").unwrap_err());
+        }
     }
 }

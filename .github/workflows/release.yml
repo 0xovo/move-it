@@ -107,6 +107,7 @@ jobs:
         working-directory: app
       - run: cargo test --workspace --locked
       - name: Write bundled OAuth config
+        shell: bash
         env:
           MOVEIT_OAUTH_JSON: ${{ secrets.MOVEIT_OAUTH_JSON }}
           MOVEIT_GOOGLE_CLIENT_JSON: ${{ secrets.MOVEIT_GOOGLE_CLIENT_JSON }}

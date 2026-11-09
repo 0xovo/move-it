@@ -66,6 +66,28 @@ pub fn bundled_oauth_dir() -> Option<PathBuf> {
     std::env::var_os("MOVEIT_BUNDLE_OAUTH_DIR").map(PathBuf::from)
 }
 
+fn bundle_has_real_builtin_oauth(dir: &Path) -> bool {
+    match load_oauth_file(&dir.join("oauth.json")) {
+        Ok(file) => !is_placeholder_oauth(&file),
+        Err(_) => false,
+    }
+}
+
+/// Placeholder values shipped in example copies; must not be used for real sign-in.
+pub fn is_placeholder_oauth(file: &OAuthFile) -> bool {
+    if let Some(d) = &file.dropbox {
+        if d.app_key == "example-dropbox-key" {
+            return true;
+        }
+    }
+    if let Some(g) = &file.google {
+        if g.client_id.starts_with("example.") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Directory holding built-in `oauth.json` and the Google client sidecar.
 pub fn builtin_oauth_dir() -> PathBuf {
     if cfg!(any(debug_assertions, test)) {
@@ -74,7 +96,13 @@ pub fn builtin_oauth_dir() -> PathBuf {
         }
     }
     if let Some(dir) = bundled_oauth_dir() {
-        return dir;
+        if cfg!(any(debug_assertions, test)) {
+            if bundle_has_real_builtin_oauth(&dir) {
+                return dir;
+            }
+        } else {
+            return dir;
+        }
     }
     moveit_config_dir()
 }
@@ -110,7 +138,13 @@ pub fn load_oauth_file(path: &Path) -> Result<OAuthFile> {
 }
 
 pub fn load_builtin_oauth() -> Result<OAuthFile> {
-    load_oauth_file(&builtin_oauth_path())
+    let file = load_oauth_file(&builtin_oauth_path())?;
+    if is_placeholder_oauth(&file) && !cfg!(any(debug_assertions, test)) {
+        return Err(Error::Refused(
+            "provider sign-in is not configured on this build".into(),
+        ));
+    }
+    Ok(file)
 }
 
 fn validate(file: &OAuthFile) -> Result<()> {
@@ -242,10 +276,28 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("bundle");
         std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("oauth.json"), FIXTURE).unwrap();
         unsafe {
             std::env::remove_var("MOVEIT_OAUTH_DIR");
             std::env::set_var("MOVEIT_BUNDLE_OAUTH_DIR", &bundle);
         }
         assert_eq!(super::builtin_oauth_dir(), bundle);
+    }
+
+    #[test]
+    fn debug_skips_placeholder_bundle_for_user_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("oauth.json"),
+            br#"{"dropbox":{"app_key":"example-dropbox-key","flow":"pkce","scopes":["files.metadata.read"],"access":"app_folder"}}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("MOVEIT_OAUTH_DIR");
+            std::env::set_var("MOVEIT_BUNDLE_OAUTH_DIR", &bundle);
+        }
+        assert_ne!(super::builtin_oauth_dir(), bundle);
     }
 }

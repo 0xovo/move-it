@@ -58,6 +58,9 @@ fn read_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>>
 }
 
 pub fn map_http_status(status: u16, body: &[u8]) -> Result<()> {
+    if status < 400 {
+        return Ok(());
+    }
     if status == 409 {
         return Err(Error::Busy);
     }
@@ -74,7 +77,7 @@ pub fn map_http_status(status: u16, body: &[u8]) -> Result<()> {
             return Err(Error::Refused("sign-in expired; sign in again".into()));
         }
     }
-    Ok(())
+    Err(Error::Refused(format!("request failed ({status})")))
 }
 
 /// Blocking ureq client. License: MIT/Apache-2.0 (GPL-3.0-compatible).
@@ -184,6 +187,25 @@ impl MockHttp {
 
     pub fn clear_recorded(&self) {
         self.requests.lock().unwrap().clear();
+        self.responses.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+
+    #[test]
+    fn map_http_status_rejects_other_4xx() {
+        assert!(matches!(
+            map_http_status(403, b"{}"),
+            Err(Error::Refused(_))
+        ));
+        assert!(matches!(
+            map_http_status(404, b"{}"),
+            Err(Error::Refused(_))
+        ));
     }
 }
 
