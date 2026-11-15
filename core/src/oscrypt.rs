@@ -883,7 +883,9 @@ mod tests {
     fn v20_is_app_bound_on_every_platform() {
         assert!(encryption_is_app_bound(b"v20"));
         assert!(!encryption_is_app_bound(b"v11"));
-        assert!(!encryption_is_windows_app_bound(b"v20"));
+        // The windows classification is platform-designed: v20 is Windows
+        // App-Bound, so it classifies that way only when running on Windows.
+        assert_eq!(encryption_is_windows_app_bound(b"v20"), cfg!(windows));
     }
 
     #[test]
