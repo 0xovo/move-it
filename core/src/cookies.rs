@@ -67,6 +67,9 @@ impl Cookie {
 pub struct Stats {
     pub imported: usize,
     pub kept_newer: usize,
+    /// Existing target rows no available key could decrypt. They are left
+    /// byte-for-byte untouched and never block the move.
+    pub preserved_undecryptable: usize,
 }
 
 /// A locked database means the browser is still open: a friendly, recoverable state.
@@ -174,6 +177,11 @@ fn open(path: &Path) -> Result<Connection> {
 /// Rows locked to the browser itself (App-Bound) are left out: they cannot move, and the
 /// preview already names them as skipped, so one locked row must not fail the whole read.
 pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
+    export_counted(path, keys).map(|(cookies, _)| cookies)
+}
+
+/// Export movable cookies and count App-Bound (v20) rows left in the browser.
+pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Cookie>, usize)> {
     let (_scratch, copy) = crate::util::snapshot_db(path)?;
     let con = open(&copy)?;
     let mut st = con
@@ -203,18 +211,21 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
         })
         .map_err(sql)?;
     let mut out = Vec::new();
+    let mut skipped = 0;
     for row in rows {
         let (host, name, path, value, enc, exp, cre, acc, sec, http, ss, upd, tfs) = row.map_err(sql)?;
         let value = if enc.is_empty() {
             value
         } else if enc.starts_with(b"v20") {
-            // Locked to the browser itself (App-Bound): it stays behind, as the
-            // preview promises, instead of failing the whole read.
+            skipped += 1;
             continue;
         } else {
             match keys.lock().decrypt(&host, &enc) {
                 Ok(v) => v,
-                Err(Error::AppBound) => continue,
+                Err(Error::AppBound)
+                | Err(Error::WrongBrowserPassword)
+                | Err(Error::Corrupt(_))
+                | Err(Error::Refused(_)) => continue,
                 Err(e) => return Err(e),
             }
         };
@@ -233,7 +244,7 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
             top_frame_site_key: tfs,
         });
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// For Linux, sample the store's existing values to pick the write label before any row changes.
@@ -249,25 +260,90 @@ fn resolve_write_prefix(con: &Connection, keys: &Keys) -> Result<Option<LinuxPre
     Ok(Some(vote))
 }
 
-fn verify_write_key(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Result<()> {
+/// What the target store's existing rows say before anything is written:
+/// which of them no available key can decrypt, and whether a row carrying
+/// the write label proves our key against this store.
+struct TargetScan {
+    /// Rowids of undecryptable rows. They are preserved byte-for-byte; the
+    /// merge treats them like App-Bound rows (the existing row wins).
+    dead: std::collections::HashSet<i64>,
+    preserved_undecryptable: usize,
+    /// Rows whose encrypted value carries the write label.
+    label_rows: usize,
+    /// At least one label row decrypts with our key.
+    label_verified: bool,
+}
+
+fn scan_target(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Result<TargetScan> {
     let label: &[u8] = match prefix {
         Some(LinuxPrefix::V11) => b"v11",
         _ => b"v10",
     };
-    let sample: Option<(String, Vec<u8>)> = con.query_row(
-        "SELECT host_key, encrypted_value FROM cookies WHERE substr(encrypted_value,1,3)=?1 LIMIT 1",
-        [label], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).optional().map_err(sql)?;
-    if let Some((host, blob)) = sample {
-        keys.lock().decrypt(&host, &blob)?;
-    } else if prefix == Some(LinuxPrefix::V11) {
+    let mut st = con
+        .prepare("SELECT rowid, host_key, encrypted_value FROM cookies")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Vec<u8>>(2)?))
+        })
+        .map_err(sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql)?;
+    let mut scan = TargetScan {
+        dead: std::collections::HashSet::new(),
+        preserved_undecryptable: 0,
+        label_rows: 0,
+        label_verified: false,
+    };
+    for (rowid, host, enc) in &rows {
+        if enc.is_empty() || enc.starts_with(b"v20") {
+            continue;
+        }
+        if enc.starts_with(label) {
+            scan.label_rows += 1;
+        }
+        match keys.lock().decrypt(host, enc) {
+            Ok(_) => {
+                if enc.starts_with(label) {
+                    scan.label_verified = true;
+                }
+            }
+            Err(Error::AppBound) => {}
+            Err(Error::WrongBrowserPassword) | Err(Error::Corrupt(_)) | Err(Error::Refused(_)) => {
+                scan.dead.insert(*rowid);
+                scan.preserved_undecryptable += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(scan)
+}
+
+fn verify_write_key(keys: &Keys, prefix: Option<LinuxPrefix>, scan: &TargetScan) -> Result<()> {
+    if scan.label_verified {
+        return Ok(());
+    }
+    if scan.label_rows == 0 {
         // No row to check against: an empty store is the fresh-browser case.
         // Trust the key only when it came from this browser's unlocked v2
         // keyring item; a fallback key must never seed v11 rows.
-        let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
-        if !trusted {
-            return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
+        if prefix == Some(LinuxPrefix::V11) {
+            let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
+            if !trusted {
+                return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
+            }
         }
+        return Ok(());
+    }
+    // Rows carry the write label but none of them opens with our key. When
+    // our key is the compiled-in fallback it proves nothing, and writing
+    // under it would seed rows the browser cannot read: keep refusing. Any
+    // other key came from the browser's own keyring item (or its platform
+    // equivalent), so the store's rows were written under a rotated-away
+    // key. Chrome itself just skips such rows; they are preserved and
+    // counted by the caller, never fatal.
+    if keys.lock().v11_key_is_fallback() {
+        return Err(Error::WrongBrowserPassword);
     }
     Ok(())
 }
@@ -301,10 +377,14 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
     }
     let tx = con.transaction().map_err(sql)?;
     let write_prefix = resolve_write_prefix(&tx, keys)?;
-    if !incoming.is_empty() {
-        verify_write_key(&tx, keys, write_prefix)?;
-    }
     let mut stats = Stats::default();
+    let mut dead: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    if !incoming.is_empty() {
+        let scan = scan_target(&tx, keys, write_prefix)?;
+        verify_write_key(keys, write_prefix, &scan)?;
+        stats.preserved_undecryptable = scan.preserved_undecryptable;
+        dead = scan.dead;
+    }
     // Modeled columns and their value for this cookie, if the column exists in this schema.
     let modeled = |c: &Cookie, enc: Vec<u8>| -> Vec<(&'static str, SqlValue)> {
         let on = |b: bool| SqlValue::Integer(b as i64);
@@ -362,6 +442,15 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
                 // The row already there is locked to this browser itself: it
                 // cannot be read or compared from outside, so it stays untouched
                 // and the incoming row is dropped, never the other way round.
+                stats.kept_newer += 1;
+                continue;
+            } else if dead.contains(rowid) {
+                // The row already there was written under a key that no
+                // longer exists (its browser password rotated away). It
+                // cannot be read or compared, so it stays byte-for-byte
+                // untouched and the incoming row is dropped, exactly like
+                // the App-Bound case; the row itself is counted in
+                // preserved_undecryptable.
                 stats.kept_newer += 1;
                 continue;
             } else {
@@ -527,7 +616,8 @@ mod tests {
         let (_t3, p3) = db();
         let con = Connection::open(&p3).unwrap();
         let fallback = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
-        assert!(verify_write_key(&con, &fallback, Some(LinuxPrefix::V11)).is_err());
+        let scan = scan_target(&con, &fallback, Some(LinuxPrefix::V11)).unwrap();
+        assert!(verify_write_key(&fallback, Some(LinuxPrefix::V11), &scan).is_err());
     }
 
     #[test]
@@ -722,7 +812,7 @@ mod tests {
             &keys(),
         )
         .unwrap();
-        assert_eq!(s, Stats { imported: 1, kept_newer: 1 });
+        assert_eq!(s, Stats { imported: 1, kept_newer: 1, preserved_undecryptable: 0 });
         // The locked row is still there, still locked; the other cookie landed.
         let raw: Vec<u8> = Connection::open(&p)
             .unwrap()
@@ -735,15 +825,84 @@ mod tests {
     }
 
     #[test]
+    fn import_over_a_store_of_only_dead_rows_lands_and_counts_them() {
+        // The target store holds only rows written under a rotated-away key
+        // (a store seen in the wild: two dead v11 cookies). The browser's current
+        // key, from its own keyring item rather than the fallback, must land
+        // the move anyway, leave the dead rows byte-for-byte, and count them.
+        let (_t, p) = db();
+        let current = Keys::Cbc { lock: Lock::linux("current-secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        let rotated = Lock::linux("rotated-away", LinuxPrefix::V11);
+        let con = Connection::open(&p).unwrap();
+        let mut dead_bytes = Vec::new();
+        for (host, name) in [(".google.com", "dead-a"), (".hcaptcha.com", "dead-b")] {
+            let blob = rotated.encrypt(host, "old", HostTag::With).unwrap();
+            con.execute(
+                "INSERT INTO cookies (creation_utc,host_key,name,path,encrypted_value) VALUES (1,?1,?2,'/',?3)",
+                (host, name, &blob),
+            )
+            .unwrap();
+            dead_bytes.push(blob);
+        }
+        drop(con);
+        let stats = import(&p, &[cookie(".new.com", "new", "value", 2)], &current).unwrap();
+        assert_eq!(stats.imported, 1);
+        assert_eq!(stats.preserved_undecryptable, 2);
+        // The dead rows survive byte-for-byte.
+        let con = Connection::open(&p).unwrap();
+        let mut st = con
+            .prepare("SELECT encrypted_value FROM cookies WHERE host_key IN ('.google.com','.hcaptcha.com') ORDER BY host_key")
+            .unwrap();
+        let now: Vec<Vec<u8>> = st
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(now, dead_bytes);
+        drop(st);
+        drop(con);
+        // And the landed row reads back with the current key.
+        let back = export(&p, &current).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].value, "value");
+    }
+
+    #[test]
+    fn import_keeps_a_dead_row_when_an_incoming_cookie_matches_it() {
+        // A dead row cannot be compared, so it wins by untouchability,
+        // exactly like an App-Bound row: same identity incoming is dropped.
+        let (_t, p) = db();
+        let current = Keys::Cbc { lock: Lock::linux("current-secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        let rotated = Lock::linux("rotated-away", LinuxPrefix::V11);
+        let blob = rotated.encrypt(".dead.com", "old", HostTag::With).unwrap();
+        Connection::open(&p)
+            .unwrap()
+            .execute(
+                "INSERT INTO cookies (creation_utc,host_key,name,path,encrypted_value) VALUES (1,'.dead.com','same','/',?1)",
+                [&blob],
+            )
+            .unwrap();
+        let stats = import(&p, &[cookie(".dead.com", "same", "new-value", 9)], &current).unwrap();
+        assert_eq!(stats.imported, 0);
+        assert_eq!(stats.kept_newer, 1);
+        assert_eq!(stats.preserved_undecryptable, 1);
+        let now: Vec<u8> = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE host_key='.dead.com'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(now, blob);
+    }
+
+    #[test]
     fn newer_wins_older_is_kept() {
         let (_t, p) = db();
         import(&p, &[cookie(".a.com", "sid", "v2", 200)], &keys()).unwrap();
         // Older creation loses.
         let s = import(&p, &[cookie(".a.com", "sid", "v1", 100)], &keys()).unwrap();
-        assert_eq!(s, Stats { imported: 0, kept_newer: 1 });
+        assert_eq!(s, Stats { imported: 0, kept_newer: 1, preserved_undecryptable: 0 });
         // Newer creation wins.
         let s = import(&p, &[cookie(".a.com", "sid", "v3", 300)], &keys()).unwrap();
-        assert_eq!(s, Stats { imported: 1, kept_newer: 0 });
+        assert_eq!(s, Stats { imported: 1, kept_newer: 0, preserved_undecryptable: 0 });
         assert_eq!(export(&p, &keys()).unwrap()[0].value, "v3");
     }
 

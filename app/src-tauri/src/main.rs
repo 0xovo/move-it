@@ -2,9 +2,10 @@
 mod pipes;
 mod updater;
 
-use moveit_core::api::{App, RouteChoice};
+use moveit_core::api::{normalize_profile_kinds, App, ProfileKinds, RouteChoice};
 use moveit_core::oauth::flow::{SignInOutcome, SIGN_IN_TIMEOUT};
 use pipes::CloudStatus;
+use open;
 use serde::Serialize;
 use std::io::Write;
 use std::net::TcpStream;
@@ -104,7 +105,14 @@ macro_rules! simple_command {
 }
 simple_command!(welcome_start);
 simple_command!(home_state);
-simple_command!(browser_open_check);
+#[tauri::command]
+async fn browser_open_check(
+    state: State<'_, Desktop>,
+    excluded: Vec<String>,
+    routes: Vec<RouteChoice>,
+) -> Reply {
+    run(state.inner().clone(), move |app| json(app.browser_open_check(&excluded, &routes))).await
+}
 simple_command!(pair_show_code);
 
 #[tauri::command]
@@ -123,9 +131,12 @@ async fn preview_counts(state: State<'_, Desktop>, excluded: Vec<String>, routes
     run(state.inner().clone(), move |app| json(app.preview_counts(&excluded, &routes))).await
 }
 #[tauri::command]
-async fn move_start(state: State<'_, Desktop>, window: tauri::WebviewWindow, excluded: Vec<String>, routes: Vec<RouteChoice>) -> Reply {
+async fn move_start(state: State<'_, Desktop>, window: tauri::WebviewWindow, excluded: Vec<String>, routes: Vec<RouteChoice>, kinds: Option<Vec<String>>, profile_kinds: Option<ProfileKinds>) -> Reply {
     run(state.inner().clone(), move |app| {
-        json(app.move_start(Some(&excluded), &routes, &mut |progress| { let _ = window.emit("move-progress", progress); }))
+        match normalize_profile_kinds(kinds.as_deref(), profile_kinds.as_ref()) {
+            Ok(pk) => json(app.move_start(Some(&excluded), &routes, pk.as_ref(), &mut |progress| { let _ = window.emit("move-progress", progress); })),
+            Err(e) => Err(e.to_string()),
+        }
     }).await
 }
 #[tauri::command]
@@ -137,19 +148,75 @@ async fn local_browsers(state: State<'_, Desktop>) -> Reply {
     run(state.inner().clone(), |app| json(Ok(app.local_browsers()))).await
 }
 #[tauri::command]
-async fn local_preview(state: State<'_, Desktop>, source: String, target: String) -> Reply {
-    run(state.inner().clone(), move |app| json(app.local_preview(&source, &target))).await
+async fn local_profiles(state: State<'_, Desktop>) -> Reply {
+    run(state.inner().clone(), |app| json(Ok(app.local_browser_profiles()))).await
+}
+#[tauri::command]
+async fn local_preview(
+    state: State<'_, Desktop>,
+    source: String,
+    target: String,
+    source_slot: Option<String>,
+    target_slot: Option<String>,
+) -> Reply {
+    run(state.inner().clone(), move |app| {
+        json(app.local_preview(
+            &source,
+            &target,
+            source_slot.as_deref(),
+            target_slot.as_deref(),
+        ))
+    })
+    .await
 }
 #[tauri::command]
 async fn local_open_check(state: State<'_, Desktop>, source: String, target: String) -> Reply {
     run(state.inner().clone(), move |app| json(app.local_open_check(&source, &target))).await
 }
 #[tauri::command]
-async fn local_move(state: State<'_, Desktop>, window: tauri::WebviewWindow, source: String, target: String) -> Reply {
+async fn local_move(
+    state: State<'_, Desktop>,
+    window: tauri::WebviewWindow,
+    source: String,
+    target: String,
+    source_slot: Option<String>,
+    target_slot: Option<String>,
+    kinds: Option<Vec<String>>,
+    profile_kinds: Option<ProfileKinds>,
+) -> Reply {
     run(state.inner().clone(), move |app| {
-        json(app.local_move(&source, &target, &mut |progress| { let _ = window.emit("move-progress", progress); }))
-    }).await
+        match normalize_profile_kinds(kinds.as_deref(), profile_kinds.as_ref()) {
+            Ok(pk) => json(app.local_move(
+                &source,
+                &target,
+                source_slot.as_deref(),
+                target_slot.as_deref(),
+                pk.as_ref(),
+                &mut |progress| {
+                    let _ = window.emit("move-progress", progress);
+                },
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
 }
+const EXTERNAL_LINKS: &[&str] = &[
+    "https://ko-fi.com/0xovo",
+    "https://getmoveit.tech",
+    "https://github.com/0xovo/move-it",
+    "https://x.com/0xovoo",
+    "https://github.com/0xovo/move-it/releases/latest",
+];
+
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    if !EXTERNAL_LINKS.contains(&url.as_str()) && !url.starts_with("https://x.com/intent/post?") {
+        return Err("That link cannot be opened from here.".into());
+    }
+    open::that(&url).map_err(|_| "Could not open the link.".to_string())
+}
+
 #[tauri::command]
 async fn logs_recent(state: State<'_, Desktop>) -> Reply {
     run(state.inner().clone(), |app| json(Ok(app.logs_recent(500)))).await
@@ -234,8 +301,12 @@ async fn pipe_sign_in_begin(
         byok,
         attempt,
     });
-    tauri::async_runtime::spawn_blocking(move || open::that(&url)).await.ok();
-    Ok(serde_json::json!({ "status": "waiting", "attempt": attempt }))
+    let open_url = url.clone();
+    let opened = matches!(
+        tauri::async_runtime::spawn_blocking(move || open::that(&open_url)).await,
+        Ok(Ok(()))
+    );
+    Ok(serde_json::json!({ "status": "waiting", "attempt": attempt, "authorizeUrl": url, "opened": opened }))
 }
 
 #[tauri::command]
@@ -423,10 +494,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![welcome_start, home_state, browser_open_check,
             pair_show_code, pair_enter_code, use_pipe, use_cloud_pipe, pipe_candidates, pick_folder,
             pipe_sign_in_begin, pipe_sign_in_finish, pipe_sign_in_cancel, pipe_sign_in_discard, pipe_sign_out, pipe_install_byok,
-            preview_counts, move_start, undo_last, local_browsers, local_preview,
+            preview_counts, move_start, undo_last, local_browsers, local_profiles, local_preview,
             local_open_check, local_move, logs_recent, export_logs, engine_idle,
             updater::updater_context, updater::updater_check, updater_install,
-            updater::open_release_page])
+            open_external, updater::open_release_page])
         .run(tauri::generate_context!())
         .expect("could not start Move It");
 }

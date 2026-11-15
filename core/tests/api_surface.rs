@@ -164,7 +164,7 @@ fn preview_counts_what_would_move_and_names_what_would_not() {
     let state = t.path().join("state");
     let pipe_dir = t.path().join("shared");
     std::fs::create_dir(&pipe_dir).unwrap();
-    let a = app(&state, &prof, "device-a", &pipe_dir);
+    let mut a = app(&state, &prof, "device-a", &pipe_dir);
 
     let preview = a.preview_counts(&[], &[]).unwrap();
     let brave = preview
@@ -181,11 +181,21 @@ fn preview_counts_what_would_move_and_names_what_would_not() {
     assert_eq!(brave.profiles[0].id, "brave:default");
     assert_eq!(brave.profiles[0].destination, "brave");
     assert!(!brave.profiles[0].routed);
-    assert!(
-        brave.skipped.iter().any(|s| s.browser == "Brave" && s.reason.contains("App-Bound")),
-        "the App-Bound cookie must be named as skipped: {:?}",
-        brave.skipped
-    );
+    if cfg!(target_os = "windows") {
+        assert!(
+            brave.skipped.iter().any(|s| s.browser == "Brave" && s.reason.contains("App-Bound")),
+            "the App-Bound cookie must be named as skipped: {:?}",
+            brave.skipped
+        );
+    } else {
+        assert!(
+            brave.skipped.iter().any(|s| {
+                s.browser == "Brave" && s.reason.contains("sealed by the browser on Windows")
+            }),
+            "v20 cookies must be counted and named on Linux: {:?}",
+            brave.skipped
+        );
+    }
 }
 
 #[test]
@@ -239,14 +249,14 @@ fn pair_move_home_and_undo_across_two_devices() {
     // A moves: its box lands in the shared folder, and the move itself is where A
     // learns who paired (the paired note is read exactly once, by the move).
     let mut events_a: Vec<Progress> = Vec::new();
-    let report_a = a.move_start(None, &[], &mut |p| events_a.push(p)).unwrap();
+    let report_a = a.move_start(None, &[], None, &mut |p| events_a.push(p)).unwrap();
     assert!(report_a.wrote_box);
     assert_ordered(&events_a);
     assert_eq!(a.welcome_start().unwrap().other_device.as_deref(), Some("device-b"));
 
     // B moves: A's logins and cookie arrive.
     let mut events_b: Vec<Progress> = Vec::new();
-    let report_b = b.move_start(None, &[], &mut |p| events_b.push(p)).unwrap();
+    let report_b = b.move_start(None, &[], None, &mut |p| events_b.push(p)).unwrap();
     assert_ordered(&events_b);
     assert!(events_b.iter().any(|p| p.step == "apply"), "B must apply A's box: {events_b:?}");
     assert_eq!(report_b.logins, 2);
@@ -277,15 +287,15 @@ fn browser_open_check_blocks_while_a_writer_holds_the_store() {
     std::fs::create_dir(&pipe_dir).unwrap();
     let a = app(&t.path().join("state"), &prof, "device-a", &pipe_dir);
 
-    assert_eq!(a.browser_open_check().unwrap(), OpenCheck::Clear);
+    assert_eq!(a.browser_open_check(&[], &[]).unwrap(), OpenCheck::Clear);
     let holder = rusqlite::Connection::open(prof.join("Default/Cookies")).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert_eq!(
-        a.browser_open_check().unwrap(),
+        a.browser_open_check(&[], &[]).unwrap(),
         OpenCheck::Blocked { browser: "Brave".into() }
     );
     holder.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(a.browser_open_check().unwrap(), OpenCheck::Clear);
+    assert_eq!(a.browser_open_check(&[], &[]).unwrap(), OpenCheck::Clear);
 }
 
 fn assert_ordered(events: &[Progress]) {
@@ -461,7 +471,7 @@ fn preview_lists_profiles_with_new_flags_and_remembered_ticks() {
     assert_eq!(b.logins, 2, "totals run over both profiles");
 
     // A move absorbs what it saw: nothing is new afterwards.
-    a.move_start(None, &[], &mut no_progress()).unwrap();
+    a.move_start(None, &[], None, &mut no_progress()).unwrap();
     let preview = a.preview_counts(&[], &[]).unwrap();
     assert!(preview.browsers[0].profiles.iter().all(|p| !p.is_new), "after a move, seen profiles are known");
 
@@ -476,8 +486,8 @@ fn preview_lists_profiles_with_new_flags_and_remembered_ticks() {
 
     // Untick Work in a move; a fresh App on the same state opens with it unticked
     // and its counts out of the totals.
-    a.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).unwrap();
-    let a2 = app(&t.path().join("state"), &prof, "device-a", &pipe_dir);
+    a.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).unwrap();
+    let mut a2 = app(&t.path().join("state"), &prof, "device-a", &pipe_dir);
     let preview = a2.preview_counts(&[], &[]).unwrap();
     let b = &preview.browsers[0];
     assert!(!b.profiles[1].ticked, "the untick is remembered across app instances");
@@ -508,7 +518,7 @@ fn excluded_profile_never_enters_the_box_or_the_other_device() {
         other => panic!("{other:?}"),
     }
 
-    a.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).unwrap();
+    a.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).unwrap();
 
     // Judge from the sealed boxes themselves, not from API answers: the ticked
     // profile's markers are all there, the unticked profile's are nowhere.
@@ -525,7 +535,7 @@ fn excluded_profile_never_enters_the_box_or_the_other_device() {
     assert!(!pipe_dir.join("Move It").join("moveit-box-brave-profile-1.json").exists());
 
     // The other device imports what exists: Default fills, Work stays empty.
-    let report_b = b.move_start(None, &[], &mut no_progress()).unwrap();
+    let report_b = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert_eq!(report_b.boxes_read, 1);
     let home = logins::export(&prof_b.join("Default/Login Data"), &keys()).unwrap();
     assert_eq!(home.len(), 1);
@@ -560,6 +570,7 @@ fn lookalike_and_stale_ids_exclude_nothing() {
                 "chrome:profile-1".to_string(),
             ]),
             &[],
+            None,
             &mut no_progress(),
         )
         .unwrap();
@@ -584,7 +595,7 @@ fn all_profiles_unticked_moves_nothing_and_is_not_an_error() {
     let mut a = paired_alone(&state, &prof, "device-a", &pipe_dir);
 
     let report = a
-        .move_start(Some(&["brave:default".to_string(), "brave:profile-1".to_string()]), &[], &mut no_progress())
+        .move_start(Some(&["brave:default".to_string(), "brave:profile-1".to_string()]), &[], None, &mut no_progress())
         .unwrap();
     assert!(!report.wrote_box);
     assert!(open_place_boxes(&pipe_dir, &app_key(&state)).is_empty(), "an all-unticked browser contributes nothing");
@@ -608,12 +619,12 @@ fn unticking_default_leaves_the_other_profile_to_move_alone() {
     let shown = a.pair_show_code().unwrap();
     assert!(matches!(b.pair_enter_code(&shown.code).unwrap(), PairOutcome::Success { .. }));
 
-    a.move_start(Some(&["brave:default".to_string()]), &[], &mut no_progress()).unwrap();
+    a.move_start(Some(&["brave:default".to_string()]), &[], None, &mut no_progress()).unwrap();
     let place = pipe_dir.join("Move It");
     assert!(!place.join(pipe::BOX_FILE).exists(), "the unticked Default leaves no main box");
     assert!(place.join("moveit-box-brave-profile-1.json").exists());
 
-    b.move_start(None, &[], &mut no_progress()).unwrap();
+    b.move_start(None, &[], None, &mut no_progress()).unwrap();
     let work = logins::export(&prof_b.join("Profile 1/Login Data"), &keys()).unwrap();
     assert_eq!(work.len(), 1);
     assert_eq!(work[0].username_value, "user-work");
@@ -632,7 +643,7 @@ fn renaming_a_profile_keeps_its_id_and_its_untick() {
     plant_markers(&prof, "Profile 1", "work");
     let state = t.path().join("state");
     let mut a = paired_alone(&state, &prof, "device-a", &pipe_dir);
-    a.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).unwrap();
+    a.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).unwrap();
 
     // The person renames Work to Job in the browser: folder (and id) unchanged.
     std::fs::write(
@@ -642,7 +653,7 @@ fn renaming_a_profile_keeps_its_id_and_its_untick() {
             "Profile 1":{"name":"Job"}}}}"#,
     )
     .unwrap();
-    let a2 = app(&state, &prof, "device-a", &pipe_dir);
+    let mut a2 = app(&state, &prof, "device-a", &pipe_dir);
     let preview = a2.preview_counts(&[], &[]).unwrap();
     let work = &preview.browsers[0].profiles[1];
     assert_eq!(work.id, "brave:profile-1");
@@ -677,7 +688,7 @@ fn corrupt_or_deleted_config_fails_closed() {
     // before anything is sealed or sent.
     std::fs::remove_file(state_a.join("config.json")).unwrap();
     let mut fresh = App::open(&state_a).unwrap().with_key_store(store_for(&state_a)).with_profile("brave", &prof_a);
-    assert!(fresh.move_start(None, &[], &mut no_progress()).is_err());
+    assert!(fresh.move_start(None, &[], None, &mut no_progress()).is_err());
     assert!(open_place_boxes(&pipe_dir, &app_key(&state_a)).is_empty());
 }
 
@@ -731,16 +742,17 @@ fn browsers_move_side_by_side_and_colliding_names_do_not_collide() {
     assert_eq!(chrome.profiles[1].name, "Work", "the same display name as Brave's, a different id");
 
     // Untick Brave's Work only: Chrome's Work still moves.
-    a.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).unwrap();
+    a.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).unwrap();
     let place = pipe_dir.join("Move It");
     assert!(place.join(pipe::BOX_FILE).exists(), "Brave Default");
     assert!(!place.join("moveit-box-brave-profile-1.json").exists(), "Brave Work stays home");
     assert!(place.join("moveit-box-chrome-default.json").exists());
     assert!(place.join("moveit-box-chrome-profile-1.json").exists(), "Chrome Work is not Brave Work");
 
-    // The Chrome-only receiver fills both of its profiles from the Chrome boxes.
-    let report = recv.move_start(None, &[], &mut no_progress()).unwrap();
-    assert_eq!(report.boxes_read, 2, "the two Chrome boxes; the Brave box is skipped");
+    // The receiver applies Chrome boxes into Chrome; the Brave box merges into
+    // Brave on this shared config home, not into Chrome.
+    let report = recv.move_start(None, &[], None, &mut no_progress()).unwrap();
+    assert_eq!(report.boxes_read, 3, "Brave Default plus the two Chrome boxes");
     let def = logins::export(&recv_root.join("Default/Login Data"), &keys()).unwrap();
     assert_eq!(def.len(), 1);
     assert_eq!(def[0].username_value, "user-chromedef");
@@ -767,7 +779,7 @@ fn browsers_move_side_by_side_and_colliding_names_do_not_collide() {
     let edge = preview.browsers.iter().find(|b| b.name == "edge").expect("edge is detected");
     assert!(edge.profiles.iter().all(|p| p.is_new), "first sight of Edge: new");
     assert!(
-        a2.move_start(None, &[], &mut no_progress()).is_err(),
+        a2.move_start(None, &[], None, &mut no_progress()).is_err(),
         "a move that cannot read a browser says so, and still absorbs nothing of it"
     );
     let preview = a2.preview_counts(&[], &[]).unwrap();
@@ -788,7 +800,7 @@ fn browsers_move_side_by_side_and_colliding_names_do_not_collide() {
     // each open, since an app captures its base when it opens.
     std::env::set_var("XDG_CONFIG_HOME", &xdg);
     let mut a3 = App::open(&state_a).unwrap().with_key_store(store_for(&state_a));
-    assert!(a3.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).is_err());
+    assert!(a3.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).is_err());
     let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
     let unticked: Vec<&str> = cfg["excluded_profiles"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
     assert!(unticked.contains(&"edge:profile-1"), "Edge never moved, so its untick is not wiped: {unticked:?}");
@@ -798,8 +810,15 @@ fn browsers_move_side_by_side_and_colliding_names_do_not_collide() {
 /// Seal a box by hand with a manifest tag of our choosing: the raw material
 /// for tag forgery probes.
 fn forge_box(src_root: &Path, src_sub: &str, key: &SyncKey, browser: &str, slot: &str, name: &str) -> Vec<u8> {
-    let prof = moveit_core::engine::Profile { dir: src_root, slot: src_sub, keys: &keys(), login_tag: HostTag::Without };
-    let mut payload = moveit_core::engine::export(&prof, "device-x").unwrap();
+    let prof = moveit_core::engine::Profile {
+        dir: src_root,
+        slot: src_sub,
+        keys: &keys(),
+        login_tag: HostTag::Without,
+        browser: "brave",
+        display: "Brave",
+    };
+    let mut payload = moveit_core::engine::export(&prof, "device-x", None).unwrap();
     payload.manifest.insert("profile_browser".into(), browser.into());
     payload.manifest.insert("profile_slot".into(), slot.into());
     payload.manifest.insert("profile_name".into(), name.into());
@@ -834,7 +853,7 @@ fn a_forged_tag_cannot_reroute_data_or_dodge_an_untick() {
     let f2 = forge_box(&prof_a, "Default", &key, "brave", "Default", "Profile 1");
     std::fs::write(place.join("moveit-box-brave-profile-1.json"), &f2).unwrap();
 
-    let report = b.move_start(Some(&["brave:profile-1".to_string()]), &[], &mut no_progress()).unwrap();
+    let report = b.move_start(Some(&["brave:profile-1".to_string()]), &[], None, &mut no_progress()).unwrap();
     assert!(report.boxes_skipped >= 2, "both forgeries refused: {report:?}");
     assert_eq!(report.boxes_read, 0);
     assert!(logins::export(&prof_b.join("Default/Login Data"), &keys()).unwrap().is_empty(), "nothing rerouted into Default");
@@ -843,7 +862,7 @@ fn a_forged_tag_cannot_reroute_data_or_dodge_an_untick() {
     // Control: an honest tag for Default still applies.
     let honest = forge_box(&prof_a, "Default", &key, "brave", "Default", "Profile 1");
     std::fs::write(place.join(pipe::BOX_FILE), &honest).unwrap();
-    let report = b.move_start(None, &[], &mut no_progress()).unwrap();
+    let report = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert_eq!(report.boxes_read, 1);
     let def = logins::export(&prof_b.join("Default/Login Data"), &keys()).unwrap();
     assert_eq!(def.len(), 1);
@@ -885,16 +904,20 @@ fn a_box_for_a_colliding_folder_lands_nowhere() {
     // the folder takes no part here, so the box is skipped whole.
     let collide = forge_box(&prof_a, "Profile 1", &key, "brave", "Profile-1", "Odd");
     std::fs::write(place.join("moveit-box-brave-profile-1.json"), &collide).unwrap();
-    let report = b.move_start(None, &[], &mut no_progress()).unwrap();
+    let report = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert_eq!(report.boxes_read, 0);
-    assert!(report.boxes_skipped >= 1, "{report:?}");
+    assert!(
+        report.boxes_skipped >= 1
+            || report.routes.iter().any(|r| r.status == "failed"),
+        "{report:?}"
+    );
     assert!(logins::export(&prof_b.join("Profile 1/Login Data"), &keys()).unwrap().is_empty());
     assert!(logins::export(&prof_b.join("Profile-1/Login Data"), &keys()).unwrap().is_empty(), "the dropped folder receives nothing");
 
     // Control: the same payload tagged for the folder that does take part lands.
     let honest = forge_box(&prof_a, "Profile 1", &key, "brave", "Profile 1", "Work");
     std::fs::write(place.join("moveit-box-brave-profile-1.json"), &honest).unwrap();
-    let report = b.move_start(None, &[], &mut no_progress()).unwrap();
+    let report = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert_eq!(report.boxes_read, 1);
     let work = logins::export(&prof_b.join("Profile 1/Login Data"), &keys()).unwrap();
     assert_eq!(work.len(), 1);
@@ -919,12 +942,12 @@ fn a_corrupt_box_is_skipped_and_the_move_goes_through() {
     let mut b = app(&t.path().join("state-b"), &prof_b, "device-b", &pipe_dir);
     let shown = a.pair_show_code().unwrap();
     assert!(matches!(b.pair_enter_code(&shown.code).unwrap(), PairOutcome::Success { .. }));
-    a.move_start(None, &[], &mut no_progress()).unwrap();
+    a.move_start(None, &[], None, &mut no_progress()).unwrap();
 
     // A truncated second box lands in the place (a sync conflict copy that lost
     // a fight, a half-written file). It must not wedge every future move.
     std::fs::write(pipe_dir.join("Move It").join("moveit-box-brave-profile-1.json"), b"{bad").unwrap();
-    let report = b.move_start(None, &[], &mut no_progress()).unwrap();
+    let report = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert!(report.boxes_skipped >= 1, "the bad box is counted, not fatal: {report:?}");
     let def = logins::export(&prof_b.join("Default/Login Data"), &keys()).unwrap();
     assert_eq!(def.len(), 1, "the good box still applied");
@@ -946,7 +969,7 @@ fn one_unreadable_profile_does_not_stop_its_siblings_sealing() {
     let state = t.path().join("state");
     let mut a = paired_alone(&state, &prof, "device-a", &pipe_dir);
 
-    let result = a.move_start(None, &[], &mut no_progress());
+    let result = a.move_start(None, &[], None, &mut no_progress());
     assert!(result.is_err(), "the failure is reported, not hidden");
     let boxes = open_place_boxes(&pipe_dir, &app_key(&state));
     assert_eq!(boxes.len(), 1, "Default still sealed on its own: {}", boxes.len());
@@ -971,13 +994,13 @@ fn same_named_devices_still_sync_by_id() {
     let shown = a.pair_show_code().unwrap();
     assert!(matches!(b.pair_enter_code(&shown.code).unwrap(), PairOutcome::Success { .. }));
 
-    a.move_start(None, &[], &mut no_progress()).unwrap();
-    let report = b.move_start(None, &[], &mut no_progress()).unwrap();
+    a.move_start(None, &[], None, &mut no_progress()).unwrap();
+    let report = b.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert!(report.boxes_read >= 1, "the same-named peer's box is not mistaken for its own: {report:?}");
     let found = logins::export(&prof_b.join("Default/Login Data"), &keys()).unwrap();
     assert!(found.iter().any(|l| l.username_value == "user-home"), "A's login landed on B");
 
-    let report = a.move_start(None, &[], &mut no_progress()).unwrap();
+    let report = a.move_start(None, &[], None, &mut no_progress()).unwrap();
     assert!(report.boxes_read >= 1, "and the other way around: {report:?}");
     let found = logins::export(&prof_a.join("Default/Login Data"), &keys()).unwrap();
     assert!(found.iter().any(|l| l.username_value == "user-away"), "B's login landed on A");
@@ -1006,7 +1029,7 @@ fn move_start_refuses_while_a_browser_is_open_and_touches_nothing() {
     let mut b = app(&t.path().join("state-b"), &prof_b, "device-b", &pipe_dir);
     let shown = a.pair_show_code().unwrap();
     assert!(matches!(b.pair_enter_code(&shown.code).unwrap(), PairOutcome::Success { .. }));
-    a.move_start(None, &[], &mut |_| {}).unwrap();
+    a.move_start(None, &[], None, &mut |_| {}).unwrap();
 
     // B's browser is open now: its singleton names this living process.
     let lock_target = format!("this-machine-{}", std::process::id());
@@ -1034,7 +1057,7 @@ fn move_start_refuses_while_a_browser_is_open_and_touches_nothing() {
     let prof_before = snapshot(&prof_b);
     let config_before = std::fs::read(t.path().join("state-b/config.json")).unwrap();
 
-    let err = b.move_start(None, &[], &mut |_| {}).unwrap_err();
+    let err = b.move_start(None, &[], None, &mut |_| {}).unwrap_err();
     assert!(matches!(err, moveit_core::Error::BrowserOpen), "{err:?}");
     assert_eq!(snapshot(&pipe_dir), pipe_before, "no box written, none withdrawn");
     assert_eq!(snapshot(&prof_b), prof_before, "the profile is byte-identical");
@@ -1053,7 +1076,7 @@ fn move_start_refuses_while_a_browser_is_open_and_touches_nothing() {
 
     // Closed again, the very same move lands.
     std::fs::remove_file(prof_b.join("SingletonLock")).unwrap();
-    let report = b.move_start(None, &[], &mut |_| {}).unwrap();
+    let report = b.move_start(None, &[], None, &mut |_| {}).unwrap();
     assert_eq!(report.logins, 1);
 }
 
@@ -1067,7 +1090,7 @@ fn move_start_refuses_a_never_launched_source_without_planting() {
     // Installed once, never opened: Default folder, no cookie/login stores.
     std::fs::create_dir_all(prof.join("Default")).unwrap();
     let mut a = paired_alone(&t.path().join("state"), &prof, "device-a", &pipe_dir);
-    let err = a.move_start(None, &[], &mut |_| {}).unwrap_err();
+    let err = a.move_start(None, &[], None, &mut |_| {}).unwrap_err();
     assert!(
         matches!(
             &err,

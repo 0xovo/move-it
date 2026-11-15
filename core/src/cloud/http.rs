@@ -77,7 +77,60 @@ pub fn map_http_status(status: u16, body: &[u8]) -> Result<()> {
             return Err(Error::Refused("sign-in expired; sign in again".into()));
         }
     }
-    Err(Error::Refused(format!("request failed ({status})")))
+    if status == 403 {
+        let reasons = provider_reasons(body);
+        let has = |r: &str| reasons.iter().any(|x| x.eq_ignore_ascii_case(r));
+        if has("accessNotConfigured") || has("SERVICE_DISABLED") {
+            return Err(Error::Refused(
+                "Google Drive is not switched on for this app yet (Drive API disabled in the Google Cloud project)".into(),
+            ));
+        }
+        if has("insufficientPermissions") || has("ACCESS_TOKEN_SCOPE_INSUFFICIENT") {
+            return Err(Error::Refused(
+                "Move It was not given Drive access. Sign in again and tick the box that lets Move It use the files it creates".into(),
+            ));
+        }
+    }
+    match provider_message(body) {
+        Some(msg) => Err(Error::Refused(format!("request failed ({status}): {msg}"))),
+        None => Err(Error::Refused(format!("request failed ({status})"))),
+    }
+}
+
+/// Machine reasons from a Google or Dropbox error body (never tokens).
+fn provider_reasons(body: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return out };
+    let err = &v["error"];
+    for list in [&err["errors"], &err["details"]] {
+        if let Some(items) = list.as_array() {
+            for item in items {
+                if let Some(r) = item["reason"].as_str() {
+                    out.push(r.to_string());
+                }
+            }
+        }
+    }
+    if let Some(s) = err["status"].as_str() {
+        out.push(s.to_string());
+    }
+    out
+}
+
+/// A short, safe provider message: Google error.message or Dropbox error_summary.
+fn provider_message(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let raw = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error_summary"].as_str())
+        .or_else(|| v["error_description"].as_str())?;
+    let clean: String = raw
+        .split_whitespace()
+        .filter(|w| !w.starts_with("ya29.") && !w.starts_with("sl.") && w.len() < 80)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let short: String = clean.chars().take(200).collect();
+    (!short.is_empty()).then_some(short)
 }
 
 /// Blocking ureq client. License: MIT/Apache-2.0 (GPL-3.0-compatible).
@@ -195,6 +248,22 @@ impl MockHttp {
 mod tests {
     use super::*;
     use crate::Error;
+
+    #[test]
+    fn google_403_reasons_are_explained() {
+        let disabled = br#"{"error":{"code":403,"message":"Google Drive API has not been used in project 1 before or it is disabled.","errors":[{"reason":"accessNotConfigured"}],"status":"PERMISSION_DENIED"}}"#;
+        let msg = map_http_status(403, disabled).unwrap_err().to_string();
+        assert!(msg.contains("Drive API disabled"), "{msg}");
+        let scope = br#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","errors":[{"reason":"insufficientPermissions"}],"status":"PERMISSION_DENIED"}}"#;
+        let msg = map_http_status(403, scope).unwrap_err().to_string();
+        assert!(msg.contains("Sign in again"), "{msg}");
+        let other = br#"{"error_summary":"path/not_found/..","error":{".tag":"path"}}"#;
+        let msg = map_http_status(404, other).unwrap_err().to_string();
+        assert!(msg.contains("path/not_found"), "{msg}");
+        let leak = br#"{"error":{"message":"bad ya29.SECRETTOKEN value"}}"#;
+        let msg = map_http_status(403, leak).unwrap_err().to_string();
+        assert!(!msg.contains("ya29"), "{msg}");
+    }
 
     #[test]
     fn map_http_status_rejects_other_4xx() {

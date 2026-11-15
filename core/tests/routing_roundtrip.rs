@@ -269,15 +269,15 @@ fn brave_profile_routed_to_chrome_lands_as_a_fresh_chrome_profile() {
     let brave_before = store_digests(&brave_a, "Default");
     let chrome_before = store_digests(&chrome_b, "Default");
 
-    // A sends its Brave profile to Chrome.
-    let report_a = a
-        .move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {})
-        .unwrap();
+    // A sends its Brave profile; B picks Chrome.
+    let report_a = a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
     assert!(report_a.wrote_box);
     assert_eq!(store_digests(&brave_a, "Default"), brave_before, "sealing never writes the source");
 
     // B moves: the routed profile lands as a new Chrome profile.
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     assert_eq!(report_b.routes.len(), 1, "one incoming profile: {report_b:?}");
     let line = &report_b.routes[0];
     assert_eq!(line.profile, "brave:default");
@@ -330,15 +330,19 @@ fn brave_profile_routed_to_chrome_lands_as_a_fresh_chrome_profile() {
     // Brave profile (choosing the route again: routes belong to one move);
     // B moves again and the routed profile lands fresh once more, because
     // undo took its first home away.
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    let report_b2 = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b2 = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     assert_eq!(report_b2.routes.len(), 1);
     assert_eq!(report_b2.routes[0].into_profile.as_deref(), Some("Profile 1"));
     assert!(report_b2.routes[0].created);
     // One more cycle: now the same box merges into the landed home instead of
     // stacking up a new profile on every move.
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    let report_b3 = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b3 = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     let line = report_b3
         .routes
         .iter()
@@ -385,15 +389,23 @@ fn one_move_many_destinations_and_duplicate_targets() {
     // Work and Play both go to Chrome (two fresh profiles there), AChrome goes to Brave.
     a.move_start(
         Some(&[]),
-        &[
-            route("brave:default", "chrome"),
-            route("brave:profile-1", "chrome"),
-            route("chrome:default", "brave"),
-        ],
+        &[],
+        None,
         &mut |_| {},
     )
     .unwrap();
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(
+            Some(&[]),
+            &[
+                route("brave:default", "chrome"),
+                route("brave:profile-1", "chrome"),
+                route("chrome:default", "brave"),
+            ],
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
     assert_eq!(report_b.routes.len(), 3, "three landings: {report_b:?}");
     assert!(report_b.routes.iter().all(|l| l.status == "moved"), "{report_b:?}");
 
@@ -453,7 +465,8 @@ fn a_failing_destination_does_not_stop_the_others_and_undo_still_works() {
 
     a.move_start(
         Some(&[]),
-        &[route("brave:default", "chrome"), route("chrome:default", "brave")],
+        &[],
+        None,
         &mut |_| {},
     )
     .unwrap();
@@ -465,7 +478,14 @@ fn a_failing_destination_does_not_stop_the_others_and_undo_still_works() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&brave_b, std::fs::Permissions::from_mode(0o555)).unwrap();
     }
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(
+            Some(&[]),
+            &[route("brave:default", "chrome"), route("chrome:default", "brave")],
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -510,8 +530,8 @@ fn a_poisoned_ledger_cannot_redirect_a_merge() {
     let (mut b, _bb) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
     pair(&mut a, &mut b);
 
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    b.move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {}).unwrap();
     // The landing carries its marker inside the created profile.
     assert!(chrome_b.join("Profile 1/.moveit-landing").exists());
 
@@ -524,8 +544,10 @@ fn a_poisoned_ledger_cannot_redirect_a_merge() {
 
     // The next delivery must NOT merge into Default: the marker there is
     // missing, so the profile lands fresh again, in a new slot of its own.
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     let line = report_b
         .routes
         .iter()
@@ -563,13 +585,15 @@ fn a_move_that_lands_nothing_ends_undo_for_the_older_move() {
     pair(&mut a, &mut b);
 
     // A first, successful landing: undo points at it.
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    b.move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {}).unwrap();
     assert!(b.home_state().unwrap().can_undo);
 
     // A second move whose only landing fails (Edge cannot be read here).
-    a.move_start(Some(&[]), &[route("brave:default", "edge")], &mut |_| {}).unwrap();
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "edge")], None, &mut |_| {})
+        .unwrap();
     assert_eq!(report_b.routes.len(), 1);
     assert_eq!(report_b.routes[0].status, "failed");
 
@@ -597,31 +621,157 @@ fn preview_counts_exclusions_and_routes_together() {
     plant(&brave_a, "Default", "Work", "work");
     plant(&brave_a, "Profile 1", "Play", "play");
     write_local_state(&brave_a, &[("Default", "Work"), ("Profile 1", "Play")]);
-    let (a, _ba) = device(t.path(), "a", "device-a", &pipe_dir, "brave", &brave_a);
+    let chrome_b = t.path().join("b-xdg/google-chrome");
+    plant(&chrome_b, "Default", "Personal", "personal");
+    write_local_state(&chrome_b, &[("Default", "Personal")]);
 
-    // Unticking Play takes it out of the totals but keeps it listed, flagged.
-    let preview = a.preview_counts(&["brave:profile-1".to_string()], &[]).unwrap();
-    let brave = &preview.browsers[0];
-    assert_eq!(brave.logins, 1, "only Work counts toward the move");
-    assert_eq!(brave.profiles.len(), 2);
-    let play = brave.profiles.iter().find(|p| p.id == "brave:profile-1").unwrap();
-    assert!(play.excluded);
-    assert_eq!(play.logins, 1, "its own row still shows its counts");
+    let (mut a, _ba) = device(t.path(), "a", "device-a", &pipe_dir, "brave", &brave_a);
+    let (mut b, _bb) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
+    pair(&mut a, &mut b);
+    a.move_start(Some(&["brave:profile-1".into()]), &[], None, &mut |_| {}).unwrap();
 
-    // A route shows in the same preview the move would use.
-    let preview = a.preview_counts(&[], &[route("brave:profile-1", "chrome")]).unwrap();
-    let play = preview.browsers[0]
-        .profiles
+    let preview = b.preview_counts(&[], &[]).unwrap();
+    assert_eq!(preview.arriving.len(), 1);
+    assert_eq!(preview.arriving[0].id, "brave:default");
+
+    let preview = b.preview_counts(&[], &[route("brave:default", "chrome")]).unwrap();
+    let arriving = &preview.arriving[0];
+    assert_eq!(arriving.destination, "chrome");
+    assert!(arriving.routed);
+
+    assert!(
+        b.preview_counts(&[], &[route("brave:nope", "chrome")])
+            .unwrap()
+            .arriving[0]
+            .destination
+            == "chrome",
+        "stale incoming routes are dropped, not refused"
+    );
+}
+
+#[test]
+fn incoming_same_browser_missing_slot_lands_fresh() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    setup();
+    let t = tempfile::tempdir().unwrap();
+    let pipe_dir = t.path().join("shared");
+    std::fs::create_dir(&pipe_dir).unwrap();
+
+    let chrome_a = t.path().join("a-xdg/google-chrome");
+    plant(&chrome_a, "Profile 2", "Work", "work");
+    write_local_state(&chrome_a, &[("Profile 2", "Work")]);
+    let chrome_b = t.path().join("b-xdg/google-chrome");
+    plant(&chrome_b, "Default", "Personal", "personal");
+    write_local_state(&chrome_b, &[("Default", "Personal")]);
+
+    let (mut a, _) = device(t.path(), "a", "device-a", &pipe_dir, "chrome", &chrome_a);
+    let (mut b, _) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
+    pair(&mut a, &mut b);
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+
+    let preview = b.preview_counts(&[], &[]).unwrap();
+    assert_eq!(preview.arriving.len(), 1);
+    assert_eq!(preview.arriving[0].destination, "chrome");
+
+    let report = b.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let line = report
+        .routes
         .iter()
-        .find(|p| p.id == "brave:profile-1")
-        .unwrap();
-    assert_eq!(play.destination, "chrome");
-    assert!(play.routed);
+        .find(|l| l.profile == "chrome:profile-2")
+        .expect("chrome:profile-2 is reported");
+    assert_eq!(line.status, "moved");
+    assert!(line.created);
+    assert_ne!(line.into_profile.as_deref(), Some("Profile 2"));
+}
 
-    // The combination move_start refuses, preview refuses too.
-    assert!(a
-        .preview_counts(&["brave:profile-1".to_string()], &[route("brave:profile-1", "chrome")])
-        .is_err());
+#[test]
+fn local_exclude_does_not_skip_incoming_with_the_same_id() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    setup();
+    let t = tempfile::tempdir().unwrap();
+    let pipe_dir = t.path().join("shared");
+    std::fs::create_dir(&pipe_dir).unwrap();
+
+    let chrome_a = t.path().join("a-xdg/google-chrome");
+    plant(&chrome_a, "Profile 1", "Remote", "remote");
+    write_local_state(&chrome_a, &[("Profile 1", "Remote")]);
+    let chrome_b = t.path().join("b-xdg/google-chrome");
+    plant(&chrome_b, "Profile 1", "Local", "local");
+    plant(&chrome_b, "Default", "Personal", "personal");
+    write_local_state(&chrome_b, &[("Default", "Personal"), ("Profile 1", "Local")]);
+
+    let (mut a, _) = device(t.path(), "a", "device-a", &pipe_dir, "chrome", &chrome_a);
+    let (mut b, _) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
+    pair(&mut a, &mut b);
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+
+    let report = b
+        .move_start(
+            Some(&["chrome:profile-1".into()]),
+            &[route("chrome:profile-1", "chrome")],
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+    let line = report
+        .routes
+        .iter()
+        .find(|l| l.profile == "chrome:profile-1" && l.status == "moved")
+        .expect("incoming chrome:profile-1 lands even when the local namesake is excluded");
+    assert!(line.created || line.into_profile.is_some());
+}
+
+#[test]
+fn manifest_route_browser_does_not_override_receiver_choice() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    setup();
+    let t = tempfile::tempdir().unwrap();
+    let pipe_dir = t.path().join("shared");
+    std::fs::create_dir(&pipe_dir).unwrap();
+
+    let brave_a = t.path().join("a-xdg/BraveSoftware/Brave-Browser");
+    plant(&brave_a, "Default", "Work", "work");
+    write_local_state(&brave_a, &[("Default", "Work")]);
+    let chrome_b = t.path().join("b-xdg/google-chrome");
+    plant(&chrome_b, "Default", "Personal", "personal");
+    write_local_state(&chrome_b, &[("Default", "Personal")]);
+    let brave_b = t.path().join("b-xdg/BraveSoftware/Brave-Browser");
+    plant(&brave_b, "Default", "Brave here", "brave-here");
+    write_local_state(&brave_b, &[("Default", "Brave here")]);
+
+    let (mut a, _) = device(t.path(), "a", "device-a", &pipe_dir, "brave", &brave_a);
+    let (mut b, _) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
+    pair(&mut a, &mut b);
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+
+    let a_state = t.path().join("a-state");
+    let account = a.device_id().unwrap();
+    let key = store_for(&a_state)
+        .load(&account)
+        .unwrap()
+        .expect("key");
+    let box_path = pipe_dir.join("Move It/moveit-box.json");
+    let bytes = std::fs::read(&box_path).unwrap();
+    let mut payload = moveit_core::engine::open_box(&bytes, &key).unwrap();
+    payload
+        .manifest
+        .insert("route_browser".into(), serde_json::json!("chrome"));
+    let env = moveit_core::sealed::seal(&payload, &key).unwrap();
+    std::fs::write(&box_path, serde_json::to_vec(&env).unwrap()).unwrap();
+
+    let report = b
+        .move_start(Some(&[]), &[route("brave:default", "brave")], None, &mut |_| {})
+        .unwrap();
+    let line = report.routes.iter().find(|l| l.profile == "brave:default").unwrap();
+    assert_eq!(line.status, "moved");
+    assert_eq!(line.to_browser, "brave");
+    let (cks, _, _) = read_markers(&brave_b, line.into_profile.as_deref().unwrap_or("Default"));
+    assert!(
+        cks.iter().any(|v| v == "v-work"),
+        "receiver choice lands in Brave, not manifest Chrome: {cks:?}"
+    );
+    let (cks, _, _) = read_markers(&chrome_b, "Default");
+    assert_eq!(cks, ["v-personal"], "Chrome was not used despite route_browser in the box");
 }
 
 #[test]
@@ -642,7 +792,7 @@ fn a_box_with_mixed_case_browser_names_still_routes() {
     let (mut a, _ba) = device(t.path(), "a", "device-a", &pipe_dir, "brave", &brave_a);
     let (mut b, _bb) = device(t.path(), "b", "device-b", &pipe_dir, "chrome", &chrome_b);
     pair(&mut a, &mut b);
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
 
     // Rewrite the sealed box the way a differently-cased peer might: browser
     // names in the manifest are matched case-insensitively on read.
@@ -662,7 +812,9 @@ fn a_box_with_mixed_case_browser_names_still_routes() {
     let env = moveit_core::sealed::seal(&payload, &key).unwrap();
     std::fs::write(&box_path, serde_json::to_vec(&env).unwrap()).unwrap();
 
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     assert_eq!(report_b.routes.len(), 1);
     assert_eq!(report_b.routes[0].status, "moved", "{report_b:?}");
     assert_eq!(report_b.routes[0].into_profile.as_deref(), Some("Profile 1"));
@@ -710,7 +862,7 @@ fn landings_are_recorded_even_when_the_send_fails() {
     let (mut a, _ba) = device(t.path(), "a", "device-a", &clone_a, "brave", &brave_a);
     let (mut b, _bb) = device(t.path(), "b", "device-b", &clone_b, "chrome", &chrome_b);
     pair(&mut a, &mut b);
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
 
     // The remote now refuses every push (fetch still works): B's move lands
     // the profile, then cannot finish sending.
@@ -721,7 +873,7 @@ fn landings_are_recorded_even_when_the_send_fails() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let failed = b.move_start(Some(&[]), &[], &mut |_| {});
+    let failed = b.move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {});
     assert!(failed.is_err(), "the send failure must surface: {failed:?}");
 
     // But the landing is real, and the records describe it truthfully.
@@ -732,8 +884,10 @@ fn landings_are_recorded_even_when_the_send_fails() {
     // With the remote healed, the next delivery merges into the landed home:
     // the ledger was written even though the earlier move reported an error.
     std::fs::remove_file(&hook).unwrap();
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |_| {})
+        .unwrap();
     let line = report_b
         .routes
         .iter()
@@ -772,8 +926,10 @@ fn routing_to_an_unreadable_browser_fails_the_route_only() {
 
     // Edge is in the family, but this build cannot read Edge's password yet, and
     // B has no Edge folder at all: the route fails plainly, nothing is created.
-    a.move_start(Some(&[]), &[route("brave:default", "edge")], &mut |_| {}).unwrap();
-    let report_b = b.move_start(Some(&[]), &[], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
+    let report_b = b
+        .move_start(Some(&[]), &[route("brave:default", "edge")], None, &mut |_| {})
+        .unwrap();
     assert_eq!(report_b.routes.len(), 1);
     let line = &report_b.routes[0];
     assert_eq!(line.status, "failed");
@@ -816,11 +972,11 @@ fn busy_retry_undo_restores_the_state_before_both_rounds() {
     let (mut a, _ba) = device(t.path(), "a", "device-a", &clone_a, "brave", &brave_a);
     let (mut b, _bb) = device(t.path(), "b", "device-b", &clone_b, "chrome", &chrome_b);
     pair(&mut a, &mut b);
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
 
     let before = std::fs::read(chrome_b.join("Local State")).unwrap();
     let mut raced = false;
-    b.move_start(Some(&[]), &[], &mut |p| {
+    b.move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |p| {
         if p.step == "send" && !raced {
             raced = true;
             std::fs::write(clone_a.join("moveit-race"), "remote advanced").unwrap();
@@ -867,9 +1023,9 @@ fn landings_are_recorded_before_a_box_write_failure() {
     let (mut a, _ba) = device(t.path(), "a", "device-a", &clone_a, "brave", &brave_a);
     let (mut b, _bb) = device(t.path(), "b", "device-b", &clone_b, "chrome", &chrome_b);
     pair(&mut a, &mut b);
-    a.move_start(Some(&[]), &[route("brave:default", "chrome")], &mut |_| {}).unwrap();
+    a.move_start(Some(&[]), &[], None, &mut |_| {}).unwrap();
 
-    let failed = b.move_start(Some(&[]), &[], &mut |p| {
+    let failed = b.move_start(Some(&[]), &[route("brave:default", "chrome")], None, &mut |p| {
         if p.step == "seal" {
             std::fs::create_dir(clone_b.join("moveit-box.json.tmp-moveit")).unwrap();
         }

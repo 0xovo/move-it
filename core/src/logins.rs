@@ -66,6 +66,10 @@ pub struct Stats {
     pub inserted: usize,
     pub updated: usize,
     pub skipped: usize,
+    /// Existing target rows no available key could decrypt. They are
+    /// preserved byte-for-byte and never updated over; the count covers
+    /// the whole target store, as the cookie store counts them.
+    pub preserved_undecryptable: usize,
 }
 
 fn open(path: &Path, wait: Duration) -> Result<Connection> {
@@ -129,7 +133,14 @@ pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Login>, usize)> {
         }
         let password_value = match unlock(keys, &origin, &realm, &blob) {
             Ok(value) => value,
-            Err(Error::AppBound) => { skipped += 1; continue; }
+            Err(Error::AppBound) => {
+                skipped += 1;
+                continue;
+            }
+            Err(Error::WrongBrowserPassword) | Err(Error::Refused(_)) => {
+                skipped += 1;
+                continue;
+            }
             Err(e) => return Err(e),
         };
         out.push(Login {
@@ -201,25 +212,109 @@ fn resolve_write_prefix(con: &Connection, keys: &Keys) -> Result<Option<LinuxPre
     Ok(Some(vote))
 }
 
-fn verify_write_key(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Result<()> {
+/// Whether the target store's rows carrying the write label prove our key
+/// against this store, and which of its rows no available key can read.
+/// Mirrors the cookie store's scan: one dead row (its key rotated away)
+/// must not be mistaken for a wrong key, and a dead row must never be
+/// updated over.
+struct TargetScan {
+    /// Rows whose password blob carries the write label.
+    label_rows: usize,
+    /// At least one label row unlocks with our key.
+    label_verified: bool,
+    /// Rowids of rows whose blob no available key can decrypt. They are
+    /// preserved byte-for-byte and counted in the import stats.
+    dead: std::collections::HashSet<i64>,
+    /// Rowids the merge must never update over: the dead rows, plus the
+    /// App-Bound rows (v20 blobs, and blobs only the browser itself can
+    /// open). The existing row wins, as in the cookie store.
+    protected: std::collections::HashSet<i64>,
+    preserved_undecryptable: usize,
+}
+
+fn scan_target(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Result<TargetScan> {
     let label: &[u8] = match prefix {
         Some(LinuxPrefix::V11) => b"v11",
         _ => b"v10",
     };
-    let sample: Option<(String, String, Vec<u8>)> = con.query_row(
-        "SELECT origin_url, signon_realm, password_value FROM logins WHERE substr(password_value,1,3)=?1 LIMIT 1",
-        [label], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).optional().map_err(sql)?;
-    if let Some((origin, realm, blob)) = sample {
-        unlock(keys, &origin, &realm, &blob)?;
-    } else if prefix == Some(LinuxPrefix::V11) {
+    let mut st = con
+        .prepare("SELECT id, origin_url, signon_realm, password_value FROM logins")
+        .map_err(sql)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql)?;
+    let mut scan = TargetScan {
+        label_rows: 0,
+        label_verified: false,
+        dead: std::collections::HashSet::new(),
+        protected: std::collections::HashSet::new(),
+        preserved_undecryptable: 0,
+    };
+    for (id, origin, realm, blob) in &rows {
+        if blob.is_empty() {
+            continue;
+        }
+        if blob.starts_with(b"v20") {
+            scan.protected.insert(*id);
+            continue;
+        }
+        if blob.starts_with(label) {
+            scan.label_rows += 1;
+        }
+        match unlock(keys, origin, realm, blob) {
+            Ok(_) => {
+                if blob.starts_with(label) {
+                    scan.label_verified = true;
+                }
+            }
+            Err(Error::AppBound) => {
+                scan.protected.insert(*id);
+            }
+            Err(Error::WrongBrowserPassword) | Err(Error::Corrupt(_)) | Err(Error::Refused(_)) => {
+                scan.dead.insert(*id);
+                scan.protected.insert(*id);
+                scan.preserved_undecryptable += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(scan)
+}
+
+fn verify_write_key(keys: &Keys, prefix: Option<LinuxPrefix>, scan: &TargetScan) -> Result<()> {
+    if scan.label_verified {
+        return Ok(());
+    }
+    if scan.label_rows == 0 {
         // No row to check against: an empty store is the fresh-browser case.
         // Trust the key only when it came from this browser's unlocked v2
         // keyring item; a fallback key must never seed v11 rows.
-        let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
-        if !trusted {
-            return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
+        if prefix == Some(LinuxPrefix::V11) {
+            let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
+            if !trusted {
+                return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
+            }
         }
+        return Ok(());
+    }
+    // Rows carry the write label but none of them opens with our key. A
+    // fallback key proves nothing, so it still refuses; a key from the
+    // browser's own keyring item means those rows were written under a
+    // rotated-away key, and they are simply left untouched.
+    let lock = match keys {
+        Keys::Cbc { lock, .. } | Keys::Gcm { lock } => lock,
+    };
+    if lock.v11_key_is_fallback() {
+        return Err(Error::WrongBrowserPassword);
     }
     Ok(())
 }
@@ -332,8 +427,12 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
     }
     let tx = con.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let prefix = resolve_write_prefix(&tx, keys)?;
+    let mut protected: std::collections::HashSet<i64> = std::collections::HashSet::new();
     if !incoming.is_empty() {
-        verify_write_key(&tx, keys, prefix)?;
+        let scan = scan_target(&tx, keys, prefix)?;
+        verify_write_key(keys, prefix, &scan)?;
+        stats.preserved_undecryptable = scan.preserved_undecryptable;
+        protected = scan.protected;
     }
     let has = |c: &str| cols.iter().any(|x| x == c);
 
@@ -363,6 +462,31 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql)?;
         drop(st);
+
+        // Rows we cannot read (a rotated-away key, or App-Bound) are not
+        // update candidates: the existing row wins and stays byte-for-byte,
+        // exactly as the cookie store treats them, so the merge below only
+        // ever measures the incoming login against readable rows. If every
+        // row for this identity is unreadable, the visible fields decide
+        // without a read: the untouchable row wins a strict contest either
+        // way, and only a full tie hands the rows back to the read-based
+        // verdict, which refuses when a row will not unlock.
+        let had_rows = !rows.is_empty();
+        let (protected_rows, mut rows): (Vec<Local>, Vec<Local>) =
+            rows.into_iter().partition(|r| protected.contains(&r.id));
+        if rows.is_empty() && had_rows {
+            let top = protected_rows
+                .iter()
+                .map(Local::key)
+                .max()
+                .ok_or_else(|| Error::Corrupt("login merge was called with no local rows".into()))?;
+            let inc = (l.date_password_modified, l.date_created, l.date_last_used, l.times_used, l.action_url.as_str(), l.signon_realm.as_str());
+            if inc != top {
+                stats.skipped += 1;
+                continue;
+            }
+            rows = protected_rows;
+        }
 
         let blob = lock_value(keys, l, tag, prefix)?;
         let int = SqlValue::Integer;
@@ -583,13 +707,60 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_login_row_does_not_abort_the_import() {
+        // The target holds one login written under a rotated-away key. The
+        // browser's current key must land the import anyway; the dead row
+        // is never touched (this import only inserts and updates by
+        // identity, and the incoming login has a different one).
+        let (_t, p) = db();
+        let rotated = Lock::linux("rotated-away", LinuxPrefix::V11);
+        let seed = rotated.encrypt("example.com", "seed", HostTag::Without).unwrap();
+        Connection::open(&p).unwrap().execute(
+            "INSERT INTO logins (origin_url,username_value,password_value,date_created,date_last_used,date_password_modified,signon_realm,times_used) VALUES (?1,'seed',?2,1,1,1,?3,0)",
+            (ORIGIN, &seed, REALM)).unwrap();
+        let current = Keys::Cbc { lock: Lock::linux("current-secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        import(&p, &[login("new", "value", D2)], &current, HostTag::Without).unwrap();
+        let now: Vec<u8> = Connection::open(&p).unwrap()
+            .query_row("SELECT password_value FROM logins WHERE username_value='seed'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(now, seed);
+    }
+
+    #[test]
+    fn a_newer_incoming_login_never_overwrites_an_unreadable_target_row() {
+        // The target holds one login under an older key; a newer incoming
+        // login with the same origin and username must not UPDATE over it.
+        // The unreadable row wins, its ciphertext stays byte-identical,
+        // and it is counted as preserved, not updated.
+        let (_t, p) = db();
+        let old_lock = Lock::linux("old-secret", LinuxPrefix::V11);
+        let seed = old_lock
+            .encrypt(&login_prefix_host(ORIGIN, REALM), "old-pw", HostTag::Without)
+            .unwrap();
+        Connection::open(&p).unwrap().execute(
+            "INSERT INTO logins (origin_url,username_value,password_value,date_created,date_last_used,date_password_modified,signon_realm,times_used) VALUES (?1,'u',?2,1,1,1,?3,0)",
+            (ORIGIN, &seed, REALM)).unwrap();
+        // The row is a live login under the old key, not garbage.
+        let old_keys = Keys::Cbc { lock: old_lock, from_libsecret_v2: false };
+        let before = export(&p, &old_keys).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].password_value, "old-pw");
+        let current = Keys::Cbc { lock: Lock::linux("new-secret", LinuxPrefix::V11), from_libsecret_v2: false };
+        let stats = import(&p, &[login("u", "new-pw", D2)], &current, HostTag::Without).unwrap();
+        assert_eq!(stats, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 1 });
+        assert_eq!(count(&p), 1);
+        assert_eq!(blob(&p, "u"), seed);
+    }
+
+    #[test]
     fn empty_v11_store_refuses_a_fallback_key() {
         let (_t, p) = db();
         let con = Connection::open(&p).unwrap();
         let fallback = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
-        assert!(verify_write_key(&con, &fallback, Some(LinuxPrefix::V11)).is_err());
+        let scan = scan_target(&con, &fallback, Some(LinuxPrefix::V11)).unwrap();
+        assert!(verify_write_key(&fallback, Some(LinuxPrefix::V11), &scan).is_err());
         let v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: true };
-        assert!(verify_write_key(&con, &v2, Some(LinuxPrefix::V11)).is_ok());
+        assert!(verify_write_key(&v2, Some(LinuxPrefix::V11), &scan).is_ok());
     }
 
     #[test]
@@ -733,7 +904,7 @@ mod tests {
         for tag in [HostTag::Without, HostTag::With] {
             let (_t, p) = db();
             let s = import(&p, &[login("u", "dummy-pw", D1)], &linux(), tag).unwrap();
-            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0 });
+            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0, preserved_undecryptable: 0 });
             let back = export(&p, &linux()).unwrap();
             assert_eq!(back, vec![login("u", "dummy-pw", D1)]);
             let raw = blob(&p, "u");
@@ -795,7 +966,7 @@ mod tests {
         let (_t, p) = db();
         import(&p, &[login("u", "new", D2)], &linux(), HostTag::Without).unwrap();
         let s = import(&p, &[login("u", "old", D1)], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 0 });
         assert_eq!(export(&p, &linux()).unwrap()[0].password_value, "new");
     }
 
@@ -838,7 +1009,7 @@ mod tests {
         assert_eq!(export(&p1, &linux()).unwrap(), export(&p2, &linux()).unwrap());
         assert_eq!(export(&p1, &linux()).unwrap()[0].password_value, "bravo");
         let s = import(&p1, &[y], &linux(), HostTag::With).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 0 });
     }
 
     #[test]
@@ -886,8 +1057,8 @@ mod tests {
         import(&p, &[login("keep", "pw", D1)], &Keys::Cbc { lock: Lock::mac("correct"), from_libsecret_v2: false }, HostTag::Without).unwrap();
         let before = std::fs::read(&p).unwrap();
         let wrong = Keys::Cbc { lock: Lock::mac("wrong"), from_libsecret_v2: false };
-        // Export refuses.
-        assert_eq!(export(&p, &wrong).unwrap_err(), Error::WrongBrowserPassword);
+        // Export skips rows that will not unlock instead of failing the whole read.
+        assert_eq!(export(&p, &wrong).unwrap().len(), 0);
         // A full tie forces a read of the local value: refused, and the earlier new row rolls back.
         let batch = [login("brand-new", "x", D1), login("keep", "pw", D1)];
         assert_eq!(import(&p, &batch, &wrong, HostTag::Without).unwrap_err(), Error::WrongBrowserPassword);
@@ -1036,7 +1207,7 @@ mod tests {
         let mut l = login("", "pw", D2);
         l.action_url = String::new();
         let s = import(&p, &[l], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0, preserved_undecryptable: 0 });
         assert_eq!(count(&p), 1);
     }
 

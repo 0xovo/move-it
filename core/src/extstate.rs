@@ -262,8 +262,14 @@ pub fn target_dirs_in(profile: &Path, slot: &str, ext_manifest: &Value, files: &
         .collect())
 }
 
-/// Refuse a symlink at `default/<folder>` or at the target itself.
+/// Refuse a symlink at the slot folder itself, at `default/<folder>`, or at
+/// the target itself.
 fn check_way(default: &Path, folder: &str, target: &Path) -> Result<()> {
+    if let Some(m) = meta(default)? {
+        if m.file_type().is_symlink() {
+            return Err(refuse_link(default));
+        }
+    }
     let mut p = default.to_path_buf();
     for seg in folder.split('/') {
         p.push(seg);
@@ -476,6 +482,12 @@ mod tests {
         symlink(outside.path(), t2.path().join("Default/Local Extension Settings")).unwrap();
         assert!(matches!(import(t2.path(), &m, &files), Err(Error::Refused(_))));
         assert!(!outside.path().join(ID_A).exists());
+        // the slot folder itself as a link redirects every state folder at once
+        let t3 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("Local Extension Settings")).unwrap();
+        symlink(outside.path(), t3.path().join("Default")).unwrap();
+        assert!(matches!(import(t3.path(), &m, &files), Err(Error::Refused(_))));
+        assert!(!outside.path().join(format!("Local Extension Settings/{ID_A}")).exists());
     }
 
     #[test]

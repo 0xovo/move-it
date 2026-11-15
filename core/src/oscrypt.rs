@@ -8,7 +8,9 @@
 //!   `v11`) is dead: live proof on Chrome 156 and Brave 1.98 showed both writing `v10` in
 //!   non-default dirs, so the folder location no longer proves anything.
 //! - Windows: `v10` + AES-256-GCM with the DPAPI-unwrapped master key from Local State.
-//!   `v20` (App-Bound) is refused, never guessed.
+//!   `v20` (App-Bound) is refused, never guessed. On Linux, `v10` is Posix, `v11` is
+//!   Freedesktop Secret, `v12` is portal-decrypt-only; `v20` is Windows App-Bound
+//!   wherever it appears and is refused, never guessed.
 //!
 //! Cookies (Cookies db meta version >= 24) put SHA256(host_key) in front of the plaintext.
 //! Saved logins do NOT, as far as Chromium's LoginDatabase goes; the Python prototype adds it.
@@ -93,7 +95,17 @@ impl LinuxBrowser {
 /// or otherwise unusable keyrings still fail, and a fallback key never seeds v11
 /// writes (see `verify_write_key` in cookies.rs and logins.rs).
 pub fn linux_browser_password_for(browser: LinuxBrowser) -> Result<(String, bool)> {
-    linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), &secret_service_lookup)
+    linux_browser_password_for_at(browser, None)
+}
+
+/// Like [`linux_browser_password_for`], with optional context from the profile
+/// install root (Flatpak under `~/.var/app/<id>/config/...`).
+pub fn linux_browser_password_for_at(
+    browser: LinuxBrowser,
+    install_root: Option<&std::path::Path>,
+) -> Result<(String, bool)> {
+    let lookup = &|attrs: &[(&str, &str)]| secret_service_lookup(attrs);
+    linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), lookup, install_root)
 }
 
 /// The ordering logic of [`linux_browser_password_for`], with the browser, the
@@ -103,13 +115,22 @@ fn linux_browser_password_from(
     browser: LinuxBrowser,
     env: Option<String>,
     lookup: &dyn Fn(&[(&str, &str)]) -> Result<Option<String>>,
+    install_root: Option<&std::path::Path>,
 ) -> Result<(String, bool)> {
     if let Some(pw) = env {
         if !pw.is_empty() {
             return Ok((pw, false));
         }
     }
+    if let Some(root) = install_root {
+        if let Some(_app_id) = flatpak_app_id_from_install(root) {
+            // Flatpak browsers keep a host Secret Service item for the portal; when
+            // that is locked away we still notice the sandbox layout below.
+            let _flatpak_keyrings = flatpak_keyrings_dir(_app_id);
+        }
+    }
     let app = browser.keyring_app();
+    let label = browser.keyring_label();
     // The v2-schema item first: it is the one a current browser actually uses, and its
     // provenance decides the write label for an empty store.
     if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)])? {
@@ -118,7 +139,69 @@ fn linux_browser_password_from(
     if let Some(pw) = lookup(&[("application", app)])? {
         return Ok((pw, false));
     }
+    if let Some(pw) = lookup(&[("label", label)])? {
+        return Ok((pw, true));
+    }
     Ok((LINUX_FALLBACK_PASSWORD.to_string(), false))
+}
+
+/// Flatpak app id when `install_root` lives under `~/.var/app/<id>/config/`.
+pub fn flatpak_app_id_from_install(install_root: &std::path::Path) -> Option<&'static str> {
+    use std::path::Component;
+    let comps: Vec<_> = install_root
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    for (i, c) in comps.iter().enumerate() {
+        if c.as_ref() == ".var" && comps.get(i + 1).map(|x| x.as_ref()) == Some("app") {
+            let id = comps.get(i + 2)?;
+            return match id.as_ref() {
+                "com.brave.Browser" => Some("com.brave.Browser"),
+                "com.google.Chrome" => Some("com.google.Chrome"),
+                "org.chromium.Chromium" => Some("org.chromium.Chromium"),
+                "io.github.ungoogled_software.ungoogled_chromium" => {
+                    Some("io.github.ungoogled_software.ungoogled_chromium")
+                }
+                "com.microsoft.Edge" => Some("com.microsoft.Edge"),
+                "com.opera.Opera" => Some("com.opera.Opera"),
+                "com.vivaldi.Vivaldi" => Some("com.vivaldi.Vivaldi"),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn flatpak_keyrings_dir(app_id: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let dir = home.join(".var/app").join(app_id).join("data/keyrings");
+    dir.is_dir().then_some(dir)
+}
+
+impl LinuxBrowser {
+    /// The Secret Service label Chromium stamps on its item (`secret-tool search label …`).
+    pub fn keyring_label(self) -> &'static str {
+        match self {
+            LinuxBrowser::Brave => "Brave Safe Storage",
+            LinuxBrowser::Chrome => "Chrome Safe Storage",
+            LinuxBrowser::Chromium => "Chromium Safe Storage",
+            LinuxBrowser::Edge => "Microsoft Edge Safe Storage",
+            LinuxBrowser::Opera => "Opera Safe Storage",
+        }
+    }
+}
+
+/// App-Bound Encryption (`v20`): Windows-only writer, but the tag means App-Bound on every OS.
+pub fn encryption_is_app_bound(prefix: &[u8]) -> bool {
+    prefix.starts_with(b"v20")
+}
+
+/// Windows Chrome/Edge App-Bound (`v20`); elsewhere the same prefix is not that contract.
+pub fn encryption_is_windows_app_bound(prefix: &[u8]) -> bool {
+    Platform::current() == Platform::Windows && encryption_is_app_bound(prefix)
 }
 
 /// One secret-service lookup over D-Bus, with a timeout so a locked
@@ -257,6 +340,18 @@ impl Lock {
         Lock::Cbc { key: derive(LINUX_FALLBACK_PASSWORD, 1), v11_key: Some(derive(password, 1)), write_prefix }
     }
 
+    /// Whether this lock's v11 key is the compiled-in fallback key. That key
+    /// comes from no keyring item, so it proves nothing about a store's real
+    /// key; a keyring-derived key that matches no live row instead means the
+    /// store's rows were written under a rotated-away password. Mac and
+    /// Windows locks are never the fallback.
+    pub fn v11_key_is_fallback(&self) -> bool {
+        match self {
+            Lock::Cbc { v11_key: Some(k), .. } => *k == derive(LINUX_FALLBACK_PASSWORD, 1),
+            _ => false,
+        }
+    }
+
     pub fn mac(keychain_password: &str) -> Lock {
         Lock::Cbc {
             key: derive(keychain_password, 1003),
@@ -313,6 +408,9 @@ impl Lock {
         let label = data.get(..3).unwrap_or(data);
         let plain = match self {
             Lock::Cbc { key, v11_key, .. } => {
+                if encryption_is_app_bound(label) {
+                    return Err(Error::AppBound);
+                }
                 if label != b"v10" && label != b"v11" {
                     return Err(Error::Refused(format!("value for {host} has unknown prefix {label:?}")));
                 }
@@ -715,22 +813,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the host keyring; run on a live Linux machine"]
+    fn live_linux_brave_password_is_not_the_fallback() {
+        let (pw, from_v2) =
+            linux_browser_password_for(LinuxBrowser::Brave).expect("brave keyring lookup");
+        assert_ne!(pw, LINUX_FALLBACK_PASSWORD, "fell back to peanuts");
+        assert!(from_v2, "expected a chrome_libsecret_os_crypt_password_v2 item");
+    }
+
+    #[test]
     fn discovery_order_env_then_v2_then_app_then_fallback() {
         let none = |_: &[(&str, &str)]| Ok(None);
         // Nothing anywhere: the compiled-in fallback, like Chromium itself.
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &none).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &none, None).unwrap(),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
         // The environment override wins over the keyring and is not a v2 item.
         let v2 = |_: &[(&str, &str)]| Ok(Some("from-keyring".to_string()));
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, Some("from-env".to_string()), &v2).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Brave, Some("from-env".to_string()), &v2, None).unwrap(),
             ("from-env".to_string(), false)
         );
         // An empty override counts as unset ("" means no override).
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, Some(String::new()), &v2).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Brave, Some(String::new()), &v2, None).unwrap(),
             ("from-keyring".to_string(), true)
         );
         // A schema-scoped hit is a v2 item; an application-only hit is not.
@@ -738,7 +845,7 @@ mod tests {
             Ok((attrs.len() == 1).then(|| "app-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &app_only).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &app_only, None).unwrap(),
             ("app-pw".to_string(), false)
         );
         // A Chrome item is found when Chrome is the browser asked for.
@@ -747,7 +854,7 @@ mod tests {
                 .then(|| "chrome-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &chrome_only).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &chrome_only, None).unwrap(),
             ("chrome-pw".to_string(), true)
         );
     }
@@ -759,6 +866,24 @@ mod tests {
             Some(LinuxBrowser::Opera)
         );
         assert_eq!(LinuxBrowser::Opera.keyring_app(), "Opera");
+    }
+
+    #[test]
+    fn flatpak_install_root_is_recognized() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/user".into());
+        let root = std::path::PathBuf::from(home)
+            .join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser");
+        assert_eq!(
+            flatpak_app_id_from_install(&root),
+            Some("com.brave.Browser")
+        );
+    }
+
+    #[test]
+    fn v20_is_app_bound_on_every_platform() {
+        assert!(encryption_is_app_bound(b"v20"));
+        assert!(!encryption_is_app_bound(b"v11"));
+        assert!(!encryption_is_windows_app_bound(b"v20"));
     }
 
     #[test]
@@ -781,11 +906,11 @@ mod tests {
                 }))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Brave, None, &both).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Brave, None, &both, None).unwrap(),
             ("brave-pw".to_string(), true)
         );
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &both).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &both, None).unwrap(),
             ("chrome-pw".to_string(), true)
         );
         // A Brave-only keyring must not serve a Chrome profile: it falls back
@@ -797,7 +922,7 @@ mod tests {
                 .then(|| "brave-pw".to_string()))
         };
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &brave_only, None).unwrap(),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
     }
@@ -809,7 +934,7 @@ mod tests {
         // password layer falls back to peanuts instead of erroring.
         for reason in ["locked", "timeout"] {
             let lookup = |_: &[(&str, &str)]| Err(Error::KeychainUnavailable(reason.into()));
-            assert_eq!(linux_browser_password_from(LinuxBrowser::Chrome, None, &lookup).unwrap_err(),
+            assert_eq!(linux_browser_password_from(LinuxBrowser::Chrome, None, &lookup, None).unwrap_err(),
                 Error::KeychainUnavailable(reason.into()));
         }
     }
@@ -821,7 +946,7 @@ mod tests {
         // An empty store then writes v10; a v11 write still needs a verified key.
         let none = |_: &[(&str, &str)]| Ok(None);
         assert_eq!(
-            linux_browser_password_from(LinuxBrowser::Chrome, None, &none).unwrap(),
+            linux_browser_password_from(LinuxBrowser::Chrome, None, &none, None).unwrap(),
             (LINUX_FALLBACK_PASSWORD.to_string(), false)
         );
     }

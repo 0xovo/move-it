@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::paths::DEFAULT_SLOT;
-use crate::oscrypt::Platform;
+use crate::oscrypt::{Platform, LINUX_PASSWORD_ENV};
 use crate::{Error, Result};
 
 /// One profile inside a browser folder.
@@ -413,18 +413,146 @@ fn browser_display(name: &str) -> String {
         "chrome" => "Google Chrome".to_string(),
         "chromium" => "Chromium".to_string(),
         "edge" => "Microsoft Edge".to_string(),
+        "opera" => "Opera".to_string(),
+        "vivaldi" => "Vivaldi".to_string(),
         other => other.to_string(),
     }
 }
 
+/// Chromium-family browsers in listing order on Linux.
+const LINUX_FAMILY: &[&str] = &["brave", "chrome", "chromium", "edge", "opera"];
+
 /// (short name, folder under the config base) pairs, Linux.
-fn linux_subs() -> [(&'static str, &'static str); 4] {
+fn linux_subs() -> [(&'static str, &'static str); 5] {
     [
         ("brave", "BraveSoftware/Brave-Browser"),
         ("chrome", "google-chrome"),
         ("chromium", "chromium"),
         ("edge", "microsoft-edge"),
+        ("opera", "opera"),
     ]
+}
+
+/// Flatpak app id, browser short name, folder under `config/`.
+const LINUX_FLATPAK: &[(&str, &str, &str)] = &[
+    ("com.brave.Browser", "brave", "BraveSoftware/Brave-Browser"),
+    ("com.google.Chrome", "chrome", "google-chrome"),
+    ("org.chromium.Chromium", "chromium", "chromium"),
+    (
+        "io.github.ungoogled_software.ungoogled_chromium",
+        "chromium",
+        "chromium",
+    ),
+    ("com.microsoft.Edge", "edge", "microsoft-edge"),
+    ("com.vivaldi.Vivaldi", "vivaldi", "vivaldi"),
+    ("com.opera.Opera", "opera", "opera"),
+];
+
+/// Where a Chromium browser keeps its user-data on this machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChromiumInstallRoot {
+    pub browser: String,
+    pub display: String,
+    pub dir: PathBuf,
+}
+
+fn xdg_config_under(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+}
+
+/// Every Chromium install root under `home` / `xdg_config`: native XDG first,
+/// then Flatpak fills browsers that are still missing. The same browser never
+/// appears twice; native wins over Flatpak.
+pub fn linux_chromium_install_roots_at(home: &Path, xdg_config: &Path) -> Vec<ChromiumInstallRoot> {
+    let mut by_name: std::collections::BTreeMap<String, ChromiumInstallRoot> =
+        std::collections::BTreeMap::new();
+    for p in scan(xdg_config, &linux_subs()) {
+        by_name.insert(
+            p.browser.clone(),
+            ChromiumInstallRoot {
+                browser: p.browser,
+                display: p.display,
+                dir: p.dir,
+            },
+        );
+    }
+    let flatpak = std::env::var(LINUX_PASSWORD_ENV)
+        .ok()
+        .is_none_or(|p| p.is_empty());
+    if flatpak {
+    for (app_id, name, sub) in LINUX_FLATPAK {
+        if by_name.contains_key(*name) {
+            continue;
+        }
+        let dir = home.join(".var/app").join(app_id).join("config").join(sub);
+        if dir.join("Default").is_dir() {
+            let mut display = browser_display(name);
+            display.push_str(" (Flatpak)");
+            by_name.insert(
+                (*name).to_string(),
+                ChromiumInstallRoot {
+                    browser: (*name).to_string(),
+                    display,
+                    dir,
+                },
+            );
+        }
+    }
+    }
+    let mut out = Vec::new();
+    for &name in LINUX_FAMILY {
+        if let Some(r) = by_name.remove(name) {
+            out.push(r);
+        }
+    }
+    out.extend(by_name.into_values());
+    out
+}
+
+/// Chromium install roots on this Linux host. `native_base` overrides the XDG
+/// config folder (harness fixtures); Flatpak is still read from `$HOME`.
+pub fn linux_chromium_install_roots(native_base: Option<&Path>) -> Vec<ChromiumInstallRoot> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let xdg = native_base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| xdg_config_under(&home));
+    linux_chromium_install_roots_at(&home, &xdg)
+}
+
+/// Directories that hold Firefox `profiles.ini` (any known Linux layout).
+pub fn linux_firefox_profile_homes_at(home: &Path, xdg_config: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in [
+        xdg_config.join("mozilla/firefox"),
+        home.join(".mozilla/firefox"),
+        home.join(".var/app/org.mozilla.firefox/.mozilla/firefox"),
+        home.join(".var/app/org.mozilla.firefox/config/mozilla/firefox"),
+    ] {
+        if !dir.join("profiles.ini").is_file() {
+            continue;
+        }
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !out.iter().any(|p: &PathBuf| {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == key
+        }) {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+pub fn linux_firefox_profile_homes(native_base: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let xdg = native_base
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| xdg_config_under(&home));
+    linux_firefox_profile_homes_at(&home, &xdg)
 }
 
 /// (short name, folder under `~/Library/Application Support`) pairs, macOS.
@@ -485,15 +613,14 @@ fn scan(base: &Path, subs: &[(&str, &str)]) -> Vec<DetectedProfile> {
 /// detection yet, so the caller names the profile folder itself.
 pub fn detect_profiles() -> Vec<DetectedProfile> {
     match Platform::current() {
-        Platform::Linux => {
-            let base = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-            match base {
-                Some(base) => scan(&base, &linux_subs()),
-                None => Vec::new(),
-            }
-        }
+        Platform::Linux => linux_chromium_install_roots(None)
+            .into_iter()
+            .map(|r| DetectedProfile {
+                browser: r.browser,
+                display: r.display,
+                dir: r.dir,
+            })
+            .collect(),
         Platform::Mac => {
             match std::env::var_os("HOME") {
                 Some(h) => scan(
@@ -589,5 +716,94 @@ mod detection_tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(scan(tmp.path(), &mac_subs()).is_empty());
         assert!(scan(tmp.path(), &linux_subs()).is_empty());
+    }
+
+    #[test]
+    fn linux_flatpak_brave_without_native_xdg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        std::fs::create_dir_all(
+            home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser/Default"),
+        )
+        .unwrap();
+        let found = linux_chromium_install_roots_at(home, &xdg);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].browser, "brave");
+        assert_eq!(found[0].display, "Brave (Flatpak)");
+    }
+
+    #[test]
+    fn linux_native_brave_wins_over_flatpak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        plant(&xdg, "BraveSoftware/Brave-Browser", true);
+        std::fs::create_dir_all(
+            home.join(".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser/Default"),
+        )
+        .unwrap();
+        let found = linux_chromium_install_roots_at(home, &xdg);
+        assert_eq!(found.iter().filter(|r| r.browser == "brave").count(), 1);
+        assert_eq!(found[0].display, "Brave");
+        assert_eq!(found[0].dir, xdg.join("BraveSoftware/Brave-Browser"));
+    }
+
+    #[test]
+    fn linux_ungoogled_chromium_flatpak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        std::fs::create_dir_all(
+            home.join(".var/app/io.github.ungoogled_software.ungoogled_chromium/config/chromium/Default"),
+        )
+        .unwrap();
+        let found = linux_chromium_install_roots_at(home, &xdg);
+        assert!(found.iter().any(|r| r.browser == "chromium" && r.display.contains("Flatpak")));
+    }
+
+    #[test]
+    fn linux_firefox_profile_ini_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        let ff = xdg.join("mozilla/firefox");
+        std::fs::create_dir_all(&ff).unwrap();
+        std::fs::write(ff.join("profiles.ini"), "[General]\nStartWithLastProfile=1\n").unwrap();
+        let legacy = home.join(".mozilla/firefox");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("profiles.ini"), "[General]\n").unwrap();
+        let found = linux_firefox_profile_homes_at(home, &xdg);
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&ff));
+        assert!(found.contains(&legacy));
+    }
+
+    #[test]
+    fn linux_firefox_flatpak_profile_ini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        let ff = home.join(".var/app/org.mozilla.firefox/config/mozilla/firefox");
+        std::fs::create_dir_all(&ff).unwrap();
+        std::fs::write(ff.join("profiles.ini"), "[General]\n").unwrap();
+        let found = linux_firefox_profile_homes_at(home, &xdg);
+        assert_eq!(found, vec![ff]);
+    }
+
+    #[test]
+    fn linux_firefox_profiles_ini_relative_paths_are_under_the_ini_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        let ini_dir = xdg.join("mozilla/firefox");
+        std::fs::create_dir_all(ini_dir.join("abc.default")).unwrap();
+        std::fs::write(
+            ini_dir.join("profiles.ini"),
+            "[Profile0]\nName=default\nIsRelative=1\nPath=abc.default\n",
+        )
+        .unwrap();
+        assert!(ini_dir.join("abc.default").is_dir());
+        assert!(linux_firefox_profile_homes_at(home, &xdg).contains(&ini_dir));
     }
 }

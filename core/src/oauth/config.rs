@@ -148,14 +148,45 @@ pub fn load_oauth_file(path: &Path) -> Result<OAuthFile> {
             Error::Io(e.to_string())
         }
     })?;
-    let file: OAuthFile = serde_json::from_slice(&bytes)
+    let mut file: OAuthFile = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Corrupt(format!("provider config is not valid: {e}")))?;
+    normalize_flow(&mut file);
     validate(&file)?;
     Ok(file)
 }
 
+/// "pkce+loopback" is the spelling used in the setup notes; it is the same flow as "pkce".
+fn normalize_flow(file: &mut OAuthFile) {
+    if let Some(d) = file.dropbox.as_mut() {
+        if d.flow == "pkce+loopback" {
+            d.flow = "pkce".into();
+        }
+    }
+    if let Some(g) = file.google.as_mut() {
+        if g.flow == "pkce+loopback" {
+            g.flow = "pkce".into();
+        }
+    }
+}
+
+/// The built-in Google client file always sits next to oauth.json; keep only its file name.
+fn builtin_client_file_name(file: &mut OAuthFile) {
+    if let Some(g) = file.google.as_mut() {
+        let base = g
+            .client_file
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if !base.is_empty() && base != ".." {
+            g.client_file = base;
+        }
+    }
+}
+
 pub fn load_builtin_oauth() -> Result<OAuthFile> {
-    let file = load_oauth_file(&builtin_oauth_path())?;
+    let mut file = load_oauth_file(&builtin_oauth_path())?;
+    builtin_client_file_name(&mut file);
     if is_placeholder_oauth(&file) && !cfg!(any(debug_assertions, test)) {
         return Err(Error::Refused(
             "provider sign-in is not configured on this build".into(),
@@ -281,6 +312,23 @@ mod tests {
       "dropbox": {"app_key":"test-dropbox-key","flow":"pkce","scopes":["files.metadata.read","files.content.read","files.content.write"],"access":"app_folder"},
       "google": {"client_id":"test-google-id","client_file":"google-client.json","flow":"pkce","scopes":["https://www.googleapis.com/auth/drive.file"]}
     }"#;
+
+    #[test]
+    fn accepts_setup_notes_spelling_and_path_client_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oauth.json");
+        std::fs::write(
+            &path,
+            br#"{"dropbox":{"app_key":"k","flow":"pkce+loopback","scopes":["files.content.read"],"access":"app_folder"},
+                "google":{"client_id":"id.apps.googleusercontent.com","client_file":"~/.config/moveit/google-client.json","flow":"pkce+loopback","scopes":["https://www.googleapis.com/auth/drive.file"]}}"#,
+        )
+        .unwrap();
+        let mut file = super::load_oauth_file(&path).expect("setup-notes spelling loads");
+        assert_eq!(file.google.as_ref().unwrap().flow, "pkce");
+        assert_eq!(file.dropbox.as_ref().unwrap().flow, "pkce");
+        super::builtin_client_file_name(&mut file);
+        assert_eq!(file.google.as_ref().unwrap().client_file, "google-client.json");
+    }
 
     #[test]
     fn validates_fixture_shape() {

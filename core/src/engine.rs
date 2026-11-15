@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use crate::cookies::{self, Cookie, Keys};
 use crate::oscrypt::HostTag;
 use crate::sealed::{Payload, BUNDLE_VERSION_2};
-use crate::{bookmarks, extstate, history, localstorage, logins, paths, profiles, txn};
+use crate::{bookmarks, extinstall, extstate, history, localstorage, logins, paths, profiles, txn};
 use crate::{Error, Result};
 
 /// A profile on this machine: a browser folder (`dir`) and the slot inside it.
@@ -28,30 +28,74 @@ pub struct Profile<'a> {
     pub keys: &'a Keys,
     /// Logins: whether to write SHA256(host) in front (see oscrypt). Default: Without.
     pub login_tag: HostTag,
+    /// Target browser short name (`chrome`, `brave`, …) for extension registration.
+    pub browser: &'a str,
+    /// Human label for progress and extension install messages.
+    pub display: &'a str,
+}
+
+/// Valid `kinds` filter names for a partial move.
+pub const MOVE_KINDS: &[&str] = &["passwords", "cookies", "bookmarks", "history", "extensions"];
+
+fn wants_kind(kinds: Option<&[String]>, name: &str) -> bool {
+    match kinds {
+        None | Some([]) => true,
+        Some(list) => list.iter().any(|k| k == name),
+    }
 }
 
 /// Read everything movable out of a profile and build a v2 payload.
-pub fn export(p: &Profile, origin: &str) -> Result<Payload> {
-    let cookies = cookies::export(&paths::cookies_in(p.dir, p.slot), p.keys)?;
-    let (logins, skipped_logins) = logins::export_counted(&paths::login_data_in(p.dir, p.slot), p.keys)?;
-    let hist = history::export(&paths::history_in(p.dir, p.slot))?;
-    let (bm_manifest, bm_bytes) = bookmarks::export(&paths::bookmarks_in(p.dir, p.slot))?;
-    let ext = extstate::collect_in(p.dir, p.slot)?;
-    let ls = localstorage::export_in(p.dir, p.slot)?;
-
+/// When `kinds` is set, only those sections are packed; importers skip missing keys.
+pub fn export(p: &Profile, origin: &str, kinds: Option<&[String]>) -> Result<Payload> {
     let mut m = Map::new();
     m.insert("v".into(), BUNDLE_VERSION_2.into());
     m.insert("origin".into(), origin.into());
-    m.insert("cookies".into(), serde_json::to_value(&cookies).map_err(ser)?);
-    m.insert("passwords".into(), serde_json::to_value(&logins).map_err(ser)?);
-    m.insert("skipped_logins".into(), skipped_logins.into());
-    m.insert("history".into(), serde_json::to_value(&hist).map_err(ser)?);
-    m.insert("bookmarks".into(), serde_json::to_value(&bm_manifest).map_err(ser)?);
-    // The extensions manifest object is built by extstate; carry it through as-is.
-    m.insert("extensions".into(), Value::Object(ext.manifest));
-    m.insert("ext_localstorage".into(), serde_json::to_value(&ls).map_err(ser)?);
+    let mut ext_files = std::collections::BTreeMap::new();
+    let mut ext_bins = std::collections::BTreeMap::new();
+    let mut bm_bytes = None;
+    if wants_kind(kinds, "cookies") {
+        let (cookies, skipped_cookies) = cookies::export_counted(&paths::cookies_in(p.dir, p.slot), p.keys)?;
+        m.insert("cookies".into(), serde_json::to_value(&cookies).map_err(ser)?);
+        m.insert("skipped_cookies".into(), skipped_cookies.into());
+    }
+    if wants_kind(kinds, "passwords") {
+        let (logins, skipped_logins) =
+            logins::export_counted(&paths::login_data_in(p.dir, p.slot), p.keys)?;
+        m.insert("passwords".into(), serde_json::to_value(&logins).map_err(ser)?);
+        m.insert("skipped_logins".into(), skipped_logins.into());
+    }
+    if wants_kind(kinds, "history") {
+        let hist = history::export(&paths::history_in(p.dir, p.slot))?;
+        m.insert("history".into(), serde_json::to_value(&hist).map_err(ser)?);
+    }
+    if wants_kind(kinds, "bookmarks") {
+        let (bm_manifest, bytes) = bookmarks::export(&paths::bookmarks_in(p.dir, p.slot))?;
+        m.insert("bookmarks".into(), serde_json::to_value(&bm_manifest).map_err(ser)?);
+        bm_bytes = bytes;
+    }
+    if wants_kind(kinds, "extensions") {
+        let ext = extstate::collect_in(p.dir, p.slot)?;
+        let ls = localstorage::export_in(p.dir, p.slot)?;
+        let ids: Vec<String> = ext
+            .manifest
+            .get("installed_ids")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let regs = extinstall::collect_registrations_in(p.dir, p.slot, &ids)?;
+        m.insert("extensions".into(), Value::Object(ext.manifest));
+        m.insert("ext_registrations".into(), Value::Object(regs));
+        m.insert("ext_localstorage".into(), serde_json::to_value(&ls).map_err(ser)?);
+        ext_files = ext.files;
+        ext_bins = extinstall::collect_bins_in(p.dir, p.slot)?;
+    }
 
-    Ok(Payload { manifest: m, ext_files: ext.files, bookmarks: bm_bytes })
+    Ok(Payload {
+        manifest: m,
+        ext_files,
+        ext_bins,
+        bookmarks: bm_bytes,
+    })
 }
 
 /// What a box write changed.
@@ -62,6 +106,7 @@ pub struct Applied {
     pub history: Option<history::Stats>,
     pub bookmarks: bookmarks::Report,
     pub extensions: extstate::Stats,
+    pub extension_installs: extinstall::InstallStats,
     pub localstorage: localstorage::Report,
 }
 
@@ -94,6 +139,14 @@ fn decode(payload: &Payload) -> Result<Decoded<'_>> {
 
 /// Apply one decoded box to one slot whose stores are already snapshotted (and, for a
 /// slot the caller just created, already planted empty).
+fn installed_ids(ext_manifest: &Value) -> Vec<String> {
+    ext_manifest
+        .get("installed_ids")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 fn apply_one(
     root: &std::path::Path,
     slot: &str,
@@ -101,6 +154,8 @@ fn apply_one(
     keys: &Keys,
     login_tag: HostTag,
     now_us: i64,
+    browser: &str,
+    display: &str,
 ) -> Result<Applied> {
     let cookies_p = paths::cookies_in(root, slot);
     let history_p = paths::history_in(root, slot);
@@ -119,16 +174,33 @@ fn apply_one(
         }
         profiles::create_empty_stores(&paths::slot_dir(root, slot))?;
     }
-    if cookies_p.exists() {
+    let m = &d.payload.manifest;
+    if m.contains_key("cookies") && cookies_p.exists() {
         a.cookies = cookies::import(&cookies_p, &d.cookies, keys)?;
     }
-    if logins_p.exists() {
+    if m.contains_key("passwords") && logins_p.exists() {
         a.logins = logins::import(&logins_p, &d.logins, keys, login_tag)?;
     }
-    a.history = history::import(&history_p, &d.history)?;
-    a.bookmarks = bookmarks::import(&bookmarks_p, &d.bm_manifest, d.payload.bookmarks.as_deref())?;
-    a.extensions = extstate::import_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?;
-    a.localstorage = localstorage::import_in(root, slot, &d.localstorage, now_us)?;
+    if m.contains_key("history") {
+        a.history = history::import(&history_p, &d.history)?;
+    }
+    if m.contains_key("bookmarks") {
+        a.bookmarks = bookmarks::import(&bookmarks_p, &d.bm_manifest, d.payload.bookmarks.as_deref())?;
+    }
+    if m.contains_key("extensions") {
+        a.extensions = extstate::import_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?;
+        a.localstorage = localstorage::import_in(root, slot, &d.localstorage, now_us)?;
+        let ids = installed_ids(&d.ext_manifest);
+        let regs = d
+            .payload
+            .manifest
+            .get("ext_registrations")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        a.extension_installs =
+            extinstall::install_in(root, slot, browser, display, &ids, &d.payload.ext_bins, &regs)?;
+    }
     Ok(a)
 }
 
@@ -148,25 +220,48 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
     let empty = Value::Object(Map::new());
     let ext_manifest = m.get("extensions").unwrap_or(&empty);
 
-    // Every store the box would touch, snapshotted together.
+  // Every store the box would touch, snapshotted together.
     let cookies_p = paths::cookies_in(p.dir, p.slot);
     let history_p = paths::history_in(p.dir, p.slot);
     let logins_p = paths::login_data_in(p.dir, p.slot);
     let bookmarks_p = paths::bookmarks_in(p.dir, p.slot);
     let ls_p = localstorage::store_path_in(p.dir, p.slot)?;
-    let ext_dirs = extstate::target_dirs_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
+    let ext_dirs = if m.contains_key("extensions") {
+        let mut dirs = extstate::target_dirs_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
+        dirs.extend(extinstall::target_paths(
+            p.dir,
+            p.slot,
+            &installed_ids(ext_manifest),
+            &box_payload.ext_bins,
+        ));
+        dirs
+    } else {
+        Vec::new()
+    };
 
-    let mut stores: Vec<(String, PathBuf)> = vec![
-        ("cookies".into(), cookies_p.clone()),
-        ("history".into(), history_p.clone()),
-        ("logins".into(), logins_p.clone()),
-        ("bookmarks".into(), bookmarks_p.clone()),
-    ];
-    if let Some(ref lp) = ls_p {
-        stores.push(("localstorage".into(), lp.clone()));
+    let mut stores: Vec<(String, PathBuf)> = Vec::new();
+    if m.contains_key("cookies") {
+        stores.push(("cookies".into(), cookies_p.clone()));
     }
-    for (i, d) in ext_dirs.iter().enumerate() {
-        stores.push((format!("ext{i}"), d.clone()));
+    if m.contains_key("history") {
+        stores.push(("history".into(), history_p.clone()));
+    }
+    if m.contains_key("passwords") {
+        stores.push(("logins".into(), logins_p.clone()));
+    }
+    if m.contains_key("bookmarks") {
+        stores.push(("bookmarks".into(), bookmarks_p.clone()));
+    }
+    if m.contains_key("extensions") {
+        if let Some(ref lp) = ls_p {
+            stores.push(("localstorage".into(), lp.clone()));
+        }
+        for (name, path) in extinstall::registration_store_paths(p.dir, p.slot).into_iter().enumerate() {
+            stores.push((if name == 0 { "extprefs".into() } else { "extsecureprefs".into() }, path));
+        }
+        for (i, d) in ext_dirs.iter().enumerate() {
+            stores.push((format!("ext{i}"), d.clone()));
+        }
     }
     let store_refs: Vec<(&str, &std::path::Path)> = stores.iter().map(|(n, p)| (n.as_str(), p.as_path())).collect();
 
@@ -178,7 +273,11 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
         // planted by the caller. An existing never-launched profile must not
         // be planted into: refuse. A partial profile (one store already there)
         // still gets the other empty store so a section is not silently dropped.
-        if (!cookies_p.exists() && !cookies_in.is_empty()) || (!logins_p.exists() && !logins_in.is_empty()) {
+        let need_cookies = m.contains_key("cookies");
+        let need_logins = m.contains_key("passwords");
+        if (need_cookies && !cookies_p.exists() && !cookies_in.is_empty())
+            || (need_logins && !logins_p.exists() && !logins_in.is_empty())
+        {
             if paths::never_launched(p.dir, p.slot) {
                 return Err(Error::NeverLaunched {
                     browser: "the browser".into(),
@@ -186,16 +285,32 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
             }
             profiles::create_empty_stores(&paths::slot_dir(p.dir, p.slot))?;
         }
-        if cookies_p.exists() {
+        if need_cookies && cookies_p.exists() {
             a.cookies = cookies::import(&cookies_p, &cookies_in, p.keys)?;
         }
-        if logins_p.exists() {
+        if need_logins && logins_p.exists() {
             a.logins = logins::import(&logins_p, &logins_in, p.keys, p.login_tag)?;
         }
-        a.history = history::import(&history_p, &hist_in)?;
-        a.bookmarks = bookmarks::import(&bookmarks_p, &bm_manifest, box_payload.bookmarks.as_deref())?;
-        a.extensions = extstate::import_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
-        a.localstorage = localstorage::import_in(p.dir, p.slot, &ls_in, now_us)?;
+        if m.contains_key("history") {
+            a.history = history::import(&history_p, &hist_in)?;
+        }
+        if m.contains_key("bookmarks") {
+            a.bookmarks = bookmarks::import(&bookmarks_p, &bm_manifest, box_payload.bookmarks.as_deref())?;
+        }
+        if m.contains_key("extensions") {
+            a.extensions = extstate::import_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
+            a.localstorage = localstorage::import_in(p.dir, p.slot, &ls_in, now_us)?;
+            let ids = installed_ids(ext_manifest);
+            let display = if p.display.is_empty() { "the browser" } else { p.display };
+            let browser = if p.browser.is_empty() { "chrome" } else { p.browser };
+            let regs = m
+                .get("ext_registrations")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            a.extension_installs =
+                extinstall::install_in(p.dir, p.slot, browser, display, &ids, &box_payload.ext_bins, &regs)?;
+        }
         Ok(a)
     })();
     match applied {
@@ -256,8 +371,10 @@ pub fn import_many(
     login_tag: HostTag,
     jobs: &[Job],
     now_us: i64,
+    browser: &str,
+    display: &str,
 ) -> Result<Vec<Landed>> {
-    import_many_preserving(root, keys, login_tag, jobs, now_us, None)
+    import_many_preserving(root, keys, login_tag, jobs, now_us, None, browser, display)
 }
 
 pub(crate) fn import_many_preserving(
@@ -267,6 +384,8 @@ pub(crate) fn import_many_preserving(
     jobs: &[Job],
     now_us: i64,
     previous: Option<&str>,
+    browser: &str,
+    display: &str,
 ) -> Result<Vec<Landed>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -361,8 +480,27 @@ pub(crate) fn import_many_preserving(
             stores.push((format!("localstorage{i}"), lp));
         }
         let d = &decoded[i];
-        for (j, dir) in extstate::target_dirs_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?.into_iter().enumerate() {
+        let mut ext_t = extstate::target_dirs_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?;
+        ext_t.extend(extinstall::target_paths(
+            root,
+            slot,
+            &installed_ids(&d.ext_manifest),
+            &d.payload.ext_bins,
+        ));
+        for (j, dir) in ext_t.into_iter().enumerate() {
             stores.push((format!("ext{i}_{j}"), dir));
+        }
+        if d.payload.manifest.contains_key("extensions") {
+            for (name, path) in extinstall::registration_store_paths(root, slot).into_iter().enumerate() {
+                stores.push((
+                    if name == 0 {
+                        format!("extprefs{i}")
+                    } else {
+                        format!("extsecureprefs{i}")
+                    },
+                    path,
+                ));
+            }
         }
     }
     let store_refs: Vec<(&str, &std::path::Path)> = stores.iter().map(|(n, p)| (n.as_str(), p.as_path())).collect();
@@ -424,7 +562,7 @@ pub(crate) fn import_many_preserving(
         }
         let mut out = Vec::new();
         for (i, d) in decoded.iter().enumerate() {
-            let applied = apply_one(root, &slots[i], d, keys, login_tag, now_us)?;
+            let applied = apply_one(root, &slots[i], d, keys, login_tag, now_us, browser, display)?;
             out.push(Landed { slot: slots[i].clone(), created: created[i], applied });
         }
         Ok(out)
@@ -459,7 +597,7 @@ fn from_section<T: serde::de::DeserializeOwned>(m: &Map<String, Value>, key: &st
 
 /// Convenience for a round trip test or a real sync: seal into bytes / open from bytes.
 pub fn seal_box(p: &Profile, origin: &str, key: &crate::sealed::SyncKey) -> Result<Vec<u8>> {
-    let payload = export(p, origin)?;
+    let payload = export(p, origin, None)?;
     let env = crate::sealed::seal(&payload, key)?;
     serde_json::to_vec(&env).map_err(ser)
 }

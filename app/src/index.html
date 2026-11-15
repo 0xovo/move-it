@@ -17,38 +17,68 @@
   <section id="welcome" class="state" hidden>
     <div class="stage"><div class="lemur" data-mode="show"></div></div>
     <h1 class="title">Your whole browser,<br>on every device.</h1>
-    <p class="sub">Bring your supported browser data with you.</p>
-    <div class="actions"><button class="btn btn-primary" id="start">Get started</button><button class="btn btn-quiet" data-nav="local">Move on this device</button></div>
+    <p class="sub">Pick how you want to move your browser data.</p>
+    <div class="choice-stack">
+      <button class="btn btn-primary choice" type="button" id="start-cross"><span class="choice-title">Move to another computer</span><span class="choice-sub">Pair two devices and send your profiles through shared storage.</span></button>
+      <button class="btn btn-quiet choice" type="button" id="start-local"><span class="choice-title">Move between browsers on this computer</span><span class="choice-sub">Copy profiles from one browser to another on this device.</span></button>
+    </div>
   </section>
   <section id="home" class="state" hidden>
     <div class="stage"><div class="lemur" data-mode="still"></div></div>
     <h1 class="title" id="home-title">Your browser, ready to go</h1>
-    <p class="sub" id="last-sync"></p><p class="hint" id="device"></p>
-    <div class="actions"><button class="btn btn-primary" id="preview-button">Move It</button><button class="btn btn-quiet" id="undo" disabled>Undo last move</button></div>
-    <nav class="home-nav"><button class="link" id="pair-button">Pair a device</button><button class="link" data-nav="local">Move on this device</button><button class="link" data-nav="logs">Logs</button><button class="link" data-nav="pipe">Change folder</button></nav>
+    <p class="sub" id="home-sub"></p>
+    <p class="hint" id="last-sync"></p>
+    <div class="actions home-primary"><button class="btn btn-primary" id="preview-button">Move It</button><button class="btn btn-quiet" id="undo" hidden>Undo last move</button></div>
+    <div class="home-actions" id="home-actions">
+      <button class="btn btn-quiet" type="button" id="pair-button">Pair a device</button>
+      <button class="btn btn-quiet" type="button" data-nav="local">Move on this computer</button>
+      <button class="btn btn-quiet" type="button" data-nav="pipe">Change storage</button>
+      <button class="btn btn-quiet" type="button" data-nav="logs">Logs</button>
+    </div>
     <p class="version" data-version></p>
   </section>
   <section id="pipe" class="state" hidden>
-    <h1 class="title at-top">Where should Move It keep your sealed box?</h1><p class="sub">Choose a folder already shared between your devices.</p>
-    <div class="options" id="pipe-options" role="radiogroup" aria-label="Shared folder"></div>
-    <p class="hint" id="pipe-path"></p><div class="spacer"></div>
-    <div class="actions"><button class="btn btn-primary" id="use-pipe" disabled><span>Use this folder</span></button><button class="btn btn-quiet" type="button" id="pipe-sign-in-cancel" hidden>Cancel sign-in</button><button class="btn btn-quiet" type="button" id="pipe-disconnect" hidden>Disconnect</button></div>
-    <p class="note">Sign in with Google Drive or Dropbox to move your sealed box through the provider API. You can also use a folder or git repo on this device. Bring your own OAuth app keys under Advanced if you prefer.</p>
+    <h1 class="title at-top">How should your data travel?</h1>
+    <p class="sub">Move It packs your data into an encrypted file and passes it through a place both computers can reach.</p>
+    <p class="group-label" id="pipe-recommended-label">Recommended</p>
+    <div class="options" id="pipe-recommended" role="radiogroup" aria-labelledby="pipe-recommended-label"></div>
+    <details class="pipe-more" id="pipe-more">
+      <summary>Other options</summary>
+      <div class="options" id="pipe-other" role="radiogroup" aria-label="Other storage options"></div>
+    </details>
+    <p class="hint" id="pipe-path"></p>
+    <p class="hint pipe-folder-alt" id="pipe-folder-alt" hidden></p>
+    <div class="spacer"></div>
+    <div class="actions"><button class="btn btn-primary" id="use-pipe" disabled><span>Use this storage</span></button><button class="btn btn-quiet" type="button" id="pipe-sign-in-cancel" hidden>Cancel sign-in</button><button class="btn btn-quiet" type="button" id="pipe-disconnect" hidden>Disconnect</button></div>
+    <div class="sign-in-link" id="pipe-sign-in-link" hidden><p class="hint" id="pipe-sign-in-link-text">Browser didn't open? Copy this link and open it in your browser.</p><div class="sign-in-link-row"><input class="sign-in-link-url" id="pipe-sign-in-url" type="text" readonly aria-label="Sign-in link" /><button class="btn btn-quiet" type="button" id="pipe-sign-in-copy">Copy link</button></div></div>
+    <p class="note" id="pipe-note">You can sign in with Google Drive or Dropbox, pick a folder on this computer, or use a git repository.</p>
   </section>
   <section id="pair" class="state" hidden>
-    <h1 class="title at-top">Bring your devices together</h1><p class="sub">Use the same shared folder on both devices.</p>
-    <div id="show-code-panel"><div class="card pair-card"><span id="pair-code" class="code"></span></div><p class="hint">Type this code on your other device. It expires in ten minutes.</p><div class="actions"><button class="btn btn-primary" id="check-pair">Check pairing</button><button class="btn btn-quiet" id="have-code">I have a code</button></div></div>
-    <form id="pair-form" hidden><label for="code-input" class="group-label">Code from your other device</label><input class="code-input" id="code-input" inputmode="numeric" autocomplete="off" maxlength="15" required><div class="actions"><button class="btn btn-primary" type="submit">Pair devices</button><button class="btn btn-quiet" type="button" id="show-code">Show a code instead</button></div></form>
+    <h1 class="title at-top">Pair your computers</h1>
+    <p class="sub" id="pair-sub">Both computers must use the same storage.</p>
+    <div id="show-code-panel"><p class="group-label">On this computer: show a code</p><div class="card pair-card"><span id="pair-code" class="code"></span></div><p class="hint">Type this code on your other computer. It expires in ten minutes.</p><p class="group-label">On the other computer: type the code</p><div class="actions"><button class="btn btn-primary" id="check-pair">I typed it on the other computer</button><button class="btn btn-quiet" id="have-code">I have a code instead</button></div></div>
+    <form id="pair-form" hidden><p class="group-label">On the other computer</p><label for="code-input" class="visually-hidden">Pairing code</label><p class="sub">Type the 6-digit code shown on your other computer</p><input class="code-input" id="code-input" inputmode="numeric" autocomplete="off" maxlength="15" required placeholder="000 000"><div class="actions"><button class="btn btn-primary" type="submit">Pair devices</button><button class="btn btn-quiet" type="button" id="show-code">Show a code on this computer</button></div></form>
   </section>
   <section id="preview" class="state" hidden>
-    <h1 class="title at-top">Ready to move</h1><p class="sub" id="preview-target"></p>
-    <div id="profiles"></div><div id="totals" class="card rows"></div>
-    <div id="skipped"></div><p class="note">Keep your browsers closed. Review what cannot move before continuing.</p>
-    <div class="actions"><button class="btn btn-primary" id="move">Move It</button></div>
+    <p class="steps" id="preview-step" hidden><span>Step 2 of 3</span></p>
+    <h1 class="title at-top">Choose what to move</h1>
+    <p class="sub" id="preview-sub"></p>
+    <div class="card route-card" id="route-card" hidden></div>
+    <div id="arriving-section" hidden>
+      <h2 class="section-title" id="arriving-title"></h2>
+      <div id="arriving-profiles"></div>
+    </div>
+    <div class="profiles-head"><h2 class="section-title" id="preview-profiles-title">Profiles on this computer</h2><button class="btn btn-quiet" type="button" id="kinds-all">Set data for all</button></div>
+    <div id="profiles"></div>
+    <div id="skipped"></div>
+    <div id="preview-empty" class="empty-preview" hidden><p class="title">No browsers found on this computer</p><p class="sub">Open a supported browser once so Move It can find its profiles, then come back.</p></div>
+    <div class="actions preview-actions"><button class="btn btn-primary" id="move" disabled>Move</button><button class="btn btn-quiet" type="button" id="preview-back">Back</button></div>
   </section>
   <section id="local" class="state" hidden>
-    <h1 class="title at-top">Move on this device</h1><p class="sub">From one browser to another. Everything stays here.</p>
+    <h1 class="title at-top">Move on this computer</h1>
+    <p class="sub">From one browser to another. Everything stays here.</p>
     <label class="group-label" for="source">From</label><select id="source"></select>
+    <label class="group-label" for="source-profile" id="source-profile-label" hidden>Profile</label><select id="source-profile" hidden></select>
     <label class="group-label" for="target">To</label><select id="target"></select>
     <p class="hint" id="local-hint"></p><div class="spacer"></div>
     <div class="actions"><button class="btn btn-primary" id="local-preview">Continue</button></div>
@@ -57,17 +87,42 @@
     <div class="stage"><div class="lemur" data-mode="dance"></div></div><h1 class="title">Moving your things</h1><p class="sub" id="moving-line" role="status">Getting started</p><p class="note">Keep both browsers closed for a moment.</p>
   </section>
   <section id="done" class="state" hidden>
-    <div class="stage short"><div class="lemur" data-mode="still"></div></div><h1 class="title" id="done-title">Move finished</h1><div class="card rows" id="report"></div><div id="report-skips"></div><div class="actions"><button class="btn btn-primary" id="done-button">Done</button></div>
+    <div class="stage short"><div class="lemur" data-mode="still"></div></div>
+    <h1 class="title" id="done-title">Move finished</h1>
+    <p class="sub" id="done-sub" hidden></p>
+    <div class="card rows" id="report"></div><div id="report-skips"></div>
+    <div id="donate-card" class="card donate-card" hidden>
+      <button type="button" class="donate-close" id="donate-close" aria-label="Close">×</button>
+      <p class="donate-title">Did Move It save you time?</p>
+      <div class="donate-actions"><button class="btn btn-primary" type="button" id="donate-kofi">Buy me a coffee</button><button class="btn btn-quiet" type="button" id="donate-share">Share Move It</button></div>
+      <p class="hint">Can't donate? Sharing helps just as much.</p>
+      <button class="link" type="button" id="donate-dismiss">Don't show again</button>
+    </div>
+    <div class="actions"><button class="btn btn-primary" id="done-button">Done</button></div>
   </section>
   <section id="blocked" class="state" hidden>
-    <div class="stage"><div class="lemur" data-mode="wait"></div></div><h1 class="title" id="blocked-title">Close your browser and tap again</h1><p class="sub" id="blocked-sub">Move It needs your browsers closed before changing their data.</p><div class="actions"><button class="btn btn-primary" id="retry">Try again</button></div>
+    <div class="stage"><div class="lemur" data-mode="wait"></div></div>
+    <h1 class="title" id="blocked-title">Close your browser and click again</h1><p class="sub" id="blocked-sub">Move It needs your browsers closed before changing their data.</p><div class="actions"><button class="btn btn-primary" id="retry">Try again</button></div>
+  </section>
+  <section id="boot-fail" class="state" hidden>
+    <h1 class="title at-top">Move It could not start</h1>
+    <p class="sub" id="boot-fail-msg"></p>
+    <div class="actions"><button class="btn btn-primary" type="button" id="boot-retry">Retry</button><button class="btn btn-quiet" type="button" id="boot-export">Export logs</button></div>
   </section>
   <section id="logs" class="state" hidden>
     <h1 class="title at-top">Logs</h1><p class="sub">A record of this session. Review an export before sharing it.</p><div id="log-lines" class="card"></div><div class="actions"><button class="btn btn-primary" id="export-logs">Export logs</button><button class="btn btn-quiet" id="refresh-logs">Refresh</button></div>
   </section>
   <section id="about" class="state" hidden>
-    <div class="stage short"><div class="lemur" data-mode="still"></div></div><h1 class="title">Move It</h1><p class="sub">Your browser, on your devices.</p><p class="version" data-version></p><p class="note">Some protected data cannot move. Check each preview and report.</p><div class="actions"><button class="btn btn-primary" id="about-home">Back home</button></div>
+    <div class="stage short"><div class="lemur" data-mode="still"></div></div>
+    <h1 class="title">Move It</h1>
+    <p class="sub">Your browser, on your devices.</p>
+    <p class="version" data-version></p>
+    <p class="about-by">Made by 0xovo</p>
+    <div class="about-links" id="about-links"></div>
+    <p class="note">Licensed under GPL-3.0. Move It only reads browser data you choose to move; nothing is uploaded except to storage you pick.</p>
+    <div class="actions"><button class="btn btn-primary" id="about-home">Back home</button></div>
   </section>
+  <dialog id="kinds-all-dialog" aria-labelledby="kinds-all-title"><h2 id="kinds-all-title">What to move for all profiles</h2><p class="sub">Sets every profile at once. Use the arrow on a profile to change just that one.</p><div id="kinds-all-list" class="kind-grid"></div><div class="actions"><button class="btn btn-primary" id="kinds-all-apply">Apply to all</button><button class="btn btn-quiet" id="kinds-all-cancel">Cancel</button></div></dialog>
   <dialog id="undo-confirm"><h2>Your browser has changed</h2><p>Undo will replace changes made since the last move. Continue?</p><div class="actions"><button class="btn btn-primary" id="force-undo">Undo anyway</button><button class="btn btn-quiet" id="cancel-undo">Keep my changes</button></div></dialog>
 </main>
 <script src="design/loader/frames/manifest.js"></script><script src="design/loader/moveit-loader.js"></script><script type="module" src="app.js"></script>

@@ -115,7 +115,14 @@ fn keys() -> Keys {
 }
 
 fn profile<'a>(dir: &'a Path, k: &'a Keys) -> Profile<'a> {
-    Profile { dir, slot: "Default", keys: k, login_tag: HostTag::Without }
+    Profile {
+        dir,
+        slot: "Default",
+        keys: k,
+        login_tag: HostTag::Without,
+        browser: "chrome",
+        display: "Google Chrome",
+    }
 }
 
 // A small universe of hosts/names so devices genuinely collide on identity.
@@ -553,7 +560,8 @@ fn profile_keys(browser: LinuxBrowser, dir: &Path) -> Result<Keys, Error> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = dir;
-        let (password, from_trusted) = moveit_core::oscrypt::linux_browser_password_for(browser)?;
+        let (password, from_trusted) =
+            moveit_core::oscrypt::linux_browser_password_for_at(browser, Some(dir))?;
         Ok(Keys::Cbc {
             lock: Lock::linux(&password, LinuxPrefix::V10),
             from_libsecret_v2: browser.empty_store_v11_from_trusted_item(from_trusted),
@@ -714,7 +722,14 @@ fn cmd_seal(browser: LinuxBrowser, dir: &str, out_box: &str) -> ! {
         Ok(k) => k,
         Err(e) => fail_engine(e),
     };
-    let profile = Profile { dir: Path::new(dir), slot: "Default", keys: &keys, login_tag: HostTag::Without };
+    let profile = Profile {
+        dir: Path::new(dir),
+        slot: "Default",
+        keys: &keys,
+        login_tag: HostTag::Without,
+        browser: "chrome",
+        display: "Google Chrome",
+    };
     let key = match SyncKey::generate() {
         Ok(k) => k,
         Err(e) => fail_engine(e),
@@ -793,7 +808,14 @@ fn cmd_open(browser: LinuxBrowser, dir: &str, in_box: &str) -> ! {
         Ok(k) => k,
         Err(e) => fail_engine(e),
     };
-    let profile = Profile { dir: Path::new(dir), slot: "Default", keys: &keys, login_tag: HostTag::Without };
+    let profile = Profile {
+        dir: Path::new(dir),
+        slot: "Default",
+        keys: &keys,
+        login_tag: HostTag::Without,
+        browser: "chrome",
+        display: "Google Chrome",
+    };
     let key_path = key_sidecar(Path::new(in_box));
     let key = match SyncKey::read_key_file(&key_path) {
         Ok(k) => k,
@@ -1117,7 +1139,7 @@ fn api_main(args: &[String]) -> ! {
         "move_start" => {
             let mut beats: Vec<serde_json::Value> = Vec::new();
             let (excluded, routes) = move_args();
-            let report = run!(app.move_start(Some(&excluded), &routes, &mut |p| {
+            let report = run!(app.move_start(Some(&excluded), &routes, None, &mut |p| {
                 let v = serde_json::to_value(&p).unwrap();
                 println!("{}", serde_json::json!({ "event": "progress", "progress": v }));
                 beats.push(v);
@@ -1130,16 +1152,32 @@ fn api_main(args: &[String]) -> ! {
             print(serde_json::to_value(run!(app.undo_last(force))).unwrap())
         }
         "browser_open_check" => {
-            print(serde_json::to_value(run!(app.browser_open_check())).unwrap())
+            print(serde_json::to_value(run!(app.browser_open_check(&[], &[]))).unwrap())
         }
         "local_browsers" => print(serde_json::to_value(app.local_browsers()).unwrap()),
         "local_preview" => {
             let (src, dst) = need_pair();
-            print(serde_json::to_value(run!(app.local_preview(&src, &dst))).unwrap())
+            let src_slot = opt("--source-slot");
+            let dst_slot = opt("--target-slot");
+            print(serde_json::to_value(run!(app.local_preview(
+                &src,
+                &dst,
+                src_slot.as_deref(),
+                dst_slot.as_deref(),
+            )))
+            .unwrap())
         }
         "local_move" => {
             let (src, dst) = need_pair();
-            let report = run!(app.local_move(&src, &dst, &mut |p| {
+            let src_slot = opt("--source-slot");
+            let dst_slot = opt("--target-slot");
+            let report = run!(app.local_move(
+                &src,
+                &dst,
+                src_slot.as_deref(),
+                dst_slot.as_deref(),
+                None,
+                &mut |p| {
                 println!(
                     "{}",
                     serde_json::json!({ "event": "progress", "progress": serde_json::to_value(&p).unwrap() })

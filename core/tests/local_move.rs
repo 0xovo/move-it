@@ -145,10 +145,18 @@ fn plant_source(dir: &Path) {
     .unwrap();
     plant_history(dir, 3);
     plant_bookmarks(dir);
-    for id in ["extone", "exttwo"] {
-        std::fs::create_dir_all(dir.join("Default/Extensions").join(id)).unwrap();
+    const EXT_ONE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const EXT_TWO: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    for (id, ver) in [(EXT_ONE, "1.0_0"), (EXT_TWO, "1.0_0")] {
+        let ver_dir = dir.join(format!("Default/Extensions/{id}/{ver}"));
+        std::fs::create_dir_all(&ver_dir).unwrap();
+        std::fs::write(
+            ver_dir.join("manifest.json"),
+            br#"{"version":"1.0","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+        )
+        .unwrap();
     }
-    let state = dir.join("Default/Local Extension Settings/extone");
+    let state = dir.join(format!("Default/Local Extension Settings/{EXT_ONE}"));
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("state.txt"), b"extone-state").unwrap();
 }
@@ -199,7 +207,7 @@ fn local_move_round_trip_and_undo() {
     assert!(browsers.iter().any(|b| b.browser == "chrome" && b.display == "Google Chrome"));
 
     // The preview counts the source, names the target, skips nothing.
-    let preview = a.local_preview("brave", "chrome").unwrap();
+    let preview = a.local_preview("brave", "chrome", None, None).unwrap();
     assert_eq!(preview.source, "Brave");
     assert_eq!(preview.target, "Google Chrome");
     assert_eq!(preview.logins, 2);
@@ -212,13 +220,13 @@ fn local_move_round_trip_and_undo() {
 
     let before = store_bytes(&src);
     let mut events: Vec<Progress> = Vec::new();
-    let report = a.local_move("brave", "chrome", &mut |p| events.push(p)).unwrap();
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |p| events.push(p)).unwrap();
     assert_eq!(report.source, "Brave");
     assert_eq!(report.target, "Google Chrome");
     assert_eq!(report.cookies, 2);
     assert_eq!(report.logins, 2);
     assert_eq!(report.history_urls, 3);
-    assert_eq!(report.extensions, 1, "only extone has saved state to carry");
+    assert_eq!(report.extensions, 1, "only ext one has saved state to carry");
     assert!(!events.is_empty());
     assert_eq!(events.first().unwrap().step, "read");
     let last = events.last().unwrap();
@@ -246,12 +254,18 @@ fn local_move_round_trip_and_undo() {
     assert!(got.iter().any(|c| c.host == ".own.example" && c.value == "keep"));
     // What landed is encrypted at rest, not plaintext with a new label.
     let wrong = Keys::Gcm { lock: Lock::windows([7; 32]) };
-    assert!(cookies::export(&dst.join("Default/Cookies"), &wrong).is_err());
+    assert_eq!(
+        cookies::export(&dst.join("Default/Cookies"), &wrong)
+            .unwrap()
+            .len(),
+        0,
+        "wrong keys yield nothing readable"
+    );
     let hist = history::export(&dst.join("Default/History")).unwrap();
     assert_eq!(hist.urls.len(), 3);
     let bm = std::fs::read(dst.join("Default/Bookmarks")).unwrap();
     assert!(bm.windows(17).any(|w| w == b"https://a.example"), "bookmarks carried into Chrome");
-    let ext_state = dst.join("Default/Local Extension Settings/extone/state.txt");
+    let ext_state = dst.join("Default/Local Extension Settings/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/state.txt");
     assert_eq!(std::fs::read(&ext_state).unwrap(), b"extone-state", "extension state carried");
 
     // Undo puts Chrome back to exactly what it was.
@@ -267,16 +281,56 @@ fn local_move_round_trip_and_undo() {
 }
 
 #[test]
+fn local_move_applies_profile_kinds() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    plant_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let kinds = BTreeMap::from([(
+        "local:default".to_string(),
+        vec!["bookmarks".to_string()],
+    )]);
+    let report = a.local_move("brave", "chrome", None, None, Some(&kinds), &mut |_| {}).unwrap();
+    assert_eq!(report.logins, 0);
+    assert_eq!(report.cookies, 0);
+    assert_eq!(report.history_urls, 0);
+    let bm = std::fs::read(dst.join("Default/Bookmarks")).unwrap();
+    assert!(bm.windows(17).any(|w| w == b"https://a.example"), "bookmarks must land");
+    let found = logins::export(&dst.join("Default/Login Data"), &keys()).unwrap();
+    assert_eq!(found.len(), 1, "other kinds must not move");
+}
+
+#[test]
+fn local_move_legacy_kinds_apply_to_the_source() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    plant_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let kinds = BTreeMap::from([("*".to_string(), vec!["bookmarks".to_string()])]);
+    let report = a.local_move("brave", "chrome", None, None, Some(&kinds), &mut |_| {}).unwrap();
+    assert_eq!(report.logins, 0);
+    assert_eq!(report.cookies, 0);
+    let bm = std::fs::read(dst.join("Default/Bookmarks")).unwrap();
+    assert!(bm.windows(17).any(|w| w == b"https://a.example"));
+}
+
+#[test]
 fn local_move_refuses_itself_and_unknown_browsers() {
     pin_browser_password();
     let t = tempfile::tempdir().unwrap();
     let src = t.path().join("brave-prof");
     plant_source(&src);
     let mut a = app(&t.path().join("state"), &src, &src);
-    assert!(a.local_preview("brave", "brave").is_err(), "a browser cannot move into itself");
-    assert!(a.local_move("brave", "brave", &mut |_| {}).is_err());
-    assert!(a.local_preview("brave", "opera").is_err(), "an unknown target is refused plainly");
-    assert!(a.local_move("opera", "brave", &mut |_| {}).is_err(), "an unknown source is refused plainly");
+    assert!(a.local_preview("brave", "brave", None, None).is_err(), "a browser cannot move into itself");
+    assert!(a.local_move("brave", "brave", None, None, None, &mut |_| {}).is_err());
+    assert!(a.local_preview("brave", "opera", None, None).is_err(), "an unknown target is refused plainly");
+    assert!(a.local_move("opera", "brave", None, None, None, &mut |_| {}).is_err(), "an unknown source is refused plainly");
 }
 
 #[test]
@@ -301,15 +355,25 @@ fn local_move_reports_locked_cookies_and_moves_the_rest() {
     }
     let mut a = app(&t.path().join("state"), &src, &dst);
 
-    let preview = a.local_preview("brave", "chrome").unwrap();
+    let preview = a.local_preview("brave", "chrome", None, None).unwrap();
     assert_eq!(preview.locked_cookies, 1);
-    assert!(
-        preview.skipped.iter().any(|s| s.browser == "Brave" && s.reason.contains("App-Bound")),
-        "the locked cookies must be named as skipped: {:?}",
-        preview.skipped
-    );
+    if cfg!(target_os = "windows") {
+        assert!(
+            preview.skipped.iter().any(|s| s.browser == "Brave" && s.reason.contains("App-Bound")),
+            "the locked cookies must be named as skipped: {:?}",
+            preview.skipped
+        );
+    } else {
+        assert!(
+            preview.skipped.iter().any(|s| {
+                s.browser == "Brave" && s.reason.contains("sealed by the browser on Windows")
+            }),
+            "v20 cookies must be counted on Linux: {:?}",
+            preview.skipped
+        );
+    }
 
-    let report = a.local_move("brave", "chrome", &mut |_| {}).unwrap();
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
     assert_eq!(report.locked_cookies, 1);
     assert_eq!(report.cookies, 2, "the movable cookies still move");
     let got = cookies::export(&dst.join("Default/Cookies"), &keys()).unwrap();
@@ -335,7 +399,7 @@ fn local_open_check_names_the_open_browser_and_the_move_refuses() {
         a.local_open_check("brave", "chrome").unwrap(),
         OpenCheck::Blocked { browser: "Google Chrome".into() }
     );
-    assert!(a.local_move("brave", "chrome", &mut |_| {}).is_err(), "never write into an open browser");
+    assert!(a.local_move("brave", "chrome", None, None, None, &mut |_| {}).is_err(), "never write into an open browser");
     holder.execute_batch("ROLLBACK").unwrap();
     assert_eq!(a.local_open_check("brave", "chrome").unwrap(), OpenCheck::Clear);
 }
@@ -357,7 +421,7 @@ fn a_second_registration_for_a_name_replaces_the_first() {
         .with_local_profile("brave", &first)
         .with_local_profile("brave", &second)
         .with_local_profile("chrome", &dst);
-    let preview = a.local_preview("brave", "chrome").unwrap();
+    let preview = a.local_preview("brave", "chrome", None, None).unwrap();
     assert_eq!(preview.history, 1, "the second registration is the one that counts");
     assert_eq!(a.local_browsers().iter().filter(|b| b.browser == "brave").count(), 1);
 }
@@ -377,12 +441,12 @@ fn an_unreadable_browser_is_refused_at_preview_not_after_it() {
     // This surface cannot attempt a Firefox password at all (no adapter
     // for it yet), so the preview refuses with the same error the move
     // would give, instead of counts that promise a move.
-    assert!(a.local_preview("firefox", "chrome").is_err());
-    assert!(a.local_move("firefox", "chrome", &mut |_| {}).is_err());
+    assert!(a.local_preview("firefox", "chrome", None, None).is_err());
+    assert!(a.local_move("firefox", "chrome", None, None, None, &mut |_| {}).is_err());
     // The target's keys gate the preview too: a move into a browser whose
     // password cannot be attempted can never write, so it refuses up front.
-    assert!(a.local_preview("chrome", "firefox").is_err());
-    assert!(a.local_move("chrome", "firefox", &mut |_| {}).is_err());
+    assert!(a.local_preview("chrome", "firefox", None, None).is_err());
+    assert!(a.local_move("chrome", "firefox", None, None, None, &mut |_| {}).is_err());
 }
 
 #[test]
@@ -397,7 +461,7 @@ fn local_undo_refuses_while_the_target_browser_is_open() {
         .unwrap()
         .with_local_profile("brave", &src)
         .with_local_profile("chrome", &dst);
-    a.local_move("brave", "chrome", &mut |_| {}).unwrap();
+    a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
 
     let holder = rusqlite::Connection::open(dst.join("Default/Cookies")).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -423,8 +487,8 @@ fn local_undo_undoes_the_newest_move_into_that_browser() {
         .with_local_profile("brave", &src)
         .with_local_profile("chromium", &other)
         .with_local_profile("chrome", &dst);
-    a.local_move("brave", "chrome", &mut |_| {}).unwrap();
-    a.local_move("chromium", "chrome", &mut |_| {}).unwrap();
+    a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    a.local_move("chromium", "chrome", None, None, None, &mut |_| {}).unwrap();
 
     // The journal keeps one undo point per profile: the second move replaced
     // the first move's point, so undo reverses the newest move only.
@@ -580,7 +644,7 @@ fn a_crashed_move_in_the_source_is_put_back_before_the_read() {
     assert!(moveit_core::txn::has_unfinished(&src));
 
     let mut a = app(&t.path().join("state"), &src, &dst);
-    let report = a.local_move("brave", "chrome", &mut |_| {}).unwrap();
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
     assert!(!moveit_core::txn::has_unfinished(&src), "the journal was recovered");
     assert_eq!(std::fs::read(&cookies_path).unwrap(), original, "source restored before the read");
     assert!(report.cookies > 0, "the restored cookies are what moved");
@@ -604,7 +668,7 @@ fn recovery_waits_while_the_source_browser_is_open() {
     std::os::unix::fs::symlink(&lock_target, src.join("SingletonLock")).unwrap();
 
     let mut a = app(&t.path().join("state"), &src, &dst);
-    let err = a.local_move("brave", "chrome", &mut |_| {}).unwrap_err();
+    let err = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap_err();
     assert!(matches!(err, moveit_core::Error::BrowserOpen), "{err:?}");
     assert_eq!(std::fs::read(&cookies_path).unwrap(), b"half-moved", "nothing was swapped under the open browser");
     assert!(moveit_core::txn::has_unfinished(&src), "the journal waits for a closed browser");
@@ -623,7 +687,7 @@ fn never_launched_profiles_refuse_preview_and_move_without_planting() {
     make_db(&dst.join("Default/History"), HISTORY_SCHEMA);
 
     let mut a = app(&t.path().join("state"), &src, &dst);
-    let preview_err = a.local_preview("brave", "chrome").unwrap_err();
+    let preview_err = a.local_preview("brave", "chrome", None, None).unwrap_err();
     assert!(
         matches!(
             &preview_err,
@@ -631,7 +695,7 @@ fn never_launched_profiles_refuse_preview_and_move_without_planting() {
         ),
         "{preview_err:?}"
     );
-    let move_err = a.local_move("brave", "chrome", &mut |_| {}).unwrap_err();
+    let move_err = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap_err();
     assert!(
         matches!(
             &move_err,
@@ -656,7 +720,7 @@ fn never_launched_target_refuses_even_when_source_is_ready() {
     plant_source(&src);
     std::fs::create_dir_all(dst.join("Default")).unwrap();
     let mut a = app(&t.path().join("state"), &src, &dst);
-    let err = a.local_preview("brave", "chrome").unwrap_err();
+    let err = a.local_preview("brave", "chrome", None, None).unwrap_err();
     assert!(
         matches!(
             &err,
@@ -664,7 +728,7 @@ fn never_launched_target_refuses_even_when_source_is_ready() {
         ),
         "{err:?}"
     );
-    let move_err = a.local_move("brave", "chrome", &mut |_| {}).unwrap_err();
+    let move_err = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap_err();
     assert!(
         matches!(
             &move_err,
@@ -699,12 +763,82 @@ fn any_one_store_lets_the_never_launched_guard_pass() {
         }
         let a = app(&t.path().join(format!("state-{label}")), &src, &dst);
         // Guard passed: failure past this point is keys/open, not NeverLaunched.
-        let err = a.local_preview("brave", "chrome");
+        let err = a.local_preview("brave", "chrome", None, None);
         assert!(
             !matches!(err, Err(moveit_core::Error::NeverLaunched { .. })),
             "{label}: {err:?}"
         );
     }
+}
+
+fn plant_source_profile1(dir: &Path) {
+    let slot = dir.join("Profile 1");
+    std::fs::create_dir_all(&slot).unwrap();
+    std::fs::create_dir_all(dir.join("Default")).unwrap();
+    make_db(&slot.join("Cookies"), COOKIES_SCHEMA);
+    make_db(&slot.join("History"), HISTORY_SCHEMA);
+    make_db(&slot.join("Login Data"), LOGINS_SCHEMA);
+    logins::import(
+        &slot.join("Login Data"),
+        &[login("p1", "secret", 100)],
+        &keys(),
+        HostTag::Without,
+    )
+    .unwrap();
+    cookies::import(
+        &slot.join("Cookies"),
+        &[cookie(".profile1.example", "sid", "1", 100)],
+        &keys(),
+    )
+    .unwrap();
+    let mut section = history::Section::default();
+    for i in 0..2 {
+        section.urls.push(history::HistoryUrl {
+            url: format!("https://p1-{i}.example/"),
+            title: String::new(),
+            typed_count: 0,
+            last_visit_time: 1_000 + i as i64,
+            hidden: 0,
+        });
+    }
+    history::import(&slot.join("History"), &section).unwrap();
+    const EXT: &str = "cccccccccccccccccccccccccccccccc";
+    let ver_dir = slot.join(format!("Extensions/{EXT}/1.0_0"));
+    std::fs::create_dir_all(&ver_dir).unwrap();
+    std::fs::write(
+        ver_dir.join("manifest.json"),
+        br#"{"version":"1.0","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+    )
+    .unwrap();
+    let state = slot.join(format!("Local Extension Settings/{EXT}"));
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("state.txt"), b"p1-ext").unwrap();
+}
+
+#[test]
+fn local_move_profile1_source_slot_round_trip_and_undo() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source_profile1(&src);
+    plant_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let preview = a.local_preview("brave", "chrome", Some("Profile 1"), None).unwrap();
+    assert_eq!(preview.logins, 1);
+    assert_eq!(preview.cookies, 1);
+    assert_eq!(preview.history, 2);
+    assert_eq!(preview.extensions, 1);
+    let before = store_bytes(&src);
+    let report = a
+        .local_move("brave", "chrome", Some("Profile 1"), None, None, &mut |_| {})
+        .unwrap();
+    assert_eq!(report.logins, preview.logins);
+    assert_eq!(report.cookies, preview.cookies);
+    assert_eq!(report.history_urls, preview.history);
+    assert_eq!(report.extensions, preview.extensions);
+    assert_eq!(store_bytes(&src), before, "source Profile 1 is read-only");
+    assert_eq!(a.undo_last(false).unwrap(), UndoOutcome::Done);
 }
 
 #[test]
@@ -716,8 +850,11 @@ fn local_move_updates_the_home_undo_record() {
     plant_source(&src);
     plant_target(&dst);
     let before = store_bytes(&dst);
-    let mut a = app(&t.path().join("state"), &src, &dst);
-    a.local_move("brave", "chrome", &mut |_| {}).unwrap();
+    let empty_base = tempfile::tempdir().unwrap();
+    let mut a = app(&t.path().join("state"), &src, &dst)
+        .with_browser_base(empty_base.path())
+        .with_profile("chrome", &dst);
+    a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
     let home = a.home_state().unwrap();
     assert!(home.can_undo);
     assert!(home.last_sync.is_some());

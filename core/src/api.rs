@@ -14,10 +14,11 @@
 //!
 //! Profiles are first-class: a device can hold several browsers, each with several
 //! profiles. The preview lists every profile; a move can leave profiles out (the
-//! excluded set) and can route a profile to a different browser (the route choices),
+//! excluded set). On the sending computer that is all it chooses. The receiving
+//! computer picks which browser each incoming profile lands in (the route choices),
 //! where it lands as that browser's own fresh profile, never over one the person
-//! already has. Routes are per profile and per move: one move may send Work to Chrome
-//! and Person 1 to Edge. Nothing makes a route stick beyond the move it was chosen in.
+//! already has. Routes are per profile and per move. Nothing makes a route stick
+//! beyond the move it was chosen in.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -99,6 +100,51 @@ pub struct DetectedProfile {
     pub dir: PathBuf,
 }
 
+fn validate_kinds(kinds: Option<&[String]>) -> Result<()> {
+    if let Some(list) = kinds {
+        for k in list {
+            if !engine::MOVE_KINDS.contains(&k.as_str()) {
+                return Err(Error::Refused(format!("unknown data kind: {k}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per-profile partial-move selection. Keys are profile ids; omit a profile to move all kinds.
+/// The legacy sentinel `*` applies one list to every profile (old global `kinds` argument).
+pub type ProfileKinds = BTreeMap<String, Vec<String>>;
+
+const LEGACY_KINDS_ALL: &str = "*";
+
+pub fn normalize_profile_kinds(
+    legacy: Option<&[String]>,
+    by_profile: Option<&ProfileKinds>,
+) -> Result<Option<ProfileKinds>> {
+    if let Some(m) = by_profile {
+        for list in m.values() {
+            validate_kinds(Some(list.as_slice()))?;
+        }
+        return Ok(Some(m.clone()));
+    }
+    if let Some(list) = legacy {
+        validate_kinds(Some(list))?;
+        return Ok(Some(ProfileKinds::from([(
+            LEGACY_KINDS_ALL.to_string(),
+            list.to_vec(),
+        )])));
+    }
+    Ok(None)
+}
+
+fn kinds_for_profile<'a>(map: Option<&'a ProfileKinds>, profile_id: &str) -> Option<&'a [String]> {
+    let m = map?;
+    if let Some(all) = m.get(LEGACY_KINDS_ALL) {
+        return Some(all.as_slice());
+    }
+    m.get(profile_id).map(|v| v.as_slice())
+}
+
 fn browser_display(name: &str) -> String {
     match name {
         "brave" => "Brave".to_string(),
@@ -169,32 +215,18 @@ pub fn detect_profiles() -> Vec<DetectedProfile> {
     if Platform::current() != Platform::Linux {
         return Vec::new();
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    let Some(base) = base else { return Vec::new() };
-    detect_profiles_at(&base)
+    from_profiles_detected(profiles::linux_chromium_install_roots(None))
 }
 
-/// The same detection under a caller-chosen base, for a caller that
-/// captured its base earlier and means to keep it.
-fn detect_profiles_at(base: &Path) -> Vec<DetectedProfile> {
-    let mut out = Vec::new();
-    if Platform::current() != Platform::Linux {
-        return out;
-    }
-    for (name, sub) in [
-        ("brave", "BraveSoftware/Brave-Browser"),
-        ("chrome", "google-chrome"),
-        ("chromium", "chromium"),
-        ("edge", "microsoft-edge"),
-    ] {
-        let dir = base.join(sub);
-        if dir.join("Default").is_dir() {
-            out.push(DetectedProfile { browser: name.to_string(), display: browser_display(name), dir });
-        }
-    }
-    out
+fn from_profiles_detected(roots: Vec<profiles::ChromiumInstallRoot>) -> Vec<DetectedProfile> {
+    roots
+        .into_iter()
+        .map(|r| DetectedProfile {
+            browser: r.browser,
+            display: r.display,
+            dir: r.dir,
+        })
+        .collect()
 }
 
 fn default_device_name() -> String {
@@ -536,10 +568,10 @@ impl App {
     /// it opened: the same world for the app's whole life, even if the
     /// environment changes under it.
     fn detected(&self) -> Vec<DetectedProfile> {
-        match &self.base {
-            Some(base) => detect_profiles_at(base),
-            None => detect_profiles(),
+        if Platform::current() == Platform::Linux {
+            return from_profiles_detected(profiles::linux_chromium_install_roots(self.base.as_deref()));
         }
+        Vec::new()
     }
 
     fn require_profile(&self) -> Result<DetectedProfile> {
@@ -549,6 +581,10 @@ impl App {
 
     /// The per-profile store keys, from live password discovery (Linux).
     fn keys_for(&self, browser: &str) -> Result<Keys> {
+        self.keys_for_at(browser, None)
+    }
+
+    fn keys_for_at(&self, browser: &str, install_root: Option<&Path>) -> Result<Keys> {
         // Integration tests plant Linux-style v10 stores and pin MOVEIT_LINUX_PASSWORD;
         // on macOS CI there is no Safe Storage item, so honour the pin without touching
         // the real Keychain. `cfg(test)` is off for integration-test builds, so a
@@ -561,7 +597,8 @@ impl App {
             let b = LinuxBrowser::from_name(browser).ok_or_else(|| {
                 Error::Refused(format!("{} is not a browser Move It can read yet", browser_display(browser)))
             })?;
-            let (password, from_trusted) = crate::oscrypt::linux_browser_password_for(b)?;
+            let (password, from_trusted) =
+                crate::oscrypt::linux_browser_password_for_at(b, install_root)?;
             let from_libsecret_v2 = b.empty_store_v11_from_trusted_item(from_trusted);
             return Ok(Keys::Cbc {
                 lock: Lock::linux(&password, LinuxPrefix::V10),
@@ -576,7 +613,8 @@ impl App {
         let b = LinuxBrowser::from_name(browser).ok_or_else(|| {
             Error::Refused(format!("{} is not a browser Move It can read yet", browser_display(browser)))
         })?;
-        let (password, from_trusted) = crate::oscrypt::linux_browser_password_for(b)?;
+        let (password, from_trusted) =
+            crate::oscrypt::linux_browser_password_for_at(b, install_root)?;
         let from_libsecret_v2 = b.empty_store_v11_from_trusted_item(from_trusted);
         Ok(Keys::Cbc { lock: Lock::linux(&password, LinuxPrefix::V10), from_libsecret_v2 })
     }
@@ -587,7 +625,26 @@ impl App {
     /// never invisible to the surface.
     fn source_profiles(&self) -> Vec<SourceProfile> {
         let mut out: Vec<SourceProfile> = Vec::new();
-        if let Some(base) = &self.base {
+        if Platform::current() == Platform::Linux {
+            for install in profiles::linux_chromium_install_roots(self.base.as_deref()) {
+                if !FAMILY.contains(&install.browser.as_str()) {
+                    continue;
+                }
+                let name = install.browser.as_str();
+                for slot in profiles::list_slots(&install.dir) {
+                    if out.iter().any(|s: &SourceProfile| s.id == profile_id(name, &slot.name)) {
+                        continue; // two folder names, one id: the first keeps it
+                    }
+                    out.push(SourceProfile {
+                        id: profile_id(name, &slot.name),
+                        browser: name.to_string(),
+                        root: install.dir.clone(),
+                        slot: slot.name,
+                        name: slot.display,
+                    });
+                }
+            }
+        } else if let Some(base) = &self.base {
             for name in FAMILY {
                 let Some(sub) = browser_subdir(name) else { continue };
                 let root = base.join(sub);
@@ -596,7 +653,7 @@ impl App {
                 }
                 for slot in profiles::list_slots(&root) {
                     if out.iter().any(|s: &SourceProfile| s.id == profile_id(name, &slot.name)) {
-                        continue; // two folder names, one id: the first keeps it
+                        continue;
                     }
                     out.push(SourceProfile {
                         id: profile_id(name, &slot.name),
@@ -635,12 +692,15 @@ impl App {
                 return Some(wp.dir);
             }
         }
+        if Platform::current() == Platform::Linux {
+            let root = profiles::linux_chromium_install_roots(self.base.as_deref())
+                .into_iter()
+                .find(|r| r.browser == browser)?;
+            return root.dir.is_dir().then_some(root.dir);
+        }
         let base = self.base.as_ref()?;
         let sub = browser_subdir(browser)?;
         let root = base.join(sub);
-        // A browser with no folder on this device is not a destination: a
-        // routed landing must never conjure a phantom browser tree into
-        // the config folder of a browser that is not installed here.
         root.is_dir().then_some(root)
     }
 
@@ -703,45 +763,57 @@ struct Incoming {
 }
 
 impl Incoming {
-    fn from_payload(payload: Payload, working: &Option<DetectedProfile>) -> Incoming {
+    fn from_payload(mut payload: Payload, working: &Option<DetectedProfile>) -> Incoming {
+        if !payload.manifest.contains_key("profile_browser") {
+            let (b, disp) = working
+                .as_ref()
+                .map(|w| (w.browser.clone(), w.display.clone()))
+                .unwrap_or_else(|| ("brave".to_string(), "Brave".to_string()));
+            let origin = payload
+                .manifest
+                .get("origin")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let origin_key = payload
+                .manifest
+                .get("origin_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| origin.clone());
+            payload
+                .manifest
+                .insert("profile_browser".into(), serde_json::json!(b));
+            payload
+                .manifest
+                .insert("profile_slot".into(), serde_json::json!(paths::DEFAULT_SLOT));
+            return Incoming {
+                origin,
+                origin_key,
+                src_browser: b,
+                src_slot: paths::DEFAULT_SLOT.to_string(),
+                src_name: disp,
+                route: None,
+                slot_ok: true,
+                payload,
+            };
+        }
         let get = |k: &str| {
             payload.manifest.get(k).and_then(|v| v.as_str()).map(str::to_string)
         };
-        match get("profile_browser") {
-            Some(b) => {
-                let slot =
-                    get("profile_slot").unwrap_or_else(|| paths::DEFAULT_SLOT.to_string());
-                Incoming {
-                    origin: get("origin").unwrap_or_default(),
-                    origin_key: get("origin_id")
-                        .unwrap_or_else(|| get("origin").unwrap_or_default()),
-                    slot_ok: profiles::is_slot_name(&slot),
-                    src_name: get("profile_name").unwrap_or_else(|| slot.clone()),
-                    // Browser names match case-insensitively; slot names do
-                    // not (they are folder names, and case is real there).
-                    src_browser: b.to_lowercase(),
-                    src_slot: slot,
-                    route: get("route_browser").map(|r| r.to_lowercase()),
-                    payload,
-                }
-            }
-            None => {
-                let (b, disp) = working
-                    .as_ref()
-                    .map(|w| (w.browser.clone(), w.display.clone()))
-                    .unwrap_or_else(|| ("brave".to_string(), "Brave".to_string()));
-                Incoming {
-                    origin: get("origin").unwrap_or_default(),
-                    origin_key: get("origin_id")
-                        .unwrap_or_else(|| get("origin").unwrap_or_default()),
-                    src_browser: b,
-                    src_slot: paths::DEFAULT_SLOT.to_string(),
-                    src_name: disp,
-                    route: None,
-                    slot_ok: true,
-                    payload,
-                }
-            }
+        let b = get("profile_browser").expect("profile_browser checked");
+        let slot = get("profile_slot").unwrap_or_else(|| paths::DEFAULT_SLOT.to_string());
+        Incoming {
+            origin: get("origin").unwrap_or_default(),
+            origin_key: get("origin_id").unwrap_or_else(|| get("origin").unwrap_or_default()),
+            slot_ok: profiles::is_slot_name(&slot),
+            src_name: get("profile_name").unwrap_or_else(|| slot.clone()),
+            // Browser names match case-insensitively; slot names do
+            // not (they are folder names, and case is real there).
+            src_browser: b.to_lowercase(),
+            src_slot: slot,
+            route: get("route_browser").map(|r| r.to_lowercase()),
+            payload,
         }
     }
 
@@ -902,27 +974,182 @@ fn validate_routes(
     Ok(out)
 }
 
-/// Every browser a profile could be sent to, with the plain reason for the ones
-/// whose password this system cannot read yet.
-fn route_targets() -> Vec<RouteTarget> {
+/// Every browser this device can land a profile into: installed, and opened at
+/// least once, with plain reasons for the rest.
+fn route_targets(app: &App) -> Vec<RouteTarget> {
     FAMILY
         .iter()
         .map(|name| {
             let display = browser_display(name);
-            let available = Platform::current() == Platform::Linux
-                && LinuxBrowser::from_name(name).is_some();
+            let mut available = false;
+            let mut reason = None;
+            if Platform::current() == Platform::Linux && LinuxBrowser::from_name(name).is_some() {
+                match app.dest_root(name) {
+                    Some(root) if !browser_landing_ready(&root) => {
+                        reason = Some(format!(
+                            "Open {display} once on this computer so Move It can add a profile there"
+                        ));
+                    }
+                    Some(_) => available = true,
+                    None => reason = Some(format!("{display} is not installed on this computer")),
+                }
+            } else {
+                reason = Some(format!(
+                    "Move It cannot read {display}'s password on this system yet"
+                ));
+            }
             RouteTarget {
                 name: name.to_string(),
                 display: display.clone(),
                 available,
-                reason: if available {
-                    None
-                } else {
-                    Some(format!("Move It cannot read {display}'s password on this system yet"))
-                },
+                reason,
             }
         })
         .collect()
+}
+
+/// Check route choices for incoming profiles waiting in shared storage. Refuses
+/// before anything is read or written: unknown id, routed twice, destination
+/// outside the Chromium family, or a destination this device cannot use yet.
+fn validate_incoming_routes(
+    arriving: &[ArrivingProfile],
+    routes: &[RouteChoice],
+) -> Result<BTreeMap<String, String>> {
+    let by_id: BTreeMap<&str, &ArrivingProfile> =
+        arriving.iter().map(|a| (a.id.as_str(), a)).collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for r in routes {
+        let Some(ap) = by_id.get(r.profile.as_str()) else {
+            continue; // stale choice from an earlier preview; drop quietly
+        };
+        if !seen.insert(r.profile.as_str()) {
+            return Err(Error::Refused(format!("{} is routed twice in one move", r.profile)));
+        }
+        let target = r.browser.to_lowercase();
+        if !FAMILY.contains(&target.as_str()) {
+            return Err(Error::Refused(format!(
+                "profiles cannot be sent to {}: it is not one of the browsers Move It moves between",
+                r.browser
+            )));
+        }
+        if target != ap.from_browser {
+            out.insert(r.profile.clone(), target);
+        }
+    }
+    Ok(out)
+}
+
+fn default_incoming_destination(
+    from_browser: &str,
+    targets: &[RouteTarget],
+) -> (String, Option<String>) {
+    if targets
+        .iter()
+        .any(|t| t.name == from_browser && t.available)
+    {
+        return (from_browser.to_string(), None);
+    }
+    let first = targets.iter().find(|t| t.available);
+    if let Some(t) = first {
+        let note = format!(
+            "{} is not on this computer; the first browser available here is {}",
+            browser_display(from_browser),
+            t.display
+        );
+        return (t.name.clone(), Some(note));
+    }
+    (from_browser.to_string(), None)
+}
+
+fn incoming_admits(
+    inc: &Incoming,
+    sources: &[SourceProfile],
+    route_map: &BTreeMap<String, String>,
+    app: &App,
+) -> bool {
+    let id = inc.id();
+    let will_route = route_map.get(&id).is_some_and(|d| d != &inc.src_browser);
+    if will_route {
+        return true;
+    }
+    if sources
+        .iter()
+        .any(|s| s.browser == inc.src_browser && s.slot == inc.src_slot)
+    {
+        return true;
+    }
+    // Same browser, no local slot yet: land fresh when that browser is here.
+    app.dest_root(&inc.src_browser).is_some()
+}
+
+fn incoming_landing_target(
+    inc: &Incoming,
+    routed: bool,
+    root: &Path,
+    landed_book: &LandedBook,
+) -> (engine::Target, bool) {
+    if routed {
+        match landed_book.home(&inc.origin_key, &inc.src_browser, &inc.src_slot, root) {
+            Some(home) => (engine::Target::Slot(home), false),
+            None => (engine::Target::Fresh { display: inc.src_name.clone() }, true),
+        }
+    } else if root.join(&inc.src_slot).is_dir() {
+        (engine::Target::Slot(inc.src_slot.clone()), false)
+    } else {
+        match landed_book.home(&inc.origin_key, &inc.src_browser, &inc.src_slot, root) {
+            Some(home) => (engine::Target::Slot(home), false),
+            None => (engine::Target::Fresh { display: inc.src_name.clone() }, true),
+        }
+    }
+}
+
+/// True when at least one profile slot under this browser root has been opened once.
+fn browser_landing_ready(root: &Path) -> bool {
+    for slot in profiles::list_slots(root) {
+        if !paths::never_launched(root, &slot.name) {
+            return true;
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return false;
+    };
+    rd.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        e.path().is_dir() && profiles::is_slot_name(&name) && !paths::never_launched(root, &name)
+    })
+}
+
+fn scan_incoming_boxes(
+    app: &App,
+    p: &dyn pipe::Pipe,
+    key: &SyncKey,
+    my_id: &str,
+    device: &str,
+) -> Result<Vec<Incoming>> {
+    let working = app.working_profile();
+    let mut out = Vec::new();
+    for box_path in p.boxes()? {
+        let fname = box_path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let opened = std::fs::read(&box_path)
+            .map_err(io)
+            .and_then(|bytes| engine::open_box(&bytes, key));
+        let payload = match opened {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !box_name_matches(&fname, &payload, &working) {
+            continue;
+        }
+        if is_own_box(&payload, Some(my_id), device) {
+            continue;
+        }
+        out.push(Incoming::from_payload(payload, &working));
+    }
+    Ok(out)
 }
 
 /// What the shell learns when the app starts (the welcome and home screens route on it).
@@ -933,6 +1160,7 @@ pub struct StartInfo {
     pub paired: bool,
     pub other_device: Option<String>,
     pub pipe_set: bool,
+    pub pipe_kind: Option<String>,
     pub browser: Option<String>,
     pub profile_found: bool,
 }
@@ -1004,6 +1232,7 @@ pub struct ProfilePreview {
     pub name: String,
     pub logins: u64,
     pub passwords: u64,
+    pub cookies: u64,
     pub extensions: u64,
     pub bookmarks: u64,
     pub history: u64,
@@ -1033,6 +1262,7 @@ pub struct BrowserPreview {
     pub display: String,
     pub logins: u64,
     pub passwords: u64,
+    pub cookies: u64,
     pub extensions: u64,
     pub bookmarks: u64,
     pub history: u64,
@@ -1054,14 +1284,34 @@ pub struct RouteTarget {
     pub reason: Option<String>,
 }
 
+/// A profile waiting in shared storage from the other device.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrivingProfile {
+    pub id: String,
+    pub name: String,
+    pub from_browser: String,
+    pub from_browser_display: String,
+    pub from_device: String,
+    /// Browser this profile will land in on this move (the receiver's choice).
+    pub destination: String,
+    pub routed: bool,
+    /// When the default is not the browser the profile came from.
+    pub destination_note: Option<String>,
+}
+
 /// The counts behind the "ready to move" screen: every profile on this device,
 /// where each one is headed, and what would not move.
 #[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Preview {
     /// The other device's name, when known.
     pub target: String,
     pub browsers: Vec<BrowserPreview>,
     pub targets: Vec<RouteTarget>,
+    /// Profiles the other device left in shared storage, waiting to land here.
+    #[serde(default)]
+    pub arriving: Vec<ArrivingProfile>,
     /// What would not move anywhere (nothing readable on this device).
     pub skipped: Vec<Skipped>,
 }
@@ -1093,9 +1343,22 @@ pub struct MoveReport {
     #[serde(default)]
     pub boxes_skipped: u64,
     pub cookies: u64,
+    /// Existing target cookies no key could decrypt, preserved untouched.
+    #[serde(default)]
+    pub preserved_cookies: u64,
     pub logins: u64,
     pub history_urls: u64,
     pub wrote_box: bool,
+    /// What this device packed for the other one (including a box already
+    /// waiting unchanged in the shared place).
+    #[serde(default)]
+    pub sent_profiles: u64,
+    #[serde(default)]
+    pub sent_cookies: u64,
+    #[serde(default)]
+    pub sent_logins: u64,
+    #[serde(default)]
+    pub sent_history_urls: u64,
     /// Where each incoming profile landed, or why it did not.
     #[serde(default)]
     pub routes: Vec<RouteLine>,
@@ -1136,6 +1399,22 @@ pub struct BrowserChoice {
     pub display: String,
 }
 
+/// One profile in a browser on this device, as the same-device pick screen
+/// lists it: the slot (folder name) and what the person calls it.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct LocalProfileChoice {
+    pub slot: String,
+    pub name: String,
+}
+
+/// The profiles one same-device browser holds, for the pick screen.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct LocalBrowserProfiles {
+    pub browser: String,
+    pub display: String,
+    pub profiles: Vec<LocalProfileChoice>,
+}
+
 /// The counts behind the same-device "ready to move" screen: what would move out
 /// of the source browser into the picked target, on this device. `extensions`
 /// counts installed extensions, the same count the sync preview shows; how many
@@ -1146,6 +1425,7 @@ pub struct LocalPreview {
     pub target: String,
     pub logins: u64,
     pub passwords: u64,
+    pub cookies: u64,
     pub extensions: u64,
     pub bookmarks: u64,
     pub history: u64,
@@ -1167,6 +1447,12 @@ pub struct LocalMoveReport {
     pub history_urls: u64,
     pub extensions: u64,
     pub locked_cookies: u64,
+    /// Existing cookies in the target that no key could decrypt. They were
+    /// left byte-for-byte untouched and did not block the move.
+    #[serde(default)]
+    pub preserved_cookies: u64,
+    #[serde(default)]
+    pub extension_installs: Vec<crate::extinstall::InstallReport>,
 }
 
 /// The movable counts of one profile, before anyone decides where they go.
@@ -1174,6 +1460,7 @@ pub struct LocalMoveReport {
 struct StoreCounts {
     logins: u64,
     passwords: u64,
+    cookies: u64,
     extensions: u64,
     bookmarks: u64,
     history: u64,
@@ -1181,18 +1468,56 @@ struct StoreCounts {
 
 fn skip_reason(browser: &str, e: &Error) -> String {
     match e {
-        Error::AppBound => {
-            format!("{browser} locks some of its data to itself (App-Bound), so that part cannot be moved")
+        Error::AppBound => match Platform::current() {
+            Platform::Windows => format!(
+                "{browser} uses Windows App-Bound protection on some data — close {browser} and try again, or leave that data behind"
+            ),
+            _ => format!(
+                "{browser} has cookies sealed by the browser on Windows (App-Bound, v20); only that Windows install can open them — you can still move the rest"
+            ),
+        },
+        Error::WrongBrowserPassword => match Platform::current() {
+            Platform::Linux => format!(
+                "Could not unlock {browser} — unlock your login keyring, or open the Flatpak browser once so it can store its key"
+            ),
+            _ => format!(
+                "Could not unlock {browser} — sign in to its system keychain, then try again"
+            ),
+        },
+        Error::KeychainUnavailable(msg) => format!(
+            "{browser} keyring is unavailable ({msg}) — unlock the keyring or use --password-store=basic"
+        ),
+        Error::BrowserOpen => {
+            format!("Close {browser} completely, then try again")
         }
-        Error::WrongBrowserPassword => {
-            format!("{browser}'s own password was not found, so it cannot be read")
-        }
-        Error::BrowserOpen => format!("{browser} is open; close it completely and try again"),
         Error::NeverLaunched { browser: name } => {
-            format!("Open {name} once, then come back")
+            format!("Open {name} once on this device, then come back")
         }
         other => format!("{browser}: {other}"),
     }
+}
+
+fn locked_logins_skip_message(browser: &str, locked: u64) -> String {
+    if Platform::current() == Platform::Windows {
+        format!("{locked} saved logins are App-Bound and cannot be moved")
+    } else if locked == 1 {
+        format!("{browser}: 1 saved password uses a protected format and will stay behind")
+    } else {
+        format!("{browser}: {locked} saved passwords use a protected format and will stay behind")
+    }
+}
+
+fn count_cookie_rows(root: &Path, slot: &str) -> u64 {
+    let db = paths::cookies_in(root, slot);
+    if !db.exists() {
+        return 0;
+    }
+    let Ok((_tmp, copy)) = crate::util::snapshot_db(&db) else { return 0 };
+    let Ok(con) = rusqlite::Connection::open(&copy) else { return 0 };
+    let Ok(n) = con.query_row("SELECT COUNT(*) FROM cookies", [], |r| r.get::<_, i64>(0)) else {
+        return 0;
+    };
+    n.max(0) as u64
 }
 
 /// True when the profile's cookie store holds App-Bound (v20) values. Reads blob labels
@@ -1207,7 +1532,7 @@ fn has_app_bound_cookies_in(root: &Path, slot: &str) -> bool {
     let Ok(mut st) = con.prepare("SELECT encrypted_value FROM cookies") else { return false };
     let Ok(rows) = st.query_map([], |r| r.get::<_, Vec<u8>>(0)) else { return false };
     for v in rows.flatten() {
-        if v.starts_with(b"v20") {
+        if crate::oscrypt::encryption_is_app_bound(&v) {
             return true;
         }
     }
@@ -1217,8 +1542,16 @@ fn has_app_bound_cookies_in(root: &Path, slot: &str) -> bool {
 /// How many of the profile's cookies are locked to the browser itself (App-Bound,
 /// v20). Reads blob labels only, from a snapshot copy, so a running browser is
 /// never disturbed.
-fn count_locked_cookies(profile_dir: &Path) -> u64 {
-    let db = paths::cookies(profile_dir);
+fn local_profile_slot(slot: Option<&str>) -> &str {
+    slot.filter(|s| !s.is_empty()).unwrap_or(paths::DEFAULT_SLOT)
+}
+
+fn local_kind_id(slot: &str) -> String {
+    profile_id("local", slot)
+}
+
+fn count_locked_cookies_in(profile_dir: &Path, slot: &str) -> u64 {
+    let db = paths::cookies_in(profile_dir, slot);
     if !db.exists() {
         return 0;
     }
@@ -1226,12 +1559,15 @@ fn count_locked_cookies(profile_dir: &Path) -> u64 {
     let Ok(con) = rusqlite::Connection::open(&copy) else { return 0 };
     let Ok(mut st) = con.prepare("SELECT encrypted_value FROM cookies") else { return 0 };
     let Ok(rows) = st.query_map([], |r| r.get::<_, Vec<u8>>(0)) else { return 0 };
-    rows.flatten().filter(|v| v.starts_with(b"v20")).count() as u64
+    rows
+        .flatten()
+        .filter(|v| crate::oscrypt::encryption_is_app_bound(v))
+        .count() as u64
 }
 
 /// True when the profile's cookie store holds App-Bound (v20) values.
 fn has_app_bound_cookies(profile_dir: &Path) -> bool {
-    count_locked_cookies(profile_dir) > 0
+    has_app_bound_cookies_in(profile_dir, paths::DEFAULT_SLOT)
 }
 
 fn count_bookmark_urls(bytes: &[u8]) -> u64 {
@@ -1272,31 +1608,20 @@ fn box_name_matches(
 ) -> bool {
     let get = |k: &str| payload.manifest.get(k).and_then(|v| v.as_str());
     if fname == pipe::BOX_FILE {
-        // The main box is the sender's working profile. Unrouted, it is
-        // for this device's working profile of the same browser, so a
-        // device working in another browser leaves it alone. Routed, the
-        // route governs and the box is admitted for the read loop's own
-        // gates to place. Either way the slot must agree: a main box
-        // naming a non-Default slot is wearing the working profile's
-        // filename, and is refused.
+        // The main box is the sender's working profile. Cross-device landings
+        // are chosen on the receiving device, so the browser named in the
+        // manifest need not be this device's working browser. The slot must
+        // still agree: a main box naming a non-Default slot wears the working
+        // profile's filename, and is refused.
         if let Some(s) = get("profile_slot") {
             if s != paths::DEFAULT_SLOT {
                 return false;
             }
         }
-        let routed = match (get("profile_browser"), get("route_browser")) {
-            (Some(b), Some(r)) => r.to_lowercase() != b.to_lowercase(),
-            _ => false,
-        };
-        if routed {
+        if get("profile_browser").is_some() || working.is_some() {
             return true;
         }
-        return match get("profile_browser") {
-            Some(b) => working
-                .as_ref()
-                .is_some_and(|w| b.to_lowercase() == w.browser),
-            None => true,
-        };
+        return false;
     }
     if pipe::is_profile_box(fname) {
         let inner = fname
@@ -1392,6 +1717,7 @@ impl App {
             paired: self.load_key()?.is_some(),
             other_device: other,
             pipe_set: self.config.pipe_path.is_some(),
+            pipe_kind: self.config.pipe_kind.clone(),
             browser: wp.as_ref().map(|p| p.display.clone()),
             profile_found: wp.is_some(),
         })
@@ -1471,22 +1797,56 @@ impl App {
     /// refuses (a route for a left-out profile, an unknown id) refuse here too,
     /// so the screen never promises a move the engine will not run. Read-only:
     /// nothing in any profile is changed.
-    pub fn preview_counts(&self, excluded: &[String], routes: &[RouteChoice]) -> Result<Preview> {
+    pub fn preview_counts(&mut self, excluded: &[String], routes: &[RouteChoice]) -> Result<Preview> {
         let sources = self.source_profiles();
-        let route_map = validate_routes(&sources, excluded, routes)?;
+        let targets = route_targets(self);
+        let mut arriving = Vec::new();
+        if let Ok(Some(key)) = self.load_key() {
+            if let Ok(p) = self.require_pipe() {
+                let my_id = self.device_id()?;
+                let device = self.device_name();
+                let peek = scan_incoming_boxes(self, p.as_ref(), &key, &my_id, &device)?;
+                for inc in peek {
+                    let (destination, destination_note) =
+                        default_incoming_destination(&inc.src_browser, &targets);
+                    arriving.push(ArrivingProfile {
+                        id: inc.id(),
+                        name: inc.src_name.clone(),
+                        from_browser: inc.src_browser.clone(),
+                        from_browser_display: browser_display(&inc.src_browser),
+                        from_device: inc.origin.clone(),
+                        destination,
+                        routed: false,
+                        destination_note,
+                    });
+                }
+                let route_map = validate_incoming_routes(&arriving, routes)?;
+                for ap in &mut arriving {
+                    if let Some(d) = route_map.get(&ap.id) {
+                        ap.destination = d.clone();
+                        ap.routed = d != &ap.from_browser;
+                        if ap.routed {
+                            ap.destination_note = None;
+                        }
+                    }
+                }
+            }
+        }
         let excluded_set: BTreeSet<&str> = excluded.iter().map(String::as_str).collect();
         // The remembered unticks apply on top of the shell's current set: a
         // profile left out of the last finished move starts this preview out
         // too, until a move runs with it back in.
         let remembered_set: BTreeSet<&str> =
             self.config.excluded_profiles.iter().map(String::as_str).collect();
+        let no_profiles = sources.is_empty() && arriving.is_empty();
         let mut out = Preview {
             target: self.config.other_device.clone().unwrap_or_default(),
             browsers: Vec::new(),
-            targets: route_targets(),
+            targets,
+            arriving,
             skipped: Vec::new(),
         };
-        if sources.is_empty() {
+        if no_profiles {
             out.skipped.push(Skipped {
                 browser: String::new(),
                 reason: "no browser profile was found on this device".into(),
@@ -1505,6 +1865,7 @@ impl App {
                 display: display.clone(),
                 logins: 0,
                 passwords: 0,
+                cookies: 0,
                 extensions: 0,
                 bookmarks: 0,
                 history: 0,
@@ -1513,16 +1874,14 @@ impl App {
             };
             for sp in group {
                 let (mut pp, mut sk) = self.count_profile(sp);
-                pp.destination = route_map
-                    .get(&sp.id)
-                    .cloned()
-                    .unwrap_or_else(|| sp.browser.clone());
-                pp.routed = pp.destination != sp.browser;
+                pp.destination = sp.browser.clone();
+                pp.routed = false;
                 pp.excluded = excluded_set.contains(sp.id.as_str());
                 pp.ticked = !pp.excluded && !remembered_set.contains(sp.id.as_str());
                 if pp.ticked {
                     bp.logins += pp.logins;
                     bp.passwords += pp.passwords;
+                    bp.cookies += pp.cookies;
                     bp.extensions += pp.extensions;
                     bp.bookmarks += pp.bookmarks;
                     bp.history += pp.history;
@@ -1545,6 +1904,7 @@ impl App {
             name: sp.name.clone(),
             logins: 0,
             passwords: 0,
+            cookies: 0,
             extensions: 0,
             bookmarks: 0,
             history: 0,
@@ -1567,21 +1927,37 @@ impl App {
             });
             return (pp, skipped);
         }
-        match self.keys_for(&sp.browser) {
-            Ok(keys) => match logins::export_counted(&paths::login_data_in(&sp.root, &sp.slot), &keys) {
-                Ok((found, locked)) => {
-                    if locked > 0 {
-                        skipped.push(Skipped { browser: display.clone(), reason: format!("{locked} saved logins are App-Bound and cannot be moved") });
+        pp.cookies = count_cookie_rows(&sp.root, &sp.slot);
+        match self.keys_for_at(&sp.browser, Some(&sp.root)) {
+            Ok(keys) => {
+                match logins::export_counted(&paths::login_data_in(&sp.root, &sp.slot), &keys) {
+                    Ok((found, locked)) => {
+                        if locked > 0 {
+                            skipped.push(Skipped {
+                                browser: display.clone(),
+                                reason: locked_logins_skip_message(&display, locked as u64),
+                            });
+                        }
+                        pp.logins = found.len() as u64;
+                        pp.passwords =
+                            found.iter().filter(|l| !l.password_value.is_empty()).count() as u64;
                     }
-                    pp.logins = found.len() as u64;
-                    pp.passwords =
-                        found.iter().filter(|l| !l.password_value.is_empty()).count() as u64;
+                    Err(e) => skipped.push(Skipped {
+                        browser: display.clone(),
+                        reason: skip_reason(&display, &e),
+                    }),
                 }
-                Err(e) => skipped.push(Skipped {
-                    browser: display.clone(),
-                    reason: skip_reason(&display, &e),
-                }),
-            },
+                if pp.cookies > 0 {
+                    let cookie_path = paths::cookies_in(&sp.root, &sp.slot);
+                    match crate::cookies::export(&cookie_path, &keys) {
+                        Ok(moved) => pp.cookies = moved.len() as u64,
+                        Err(e) => skipped.push(Skipped {
+                            browser: display.clone(),
+                            reason: skip_reason(&display, &e),
+                        }),
+                    }
+                }
+            }
             Err(e) => skipped.push(Skipped {
                 browser: display.clone(),
                 reason: skip_reason(&display, &e),
@@ -1634,8 +2010,14 @@ impl App {
         &mut self,
         excluded: Option<&[String]>,
         routes: &[RouteChoice],
+        profile_kinds: Option<&ProfileKinds>,
         on: &mut dyn FnMut(Progress),
     ) -> Result<MoveReport> {
+        if let Some(m) = profile_kinds {
+            for list in m.values() {
+                validate_kinds(Some(list.as_slice()))?;
+            }
+        }
         let key = self
             .load_key()?
             .ok_or_else(|| Error::Refused("this device is not paired yet".into()))?;
@@ -1648,7 +2030,6 @@ impl App {
             Some(list) => list.to_vec(),
             None => self.config.excluded_profiles.clone(),
         };
-        let route_map = validate_routes(&sources, &effective, routes)?;
         let excluded_set: BTreeSet<&str> = effective.iter().map(String::as_str).collect();
         // Never-launched first among profile work: a profile with no Cookies and
         // no Login Data was never opened. Refuse before the move lock, browser
@@ -1692,6 +2073,8 @@ impl App {
         // Browsers this move actually read from (their password was
         // readable): only they take part, for what the move remembers.
         let mut took_part: BTreeSet<String> = BTreeSet::new();
+        let landing_targets = route_targets(self);
+        let mut incoming_route_map: Option<BTreeMap<String, String>> = None;
 
         // A push that loses a race earns exactly one more round (refresh, merge, send).
         for round in 0..2 {
@@ -1711,7 +2094,7 @@ impl App {
 
             on(Progress { frac: 0.15, step: "read".into(), line: "Reading what your other device sent".into() });
             let mut digests: BTreeMap<String, String> = BTreeMap::new();
-            let mut incoming: Vec<Incoming> = Vec::new();
+            let mut candidates: Vec<Incoming> = Vec::new();
             for box_path in p.boxes()? {
                 let fname = box_path
                     .file_name()
@@ -1743,20 +2126,49 @@ impl App {
                 if is_own_box(&payload, Some(&my_id), &device) {
                     continue; // our own box coming back around; nothing to apply
                 }
-                let inc = Incoming::from_payload(payload, &working);
-                let routed = inc.route.as_ref().is_some_and(|r| r != &inc.src_browser);
-                if !routed
-                    && !sources
-                        .iter()
-                        .any(|s| s.browser == inc.src_browser && s.slot == inc.src_slot)
-                {
-                    // No such profile on this device (it never existed here,
-                    // or its folder lost a naming collision): the box is
-                    // skipped whole rather than inventing a home for it.
+                candidates.push(Incoming::from_payload(payload, &working));
+            }
+            if incoming_route_map.is_none() {
+                let arriving: Vec<ArrivingProfile> = candidates
+                    .iter()
+                    .map(|inc| {
+                        let (destination, destination_note) =
+                            default_incoming_destination(&inc.src_browser, &landing_targets);
+                        ArrivingProfile {
+                            id: inc.id(),
+                            name: inc.src_name.clone(),
+                            from_browser: inc.src_browser.clone(),
+                            from_browser_display: browser_display(&inc.src_browser),
+                            from_device: inc.origin.clone(),
+                            destination,
+                            routed: false,
+                            destination_note,
+                        }
+                    })
+                    .collect();
+                incoming_route_map = Some(validate_incoming_routes(&arriving, routes)?);
+            }
+            let route_map = incoming_route_map.as_ref().expect("incoming routes validated once");
+            let mut incoming = Vec::new();
+            let mut admit_failures: Vec<RouteLine> = Vec::new();
+            for inc in candidates {
+                if incoming_admits(&inc, &sources, route_map, self) {
+                    incoming.push(inc);
+                } else {
                     report.boxes_skipped += 1;
-                    continue;
+                    admit_failures.push(RouteLine {
+                        profile: inc.id(),
+                        from_browser: inc.src_browser.clone(),
+                        to_browser: inc.src_browser.clone(),
+                        into_profile: None,
+                        created: false,
+                        status: "failed".into(),
+                        reason: Some(format!(
+                            "{} is not on this computer",
+                            browser_display(&inc.src_browser)
+                        )),
+                    });
                 }
-                incoming.push(inc);
             }
 
             // Plan the landings: group the jobs by destination root, so each
@@ -1768,12 +2180,11 @@ impl App {
                 BTreeMap::new();
             let mut lines: BTreeMap<usize, RouteLine> = BTreeMap::new();
             for (i, inc) in incoming.iter().enumerate() {
-                let routed = inc.route.as_ref().is_some_and(|r| r != &inc.src_browser);
-                let dest = if routed {
-                    inc.route.clone().expect("routed")
-                } else {
-                    inc.src_browser.clone()
-                };
+                let dest = route_map
+                    .get(&inc.id())
+                    .cloned()
+                    .unwrap_or_else(|| inc.src_browser.clone());
+                let routed = dest != inc.src_browser;
                 let fail = |lines: &mut BTreeMap<usize, RouteLine>, reason: String| {
                     lines.insert(i, RouteLine {
                         profile: inc.id(),
@@ -1793,24 +2204,24 @@ impl App {
                     fail(&mut lines, format!("{dest} is not one of the browsers Move It moves between"));
                     continue;
                 }
-                if !routed && excluded_set.contains(inc.id().as_str()) {
-                    continue; // headed for a profile sitting this move out; left in the pipe
-                }
                 let Some(root) = self.dest_root(&dest) else {
                     fail(&mut lines, format!("there is no {} folder on this device", browser_display(&dest)));
                     continue;
                 };
-                let (target, was_fresh) = if routed {
-                    // A routed profile that already landed here in an earlier
-                    // move has a home now: later boxes merge into it instead of
-                    // landing fresh again every move.
-                    match landed_book.home(&inc.origin_key, &inc.src_browser, &inc.src_slot, &root) {
-                        Some(home) => (engine::Target::Slot(home), false),
-                        None => (engine::Target::Fresh { display: inc.src_name.clone() }, true),
+                let (target, was_fresh) =
+                    incoming_landing_target(inc, routed, &root, &landed_book);
+                if let engine::Target::Slot(slot) = &target {
+                    if root.join(slot).is_dir() && paths::never_launched(&root, slot) {
+                        fail(
+                            &mut lines,
+                            format!(
+                                "Open {} once on this device, then try again",
+                                browser_display(&dest)
+                            ),
+                        );
+                        continue;
                     }
-                } else {
-                    (engine::Target::Slot(inc.src_slot.clone()), false)
-                };
+                }
                 groups
                     .entry(root.to_string_lossy().into_owned())
                     .or_insert_with(|| (dest.clone(), root.clone(), Vec::new()))
@@ -1822,21 +2233,7 @@ impl App {
             }
 
             if !groups.is_empty() {
-                for (_k, (dest, root, grouped)) in &groups {
-                    // Existing never-launched destinations: refuse before recover
-                    // or plant. Fresh slots the engine creates are not checked.
-                    for (_meta, job) in grouped {
-                        if let engine::Target::Slot(slot) = &job.target {
-                            if root.join(slot).is_dir() && paths::never_launched(root, slot) {
-                                return Err(Error::NeverLaunched {
-                                    browser: browser_display(dest),
-                                });
-                            }
-                        }
-                    }
-                    if root_open(root) {
-                        return Err(Error::BrowserOpen);
-                    }
+                for (_k, (_dest, root, _grouped)) in &groups {
                     let _ = txn::recover(root);
                 }
                 on(Progress { frac: 0.45, step: "apply".into(), line: "Moving your other device's profiles in".into() });
@@ -1858,14 +2255,10 @@ impl App {
                         });
                     }
                 };
-                // Creating a profile under a running browser is not safe: the
-                // browser's own profile list would fight ours. Merging into
-                // profiles that already exist keeps the long-standing behavior.
-                let creates = job_list.iter().any(|j| match &j.target {
-                    engine::Target::Fresh { .. } => true,
-                    engine::Target::Slot(name) => !root.join(name).is_dir(),
-                });
-                if creates && root_open(&root) {
+                // Never write into a running browser: it holds its databases
+                // open and would overwrite or corrupt what we land. This
+                // profile fails on its own line; the rest of the move runs.
+                if root_open(&root) {
                     fail_all(&mut lines, format!("{display} is open on this device; close it and try again"));
                     continue;
                 }
@@ -1877,7 +2270,16 @@ impl App {
                     }
                 };
                 let previous = if landed_roots.contains(&root) { current_undo_point(&root) } else { None };
-                match engine::import_many_preserving(&root, &keys, HostTag::Without, &job_list, now_micros(), previous.as_deref()) {
+                match engine::import_many_preserving(
+                    &root,
+                    &keys,
+                    HostTag::Without,
+                    &job_list,
+                    now_micros(),
+                    previous.as_deref(),
+                    dest.as_str(),
+                    &display,
+                ) {
                     Ok(landed) => {
                         landed_roots.insert(root.clone());
                         for ((i, id, src, origin, src_slot, was_fresh), l) in
@@ -1889,6 +2291,8 @@ impl App {
                             }
                             report.boxes_read += 1;
                             report.cookies += l.applied.cookies.imported as u64;
+                            report.preserved_cookies +=
+                                l.applied.cookies.preserved_undecryptable as u64;
                             report.logins +=
                                 (l.applied.logins.inserted + l.applied.logins.updated) as u64;
                             if let Some(h) = &l.applied.history {
@@ -1909,7 +2313,8 @@ impl App {
                     Err(e) => fail_all(&mut lines, skip_reason(&display, &e)),
                 }
             }
-            report.routes = lines.into_values().collect();
+            admit_failures.extend(lines.into_values());
+            report.routes = admit_failures;
 
             for sp in &sources {
                 if excluded_set.contains(sp.id.as_str()) {
@@ -1950,8 +2355,11 @@ impl App {
                     slot: &sp.slot,
                     keys: &keys,
                     login_tag: HostTag::Without,
+                    browser: &sp.browser,
+                    display: &display,
                 };
-                let mut payload = match engine::export(&prof, &device) {
+                let pk = kinds_for_profile(profile_kinds, &sp.id);
+                let mut payload = match engine::export(&prof, &device, pk) {
                     Ok(p) => {
                         took_part.insert(sp.browser.clone());
                         for source in sources.iter().filter(|s| s.browser == sp.browser) {
@@ -1986,9 +2394,6 @@ impl App {
                 payload.manifest.insert("profile_browser".into(), sp.browser.clone().into());
                 payload.manifest.insert("profile_slot".into(), sp.slot.clone().into());
                 payload.manifest.insert("profile_name".into(), sp.name.clone().into());
-                if let Some(dest) = route_map.get(&sp.id) {
-                    payload.manifest.insert("route_browser".into(), dest.clone().into());
-                }
                 // The working profile is its root's Default slot; a sibling slot
                 // in the same folder is a different profile with its own box.
                 let is_working = working.as_ref().is_some_and(|w| {
@@ -2001,6 +2406,11 @@ impl App {
                 } else {
                     pipe::profile_box_name(&sp.browser, &slot_slug(&sp.slot))
                 };
+                let arr_len = |k: &str| payload.manifest.get(k).and_then(serde_json::Value::as_array).map_or(0, |a| a.len() as u64);
+                report.sent_profiles += 1;
+                report.sent_cookies += arr_len("cookies");
+                report.sent_logins += arr_len("passwords");
+                report.sent_history_urls += payload.manifest.get("history").and_then(|h| h.get("urls")).and_then(serde_json::Value::as_array).map_or(0, |a| a.len() as u64);
                 let digest = payload_digest(&payload)?;
                 if digests.get(&fname).is_some_and(|d| d == &digest) {
                     continue; // the pipe already holds exactly this profile
@@ -2267,8 +2677,10 @@ impl App {
     }
 
     /// Is the working profile's browser open right now? Two signals: the browser's own
-    /// lock marker with a live process behind it, and the store lock canary (a write
-    /// lock on the cookie store that only a running browser's database can refuse).
+    /// lock marker with a live process behind it (the recorded pid, or the browser's
+    /// host processes when that pid is a sandbox pid), and the store lock canary (a
+    /// write lock on the cookie store that only a running browser's database can
+    /// refuse).
     /// The newest log lines, oldest first; the Logs screen renders them
     /// newest first.
     pub fn logs_recent(&self, n: usize) -> Vec<crate::logbuf::LogLine> {
@@ -2280,18 +2692,48 @@ impl App {
         self.logs.export(now_secs())
     }
 
-    pub fn browser_open_check(&self) -> Result<OpenCheck> {
-        let Some(wp) = self.working_profile() else { return Ok(OpenCheck::Clear) };
-        if profile_open(&wp) {
-            Ok(OpenCheck::Blocked { browser: wp.display })
-        } else {
-            Ok(OpenCheck::Clear)
+    pub fn browser_open_check(
+        &self,
+        excluded: &[String],
+        routes: &[RouteChoice],
+    ) -> Result<OpenCheck> {
+        let _ = excluded;
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(wp) = self.working_profile() {
+            roots.push(wp.dir.clone());
         }
+        for r in routes {
+            let browser = r.browser.to_lowercase();
+            if let Some(root) = self.dest_root(&browser) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+        }
+        for root in roots {
+            if root_open(&root) {
+                let display = self
+                    .working_profile()
+                    .filter(|w| w.dir == root)
+                    .map(|w| w.display.clone())
+                    .or_else(|| {
+                        routes.iter().find_map(|r| {
+                            self.dest_root(&r.browser.to_lowercase()).filter(|d| d == &root).map(|_| {
+                                browser_display(&r.browser)
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| "your browser".into());
+                return Ok(OpenCheck::Blocked { browser: display });
+            }
+        }
+        Ok(OpenCheck::Clear)
     }
 
-    /// The browsers the same-device move can pick from: every profile this device
-    /// has, each once, pinned and registered ones first, then detection order.
-    pub fn local_browsers(&self) -> Vec<BrowserChoice> {
+    /// The browser folders the same-device move can pick from, in pick order:
+    /// the pinned override first, then registered and detected roots, each
+    /// browser once.
+    fn local_browser_roots(&self) -> Vec<DetectedProfile> {
         let mut found: Vec<DetectedProfile> = Vec::new();
         if let Some((b, d)) = &self.profile_override {
             found.push(DetectedProfile { browser: b.clone(), display: browser_display(b), dir: d.clone() });
@@ -2302,8 +2744,31 @@ impl App {
             }
         }
         found
+    }
+
+    /// The browsers the same-device move can pick from: every profile this device
+    /// has, each once, pinned and registered ones first, then detection order.
+    pub fn local_browsers(&self) -> Vec<BrowserChoice> {
+        self.local_browser_roots()
             .into_iter()
             .map(|p| BrowserChoice { browser: p.browser, display: p.display })
+            .collect()
+    }
+
+    /// Every profile each same-device browser holds, in the browser's own
+    /// order, so the pick screen can ask which profile to move when a
+    /// browser has more than one.
+    pub fn local_browser_profiles(&self) -> Vec<LocalBrowserProfiles> {
+        self.local_browser_roots()
+            .into_iter()
+            .map(|p| LocalBrowserProfiles {
+                profiles: profiles::list_slots(&p.dir)
+                    .into_iter()
+                    .map(|s| LocalProfileChoice { slot: s.name, name: s.display })
+                    .collect(),
+                browser: p.browser,
+                display: p.display,
+            })
             .collect()
     }
 
@@ -2311,37 +2776,52 @@ impl App {
     /// name honestly what would not. Read-only: nothing in any profile is changed.
     /// The movable counts of one same-device profile, with every store
     /// that would not read named in the skipped list.
-    fn count_stores(&self, prof: &DetectedProfile) -> (StoreCounts, Vec<Skipped>) {
+    fn count_stores(&self, prof: &DetectedProfile, slot: &str) -> (StoreCounts, Vec<Skipped>) {
         let mut counts = StoreCounts::default();
         let mut skipped: Vec<Skipped> = Vec::new();
-        match self.keys_for(&prof.browser) {
-            Ok(keys) => match logins::export_counted(&paths::login_data(&prof.dir), &keys) {
-                Ok((found, locked)) => {
-                    if locked > 0 {
-                        skipped.push(Skipped { browser: prof.display.clone(), reason: format!("{locked} saved logins are App-Bound and cannot be moved") });
+        counts.cookies = count_cookie_rows(&prof.dir, slot);
+        match self.keys_for_at(&prof.browser, Some(&prof.dir)) {
+            Ok(keys) => {
+                match logins::export_counted(&paths::login_data_in(&prof.dir, slot), &keys) {
+                    Ok((found, locked)) => {
+                        if locked > 0 {
+                            skipped.push(Skipped {
+                                browser: prof.display.clone(),
+                                reason: locked_logins_skip_message(&prof.display, locked as u64),
+                            });
+                        }
+                        counts.logins = found.len() as u64;
+                        counts.passwords =
+                            found.iter().filter(|l| !l.password_value.is_empty()).count() as u64;
                     }
-                    counts.logins = found.len() as u64;
-                    counts.passwords =
-                        found.iter().filter(|l| !l.password_value.is_empty()).count() as u64;
+                    Err(e) => skipped.push(Skipped {
+                        browser: prof.display.clone(),
+                        reason: skip_reason(&prof.display, &e),
+                    }),
                 }
-                Err(e) => skipped.push(Skipped {
-                    browser: prof.display.clone(),
-                    reason: skip_reason(&prof.display, &e),
-                }),
-            },
+                if counts.cookies > 0 {
+                    match crate::cookies::export(&paths::cookies_in(&prof.dir, slot), &keys) {
+                        Ok(moved) => counts.cookies = moved.len() as u64,
+                        Err(e) => skipped.push(Skipped {
+                            browser: prof.display.clone(),
+                            reason: skip_reason(&prof.display, &e),
+                        }),
+                    }
+                }
+            }
             Err(e) => skipped.push(Skipped {
                 browser: prof.display.clone(),
                 reason: skip_reason(&prof.display, &e),
             }),
         }
-        match history::export(&paths::history(&prof.dir)) {
+        match history::export(&paths::history_in(&prof.dir, slot)) {
             Ok(section) => counts.history = section.urls.len() as u64,
             Err(e) => skipped.push(Skipped {
                 browser: prof.display.clone(),
                 reason: skip_reason(&prof.display, &e),
             }),
         }
-        match bookmarks::export(&paths::bookmarks(&prof.dir)) {
+        match bookmarks::export(&paths::bookmarks_in(&prof.dir, slot)) {
             Ok((_m, bytes)) => {
                 counts.bookmarks = bytes.as_deref().map(count_bookmark_urls).unwrap_or(0);
             }
@@ -2350,7 +2830,7 @@ impl App {
                 reason: skip_reason(&prof.display, &e),
             }),
         }
-        match extstate::installed_extension_ids(&prof.dir) {
+        match extstate::installed_extension_ids_in(&prof.dir, slot) {
             Ok(ids) => counts.extensions = ids.len() as u64,
             Err(e) => skipped.push(Skipped {
                 browser: prof.display.clone(),
@@ -2360,7 +2840,15 @@ impl App {
         (counts, skipped)
     }
 
-    pub fn local_preview(&self, source: &str, target: &str) -> Result<LocalPreview> {
+    pub fn local_preview(
+        &self,
+        source: &str,
+        target: &str,
+        source_slot: Option<&str>,
+        target_slot: Option<&str>,
+    ) -> Result<LocalPreview> {
+        let src_slot = local_profile_slot(source_slot);
+        let dst_slot = local_profile_slot(target_slot);
         let src = self.require_local_profile(source)?;
         let dst = self.require_local_profile(target)?;
         if src.dir == dst.dir {
@@ -2368,12 +2856,12 @@ impl App {
         }
         // Never-launched first: touch nothing (no keys, no counts) until both
         // sides have been opened in their browser at least once.
-        if paths::never_launched(&src.dir, paths::DEFAULT_SLOT) {
+        if paths::never_launched(&src.dir, src_slot) {
             return Err(Error::NeverLaunched {
                 browser: src.display.clone(),
             });
         }
-        if paths::never_launched(&dst.dir, paths::DEFAULT_SLOT) {
+        if paths::never_launched(&dst.dir, dst_slot) {
             return Err(Error::NeverLaunched {
                 browser: dst.display.clone(),
             });
@@ -2384,8 +2872,8 @@ impl App {
         // counts that promise a move.
         self.keys_for(&src.browser)?;
         self.keys_for(&dst.browser)?;
-        let (counts, mut skipped) = self.count_stores(&src);
-        let locked_cookies = count_locked_cookies(&src.dir);
+        let (counts, mut skipped) = self.count_stores(&src, src_slot);
+        let locked_cookies = count_locked_cookies_in(&src.dir, src_slot);
         if locked_cookies > 0 {
             skipped.push(Skipped {
                 browser: src.display.clone(),
@@ -2397,6 +2885,7 @@ impl App {
             target: dst.display,
             logins: counts.logins,
             passwords: counts.passwords,
+            cookies: counts.cookies,
             extensions: counts.extensions,
             bookmarks: counts.bookmarks,
             history: counts.history,
@@ -2415,20 +2904,30 @@ impl App {
         &mut self,
         source: &str,
         target: &str,
+        source_slot: Option<&str>,
+        target_slot: Option<&str>,
+        profile_kinds: Option<&ProfileKinds>,
         on: &mut dyn FnMut(Progress),
     ) -> Result<LocalMoveReport> {
+        if let Some(m) = profile_kinds {
+            for list in m.values() {
+                validate_kinds(Some(list.as_slice()))?;
+            }
+        }
+        let src_slot = local_profile_slot(source_slot);
+        let dst_slot = local_profile_slot(target_slot);
         let src = self.require_local_profile(source)?;
         let dst = self.require_local_profile(target)?;
         if src.dir == dst.dir {
             return Err(Error::Refused("a browser cannot move into itself".into()));
         }
         // Never-launched first: before the lock, keys, recover, or any plant.
-        if paths::never_launched(&src.dir, paths::DEFAULT_SLOT) {
+        if paths::never_launched(&src.dir, src_slot) {
             return Err(Error::NeverLaunched {
                 browser: src.display.clone(),
             });
         }
-        if paths::never_launched(&dst.dir, paths::DEFAULT_SLOT) {
+        if paths::never_launched(&dst.dir, dst_slot) {
             return Err(Error::NeverLaunched {
                 browser: dst.display.clone(),
             });
@@ -2451,15 +2950,30 @@ impl App {
         txn::recover(&dst.dir)?;
 
         on(Progress { frac: 0.1, step: "read".into(), line: format!("Reading {}", src.display) });
-        let src_prof = engine::Profile { dir: &src.dir, slot: paths::DEFAULT_SLOT, keys: &src_keys, login_tag: HostTag::Without };
-        let payload = engine::export(&src_prof, &self.device_name())?;
+        let src_prof = engine::Profile {
+            dir: &src.dir,
+            slot: src_slot,
+            keys: &src_keys,
+            login_tag: HostTag::Without,
+            browser: &src.browser,
+            display: &src.display,
+        };
+        let pk = kinds_for_profile(profile_kinds, &local_kind_id(src_slot));
+        let payload = engine::export(&src_prof, &self.device_name(), pk)?;
 
         on(Progress {
             frac: 0.55,
             step: "apply".into(),
             line: format!("Moving your things into {}", dst.display),
         });
-        let dst_prof = engine::Profile { dir: &dst.dir, slot: paths::DEFAULT_SLOT, keys: &dst_keys, login_tag: HostTag::Without };
+        let dst_prof = engine::Profile {
+            dir: &dst.dir,
+            slot: dst_slot,
+            keys: &dst_keys,
+            login_tag: HostTag::Without,
+            browser: &dst.browser,
+            display: &dst.display,
+        };
         let applied = engine::import(&dst_prof, &payload, now_micros())?;
         self.record_landings(&BTreeSet::from([dst.dir.clone()]), &self.load_landed())?;
 
@@ -2474,7 +2988,9 @@ impl App {
                 .map(|h| (h.urls_inserted + h.urls_updated) as u64)
                 .unwrap_or(0),
             extensions: applied.extensions.ids.len() as u64,
-            locked_cookies: count_locked_cookies(&src.dir),
+            locked_cookies: count_locked_cookies_in(&src.dir, src_slot),
+            preserved_cookies: applied.cookies.preserved_undecryptable as u64,
+            extension_installs: applied.extension_installs.reports,
         };
         on(Progress { frac: 1.0, step: "done".into(), line: "Everything moved".into() });
         Ok(report)
@@ -2513,8 +3029,9 @@ impl App {
 }
 
 /// Is this profile's browser open right now? Two signals: the browser's own lock
-/// marker with a live process behind it, and the store lock canary (a write lock
-/// on the cookie store that only a running browser's database can refuse).
+/// marker with a live process behind it (the recorded pid, or the browser's host
+/// processes when that pid is a sandbox pid), and the store lock canary (a write
+/// lock on the cookie store that only a running browser's database can refuse).
 fn profile_open(p: &DetectedProfile) -> bool {
     root_open(&p.dir)
 }
@@ -2528,12 +3045,177 @@ fn root_open(root: &Path) -> bool {
 }
 
 /// The browser leaves a `SingletonLock` marker naming its process while it runs.
+/// The name is `hostname-pid`, but the pid only means something in the pid
+/// namespace the browser runs in: a Flatpak browser records its sandbox pid
+/// (the app is pid 2 there), which on the host is a kernel thread. A recorded
+/// pid therefore proves the browser is open only when the host process behind
+/// it is plausibly that browser. When it does not resolve, the browser's own
+/// host processes are the next witness: a running Flatpak browser is alive on
+/// the host even though its recorded pid is meaningless there, and only when
+/// no host process speaks for it either is the browser really closed.
 #[cfg(unix)]
 fn singleton_live(dir: &Path) -> bool {
     let Ok(target) = std::fs::read_link(dir.join("SingletonLock")) else { return false };
     let s = target.to_string_lossy();
     let Some(pid) = s.rsplit('-').next().and_then(|t| t.parse::<i32>().ok()) else { return false };
-    process_live(pid)
+    (process_live(pid) && pid_could_be_browser(pid, dir)) || host_browser_live(dir)
+}
+
+/// Identity screen for a live pid named by a SingletonLock. Kernel threads
+/// and zombies are never a browser; they are the shapes with no command
+/// line at all, told apart from a userspace process caught mid-exec (whose
+/// command line also reads empty for a moment) by the process flags in
+/// /proc/<pid>/stat. A process whose
+/// command line names a browser binary, or this profile root (a browser
+/// launched with --user-data-dir), is the browser. Anything we cannot
+/// inspect (no /proc, no permission) and any larger pid we cannot rule out
+/// stays "could be the browser": the guard keeps its bias toward protecting
+/// a running browser's stores. Only the shapes that provably are not the
+/// browser clear the check: no command line at all, or a boot-range pid
+/// plainly running something else (init and its earliest children live
+/// there; that is where sandbox-namespace pids land on the host).
+#[cfg(unix)]
+fn pid_could_be_browser(pid: i32, root: &Path) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return true;
+    };
+    if cmdline.is_empty() {
+        return !is_kernel_thread_or_zombie(pid);
+    }
+    let text = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+    let argv0 = text.split(' ').next().unwrap_or_default();
+    let base = argv0.rsplit('/').next().unwrap_or_default().to_lowercase();
+    const BROWSER_TOKENS: [&str; 6] = ["brave", "chrome", "chromium", "msedge", "opera", "vivaldi"];
+    if BROWSER_TOKENS.iter().any(|t| base.contains(t)) {
+        return true;
+    }
+    if text.contains(&*root.to_string_lossy()) {
+        return true;
+    }
+    pid >= 512
+}
+
+/// Kernel threads and zombies are never a browser, and both read as an
+/// empty command line, but so does a userspace process in the middle of
+/// exec. The stat flags tell them apart: PF_KTHREAD marks a kernel
+/// thread, and a zombie's state is Z. Anything unprovable keeps the
+/// benefit of the doubt (not proven kernel or zombie).
+#[cfg(unix)]
+fn is_kernel_thread_or_zombie(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+        // comm is parenthesised and may itself contain spaces or parens;
+        // the fields after the closing paren start at state (field 3),
+        // so flags (field 9) is the seventh of them.
+        let Some(rest) = stat.rsplit(')').next() else { return false };
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        if fields.first() == Some(&"Z") {
+            return true;
+        }
+        const PF_KTHREAD: i64 = 0x200000;
+        fields
+            .get(6)
+            .and_then(|f| f.parse::<i64>().ok())
+            .map(|flags| flags & PF_KTHREAD != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Host-side witnesses for a browser whose recorded singleton pid did not
+/// resolve: a live process whose command line names this profile root or,
+/// for a Flatpak install, its app (the sandbox launcher names the app id,
+/// and the app's own processes name its app home), or a process holding
+/// this root's SingletonSocket. Only Linux exposes the process table this
+/// reads; elsewhere the recorded pid and the store lock canaries decide.
+#[cfg(target_os = "linux")]
+fn host_browser_live(root: &Path) -> bool {
+    let app_id = crate::oscrypt::flatpak_app_id_from_install(root);
+    let root_text = root.to_string_lossy().into_owned();
+    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let Ok(cmd) = std::fs::read(e.path().join("cmdline")) else { continue };
+        if !cmd.is_empty() && cmdline_names_this_browser(&cmd, &root_text, app_id) {
+            return true;
+        }
+    }
+    singleton_socket_held(root)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn host_browser_live(_root: &Path) -> bool {
+    false
+}
+
+/// Does this process command line belong to the browser living at `root`?
+/// A browser's processes name their user-data dir, and a Flatpak app's
+/// processes name the app home or, for the sandbox launcher, the app id
+/// itself. Anything else (another browser, another app, a plain sleeper)
+/// does not match, so a stale singleton still clears.
+#[cfg(target_os = "linux")]
+fn cmdline_names_this_browser(cmdline: &[u8], root: &str, app_id: Option<&str>) -> bool {
+    let text = String::from_utf8_lossy(cmdline).replace('\0', " ");
+    if text.contains(root) {
+        return true;
+    }
+    let Some(app) = app_id else { return false };
+    if text.contains(&format!("/.var/app/{app}/")) {
+        return true;
+    }
+    let argv0 = text.split(' ').next().unwrap_or_default();
+    let base = argv0.rsplit('/').next().unwrap_or_default();
+    (base == "bwrap" || base == "flatpak") && text.contains(app)
+}
+
+/// A process holding this root's SingletonSocket is the browser: that
+/// socket is how a second launch hands off to the running instance.
+#[cfg(target_os = "linux")]
+fn singleton_socket_held(root: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(root.join("SingletonSocket")) else { return false };
+    // The socket's kernel inode is not the inode of the file it leaves on
+    // disk; /proc/net/unix maps the bound path to the inode the fd links
+    // name.
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else { return false };
+    let path = target.to_string_lossy();
+    let mut needle = None;
+    for line in table.lines() {
+        let mut fields = line.split_whitespace();
+        for _ in 0..6 {
+            fields.next();
+        }
+        let (Some(ino), Some(p)) = (fields.next(), fields.next()) else { continue };
+        if p == path {
+            needle = Some(format!("socket:[{ino}]"));
+            break;
+        }
+    }
+    let Some(needle) = needle else { return false };
+    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if name.to_str().and_then(|s| s.parse::<i32>().ok()).is_none() {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(e.path().join("fd")) else { continue };
+        for fd in fds.flatten() {
+            if let Ok(t) = std::fs::read_link(fd.path()) {
+                if t.to_string_lossy() == needle {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -2600,7 +3282,10 @@ mod tests {
     fn local_move_takes_the_same_lock_as_sync() {
         let (t, mut app) = state();
         let lock = MoveLock::take(t.path()).unwrap();
-        assert!(matches!(app.local_move("brave", "chrome", &mut |_| {}), Err(Error::Refused(_))));
+        assert!(matches!(
+            app.local_move("brave", "chrome", None, None, None, &mut |_| {}),
+            Err(Error::Refused(_))
+        ));
         drop(lock);
     }
 
@@ -2723,17 +3408,171 @@ mod tests {
             con.execute_batch("CREATE TABLE cookies (host_key TEXT)").unwrap();
         }
         let app = app.with_profile("brave", prof.path());
-        assert_eq!(app.browser_open_check().unwrap(), OpenCheck::Clear);
+        assert_eq!(app.browser_open_check(&[], &[]).unwrap(), OpenCheck::Clear);
 
         // A second connection holding the write lock is what a running browser looks like.
         let holder = rusqlite::Connection::open(&db).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert_eq!(
-            app.browser_open_check().unwrap(),
+            app.browser_open_check(&[], &[]).unwrap(),
             OpenCheck::Blocked { browser: "Brave".into() }
         );
         holder.execute_batch("ROLLBACK").unwrap();
-        assert_eq!(app.browser_open_check().unwrap(), OpenCheck::Clear);
+        assert_eq!(app.browser_open_check(&[], &[]).unwrap(), OpenCheck::Clear);
+    }
+
+    #[cfg(unix)]
+    fn singleton_root(target: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("browser");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(target, root.join("SingletonLock")).unwrap();
+        (t, root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn singleton_with_a_dead_pid_is_not_open() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let (_t, root) = singleton_root(&format!("host-{pid}"));
+        assert!(!singleton_live(&root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn singleton_with_a_live_browser_pid_is_open() {
+        let t = tempfile::tempdir().unwrap();
+        let fake = t.path().join("chrome");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+        let mut child = std::process::Command::new(&fake).arg("60").spawn().unwrap();
+        let root = t.path().join("browser");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(format!("host-{}", child.id()), root.join("SingletonLock")).unwrap();
+        assert!(singleton_live(&root));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flatpak_style_singleton_pid_is_not_the_host_browser() {
+        // A Flatpak browser records its sandbox pid: "fedora-2". Host pid 2
+        // is a kernel thread and pid 1 is init; neither is the browser, so
+        // a stale Flatpak singleton must not block a move.
+        let (_t, root) = singleton_root("fedora-2");
+        assert!(!singleton_live(&root));
+        let (_t2, root2) = singleton_root("fedora-1");
+        assert!(!singleton_live(&root2));
+    }
+
+    /// A just-spawned process has no command line of its own until exec
+    /// lands; wait for it so the scan below sees the real one.
+    #[cfg(target_os = "linux")]
+    fn wait_for_cmdline(pid: u32) {
+        for _ in 0..200 {
+            let ready = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flatpak_singleton_with_a_live_app_process_is_open() {
+        // The singleton records the sandbox pid while the browser itself is
+        // alive on the host: a process of the app (here one naming the app
+        // home, as the browser's own processes name their user-data dir
+        // under it) must still mark the root open.
+        let t = tempfile::tempdir().unwrap();
+        let app_home = t.path().join(".var/app/com.brave.Browser");
+        let root = app_home.join("config/BraveSoftware/Brave-Browser");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("fedora-2", root.join("SingletonLock")).unwrap();
+        let runner_dir = app_home.join("cache");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let fake = runner_dir.join("runner");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+        let mut child = std::process::Command::new(&fake).arg("60").spawn().unwrap();
+        wait_for_cmdline(child.id());
+        assert!(singleton_live(&root));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn singleton_with_a_live_process_for_the_root_is_open() {
+        // The recorded pid is dead, but a process naming this root (a
+        // browser launched with --user-data-dir) is alive: open. Once it
+        // exits and nothing speaks for the root, the singleton is stale.
+        let mut dead = std::process::Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let (_t, root) = singleton_root(&format!("host-{dead_pid}"));
+        let fake = root.join("browser-bin");
+        std::fs::copy("/bin/sleep", &fake).unwrap();
+        let mut child = std::process::Command::new(&fake).arg("60").spawn().unwrap();
+        wait_for_cmdline(child.id());
+        assert!(singleton_live(&root));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!singleton_live(&root));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn singleton_socket_holder_is_open() {
+        // The recorded pid is dead and no process names the root, but a
+        // process holds the root's SingletonSocket: the browser is open.
+        let mut dead = std::process::Command::new("/bin/sleep").arg("0.1").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let (t, root) = singleton_root(&format!("host-{dead_pid}"));
+        let sock = t.path().join("singleton.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::os::unix::fs::symlink(&sock, root.join("SingletonSocket")).unwrap();
+        assert!(singleton_live(&root));
+        drop(listener);
+        assert!(!singleton_live(&root));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cmdline_matching_names_only_this_browser() {
+        let root = "/home/u/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser";
+        let app = Some("com.brave.Browser");
+        // A browser process naming its user-data dir.
+        assert!(cmdline_names_this_browser(
+            format!("/app/brave/brave\x00--type=renderer\x00--user-data-dir={root}\x00").as_bytes(),
+            root,
+            app,
+        ));
+        // The sandbox launcher naming the app id.
+        assert!(cmdline_names_this_browser(
+            b"/usr/bin/bwrap\x00--args\x00 76\x00--\x00com.brave.Browser\x00",
+            root,
+            app,
+        ));
+        // Another Flatpak app is not this browser.
+        assert!(!cmdline_names_this_browser(
+            b"/app/spotify\x00--user-data-dir=/home/u/.var/app/com.spotify.Client/cache\x00",
+            root,
+            app,
+        ));
+        // A plain process is not this browser, and the app shapes do not
+        // count for a native root.
+        assert!(!cmdline_names_this_browser(b"/bin/sleep\x00 60\x00", root, app));
+        assert!(!cmdline_names_this_browser(
+            b"/usr/bin/bwrap\x00--args\x00 76\x00--\x00com.brave.Browser\x00",
+            "/home/u/.config/BraveSoftware/Brave-Browser",
+            None,
+        ));
     }
 
     #[test]
@@ -2829,6 +3668,22 @@ mod tests {
         assert_eq!(m.get("brave:default").map(String::as_str), Some("chrome"));
         let m = validate_routes(&sources, &[], &[route("brave:default", "BRAVE")]).unwrap();
         assert!(m.is_empty(), "a case-only difference is still the own browser");
+    }
+
+    #[test]
+    fn incoming_routes_drop_stale_ids() {
+        let arriving = vec![ArrivingProfile {
+            id: "brave:default".into(),
+            name: "Work".into(),
+            from_browser: "brave".into(),
+            from_browser_display: "Brave".into(),
+            from_device: "other".into(),
+            destination: "brave".into(),
+            routed: false,
+            destination_note: None,
+        }];
+        let m = validate_incoming_routes(&arriving, &[route("brave:nope", "chrome")]).unwrap();
+        assert!(m.is_empty());
     }
 
     #[test]

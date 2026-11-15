@@ -26,6 +26,7 @@ pub const BUNDLE_VERSION_2: u64 = 2;
 pub const EXT_STATE_FOLDERS: [&str; 2] = ["Local Extension Settings", "Sync Extension Settings"];
 pub const INDEXEDDB_STATE_FOLDER: &str = "IndexedDB";
 pub const EXT_ZIP_PREFIX: &str = "extstate/";
+pub const EXT_BIN_ZIP_PREFIX: &str = "extbin/";
 pub const BOOKMARKS_ZIP_ENTRY: &str = "bundlefiles/Bookmarks";
 const TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -113,11 +114,12 @@ impl SyncKey {
 }
 
 /// What a box carries. `manifest` is the JSON object (v1: the whole payload);
-/// `ext_files` and `bookmarks` hold the v2 file bytes.
+/// `ext_files`, `ext_bins`, and `bookmarks` hold the v2 file bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Payload {
     pub manifest: Map<String, Value>,
     pub ext_files: BTreeMap<String, Vec<u8>>,
+    pub ext_bins: BTreeMap<String, Vec<u8>>,
     pub bookmarks: Option<Vec<u8>>,
 }
 
@@ -169,6 +171,25 @@ pub fn validate_ext_logical_path(logical: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fail closed on extension binary paths (`Extensions/<id>/<ver>/...`).
+pub fn validate_ext_bin_path(logical: &str) -> Result<()> {
+    let parts: Vec<&str> = logical.split('/').collect();
+    let bad = |why: &str| Err(Error::Corrupt(format!("extension binary path {logical:?} {why}")));
+    if parts.len() < 4 || parts[0] != "Extensions" {
+        return bad("must start with Extensions/<id>/<version>");
+    }
+    if !parts[1].chars().all(|c| matches!(c, 'a'..='p')) || parts[1].len() != 32 {
+        return bad("has an invalid extension id");
+    }
+    if unsafe_seg(parts[2]) || parts[2].is_empty() {
+        return bad("has an invalid version segment");
+    }
+    if parts[3..].iter().any(|s| unsafe_seg(s)) {
+        return bad("has unsafe segments");
+    }
+    Ok(())
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -185,6 +206,11 @@ fn build_v2_zip(p: &Payload) -> Result<Vec<u8>> {
         for (logical, data) in &p.ext_files {
             validate_ext_logical_path(logical)?;
             zw.start_file(format!("{EXT_ZIP_PREFIX}{logical}"), opts).map_err(zerr)?;
+            zw.write_all(data).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        for (logical, data) in &p.ext_bins {
+            validate_ext_bin_path(logical)?;
+            zw.start_file(format!("{EXT_BIN_ZIP_PREFIX}{logical}"), opts).map_err(zerr)?;
             zw.write_all(data).map_err(|e| Error::Io(e.to_string()))?;
         }
         if let Some(b) = &p.bookmarks {
@@ -264,7 +290,31 @@ fn parse_v2_zip(raw: &[u8]) -> Result<Payload> {
         }
         _ => None,
     };
-    Ok(Payload { manifest, ext_files, bookmarks })
+    let bin_names: Vec<String> = (0..zr.len())
+        .filter_map(|i| {
+            zr.by_index(i)
+                .ok()
+                .map(|f| f.name().to_string())
+                .filter(|n| n.starts_with(EXT_BIN_ZIP_PREFIX))
+        })
+        .collect();
+    let mut ext_bins = BTreeMap::new();
+    for name in bin_names {
+        let rest = name
+            .strip_prefix(EXT_BIN_ZIP_PREFIX)
+            .ok_or_else(|| Error::Corrupt("bundle is corrupt (bad extbin prefix)".into()))?;
+        validate_ext_bin_path(rest)?;
+        let data = read_entry(&mut zr, &name)?.ok_or_else(|| {
+            Error::Corrupt(format!("bundle is corrupt (missing {name})"))
+        })?;
+        ext_bins.insert(rest.to_string(), data);
+    }
+    Ok(Payload {
+        manifest,
+        ext_files,
+        ext_bins,
+        bookmarks,
+    })
 }
 
 /// Seal a payload into the JSON envelope.
@@ -317,7 +367,12 @@ pub fn unseal(envelope: &Value, key: &SyncKey) -> Result<Payload> {
     if manifest.get("v").and_then(Value::as_u64) != Some(BUNDLE_VERSION_1) || !manifest.contains_key("cookies") {
         return Err(Error::Corrupt("bundle payload is not in the expected shape".into()));
     }
-    Ok(Payload { manifest, ext_files: BTreeMap::new(), bookmarks: None })
+    Ok(Payload {
+        manifest,
+        ext_files: BTreeMap::new(),
+        ext_bins: BTreeMap::new(),
+        bookmarks: None,
+    })
 }
 
 fn fsync_dir(dir: &Path) {

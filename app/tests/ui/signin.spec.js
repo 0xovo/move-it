@@ -35,7 +35,7 @@ async function mock(page) {
 test('cloud pipe rows sign in and show connected disconnect', async ({ page }) => {
   await mock(page);
   await page.goto('/');
-  await page.locator('#start').click();
+  await page.locator('#start-cross').click();
   await page.locator('#preview-button').click();
   await expect(page.getByRole('radio', { name: /Sign in with Google Drive/ })).toBeVisible();
   await page.getByRole('radio', { name: /Dropbox \(connected\)/ }).click();
@@ -84,7 +84,7 @@ async function mockSignInHang(page) {
 test('cancel sign-in leaves pipe screen usable quickly', async ({ page }) => {
   await mockSignInHang(page);
   await page.goto('/');
-  await page.locator('#start').click();
+  await page.locator('#start-cross').click();
   await page.locator('#preview-button').click();
   await page.getByRole('radio', { name: /Sign in with Google Drive/ }).click();
   await page.locator('#use-pipe').click();
@@ -99,7 +99,7 @@ test('cancel sign-in leaves pipe screen usable quickly', async ({ page }) => {
 test('back while sign-in waiting cancels and goes home', async ({ page }) => {
   await mockSignInHang(page);
   await page.goto('/');
-  await page.locator('#start').click();
+  await page.locator('#start-cross').click();
   await page.locator('#preview-button').click();
   await page.getByRole('radio', { name: /Sign in with Google Drive/ }).click();
   await page.locator('#use-pipe').click();
@@ -149,7 +149,7 @@ async function mockSignInConnectedCancel(page) {
 test('cancel after connected finish discards minted token', async ({ page }) => {
   await mockSignInConnectedCancel(page);
   await page.goto('/');
-  await page.locator('#start').click();
+  await page.locator('#start-cross').click();
   await page.locator('#preview-button').click();
   await page.getByRole('radio', { name: /Sign in with Google Drive/ }).click();
   await page.locator('#use-pipe').click();
@@ -157,4 +157,42 @@ test('cancel after connected finish discards minted token', async ({ page }) => 
   await page.locator('#pipe-sign-in-cancel').click();
   await expect(page.locator('#error')).toContainText('cancelled', { timeout: 2000 });
   expect(await page.evaluate(() => window.calls.some(c => c.name === 'pipe_sign_in_discard' && c.args.attempt === 1))).toBe(true);
+});
+
+test('sign-in shows a copyable link while waiting for the browser', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.calls = [];
+    window.__TAURI__ = {
+      app: { getVersion: async () => '0.1.0' },
+      event: { listen: async () => () => {} },
+      core: {
+        invoke: async (name, args) => {
+          window.calls.push({ name, args });
+          if (name === 'welcome_start') return { device: 'Test', paired: false, pipeSet: false, otherDevice: null };
+          if (name === 'home_state') return { lastSync: null, canUndo: false };
+          if (name === 'pipe_candidates') return [{ label: 'Sign in with Google Drive', kind: 'google', path: null, connected: false, cloud: true }];
+          if (name === 'pipe_sign_in_begin') return { status: 'waiting', attempt: 1, authorizeUrl: 'https://accounts.example.test/auth?x=1', opened: false };
+          if (name === 'pipe_sign_in_finish') return new Promise((_, reject) => { window.rejectCopyFinish = () => reject(new Error('sign-in was cancelled')); });
+          if (name === 'pipe_sign_in_cancel') { window.rejectCopyFinish?.(); return null; }
+          if (name === 'engine_idle') return true;
+          if (name === 'updater_context') return { packageManaged: false, githubUrl: 'https://example.test' };
+          if (name === 'updater_check') return null;
+          throw new Error(`Unexpected: ${name}`);
+        },
+      },
+    };
+  });
+  await page.goto('/');
+  await page.locator('#start-cross').click();
+  await page.locator('#preview-button').click();
+  await page.getByRole('radio', { name: /Sign in with Google Drive/ }).click();
+  await page.locator('#use-pipe').click();
+  await expect(page.locator('#pipe-sign-in-link')).toBeVisible();
+  await expect(page.locator('#pipe-sign-in-url')).toHaveValue('https://accounts.example.test/auth?x=1');
+  await expect(page.locator('#pipe-sign-in-link-text')).toContainText('did not open');
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.locator('#pipe-sign-in-copy').click();
+  await expect(page.locator('#pipe-sign-in-copy')).toHaveText('Copied');
+  await page.locator('#pipe-sign-in-cancel').click();
+  await expect(page.locator('#pipe-sign-in-link')).toBeHidden();
 });

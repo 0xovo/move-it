@@ -188,6 +188,14 @@ fn remove_any(p: &Path) -> Result<()> {
     }
 }
 
+/// Where a store is staged on its way back: beside the original, same folder.
+fn staged_path(original: &Path) -> PathBuf {
+    original.with_file_name(format!(
+        "{}.moveit-restore",
+        original.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ))
+}
+
 /// Put one snapshot back: copy beside the original, then swap, so a crash mid-restore
 /// leaves either the old or the restored store, and a re-run finishes the job.
 fn restore_entry(txn_dir: &Path, e: &Entry) -> Result<()> {
@@ -195,10 +203,7 @@ fn restore_entry(txn_dir: &Path, e: &Entry) -> Result<()> {
         remove_any(&e.original)?;
     } else {
         let snap = txn_dir.join(&e.snapshot);
-        let staged = e.original.with_file_name(format!(
-            "{}.moveit-restore",
-            e.original.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        ));
+        let staged = staged_path(&e.original);
         remove_any(&staged)?;
         match e.kind {
             Kind::Dir => copy_tree(&snap, &staged)?,
@@ -232,12 +237,50 @@ fn read_undo_manifest(dir: &Path) -> Result<Manifest> {
     }
 }
 
-fn restore_all(txn_dir: &Path) -> Result<()> {
-    let m = if txn_dir.join(COMMITTED).exists() {
-        read_undo_manifest(txn_dir)?
+/// The manifest a restore from this journal would put back.
+fn restore_manifest(txn_dir: &Path) -> Result<Manifest> {
+    if txn_dir.join(COMMITTED).exists() {
+        read_undo_manifest(txn_dir)
     } else {
-        read_manifest(txn_dir)?
-    };
+        read_manifest(txn_dir)
+    }
+}
+
+/// Re-check every destination a restore can write, before it writes any of
+/// them. The destinations were checked when the move began, but the folders
+/// above them may have changed since: a folder swapped for a link after the
+/// import would send the put-back into another profile, one that was never
+/// picked, never checked for a running browser and never snapshotted. The
+/// staging path beside each store is part of the set. A refusal leaves every
+/// store and the journal untouched, so the restore can be retried once the
+/// link is gone; nothing, not even a forced undo, overrides this.
+fn validate_restore(txn_dir: &Path) -> Result<Manifest> {
+    let m = restore_manifest(txn_dir)?;
+    let root = txn_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| Error::Refused(format!("cannot tell which browser folder {} belongs to", txn_dir.display())))?;
+    match fs::symlink_metadata(txn_dir) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(Error::Refused(format!(
+                "the journal folder {} is a symbolic link; Move It never follows links",
+                txn_dir.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => return Err(io(e, "cannot stat", txn_dir)),
+    }
+    for e in &m.entries {
+        crate::paths::check_contained(root, &e.original)?;
+        if e.kind != Kind::Absent {
+            crate::paths::check_contained(root, &staged_path(&e.original))?;
+        }
+    }
+    Ok(m)
+}
+
+fn restore_all(txn_dir: &Path) -> Result<()> {
+    let m = validate_restore(txn_dir)?;
     // Restore everything we can, then report the first failure.
     let mut first_err = None;
     for e in &m.entries {
@@ -377,6 +420,9 @@ pub fn undo_last(root: &Path, force: bool) -> Result<Undo> {
             return Ok(Undo::ChangedSince);
         }
     }
+    // Refuse a linked destination before marking anything, so a refused
+    // undo leaves the journal exactly as it was and can be retried.
+    validate_restore(&d)?;
     mark(&d, UNDOING, b"")?;
     restore_all(&d)?;
     mark(&d, UNDONE, b"")?;
@@ -435,6 +481,13 @@ impl Txn {
                         all.push((format!("{name}{sc}"), PathBuf::from(os)));
                     }
                 }
+            }
+            // A store reached through a link is not the store that was
+            // picked: the snapshot would copy another profile's bytes and
+            // the write would land there too, past that profile's own
+            // checks. Refuse before anything is copied.
+            for (_, path) in &all {
+                crate::paths::check_contained(root, path)?;
             }
             let mut entries = Vec::new();
             for (i, (name, path)) in all.iter().enumerate() {
@@ -804,5 +857,132 @@ mod tests {
         let refs: Vec<(&str, &Path)> = s.iter().map(|(n, p)| (*n, p.as_path())).collect();
         assert!(matches!(Txn::begin(&f.root, &refs), Err(Error::Refused(_))));
         assert!(txn_dirs(&f.root).unwrap().is_empty(), "no journal left behind on refusal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_store_reached_through_a_linked_ancestor() {
+        // The picked profile's "Local Storage" is a link into another
+        // profile's folder: the store under it is that other profile's, and
+        // snapshotting or writing it would cross the boundary. (The link
+        // checks on the store itself and inside it cannot see this one;
+        // it sits above both.)
+        let f = fx();
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir_all(other.path().join("leveldb")).unwrap();
+        fs::remove_dir_all(f.root.join("Local Storage")).unwrap();
+        std::os::unix::fs::symlink(other.path(), f.root.join("Local Storage")).unwrap();
+        let s = stores(&f.root);
+        let refs: Vec<(&str, &Path)> = s.iter().map(|(n, p)| (*n, p.as_path())).collect();
+        assert!(matches!(Txn::begin(&f.root, &refs), Err(Error::Refused(_))));
+        assert!(txn_dirs(&f.root).unwrap().is_empty(), "no journal left behind on refusal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_store_under_a_linked_slot_folder() {
+        // The whole slot folder is a link into another browser folder.
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("browser");
+        fs::create_dir_all(&root).unwrap();
+        let other = t.path().join("other-browser");
+        fs::create_dir_all(other.join("Default")).unwrap();
+        fs::write(other.join("Default/Cookies"), b"theirs").unwrap();
+        std::os::unix::fs::symlink(other.join("Default"), root.join("Default")).unwrap();
+        let store = root.join("Default/Cookies");
+        assert!(matches!(Txn::begin(&root, &[("cookies", &store)]), Err(Error::Refused(_))));
+        assert_eq!(fs::read(other.join("Default/Cookies")).unwrap(), b"theirs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_refuses_when_an_ancestor_was_swapped_for_a_link_after_import() {
+        // The Codex r3 repro at the seam it names. The import commits into a
+        // normal target; afterwards the target Extensions folder is swapped
+        // for a link to another profile carrying the same extension build, so
+        // the bytes showing through the link match the post-import digests
+        // and the changed-since check passes. Undo must still refuse: the
+        // put-back would land in the other profile.
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("browser");
+        let ext = root.join("Default/Extensions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1.0_0");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("manifest.json"), br#"{"name":"picked-original"}"#).unwrap();
+        let other = t.path().join("other-browser");
+        let other_ext = other.join("Default/Extensions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1.0_0");
+        fs::create_dir_all(&other_ext).unwrap();
+        fs::write(other_ext.join("manifest.json"), br#"{"name":"incoming"}"#).unwrap();
+        let txn = Txn::begin(&root, &[("ext", &ext)]).unwrap();
+        fs::write(ext.join("manifest.json"), br#"{"name":"incoming"}"#).unwrap();
+        txn.commit().unwrap();
+        fs::rename(root.join("Default/Extensions"), root.join("Default/Extensions.real")).unwrap();
+        symlink(other.join("Default/Extensions"), root.join("Default/Extensions")).unwrap();
+        assert!(matches!(undo_last(&root, false), Err(Error::Refused(_))), "undo must refuse through the link");
+        assert!(matches!(undo_last(&root, true), Err(Error::Refused(_))), "force never overrides containment");
+        assert_eq!(fs::read(other_ext.join("manifest.json")).unwrap(), br#"{"name":"incoming"}"#, "the other profile is untouched");
+        assert!(can_undo(&root).unwrap(), "the undo point survives a refused undo");
+        fs::remove_file(root.join("Default/Extensions")).unwrap();
+        fs::rename(root.join("Default/Extensions.real"), root.join("Default/Extensions")).unwrap();
+        assert_eq!(undo_last(&root, false).unwrap(), Undo::Done);
+        assert_eq!(fs::read(ext.join("manifest.json")).unwrap(), br#"{"name":"picked-original"}"#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_refuses_when_a_store_folder_was_swapped_for_a_link_after_import() {
+        // Same swap aimed at a sqlite store: the whole slot folder becomes a
+        // link to another profile whose Cookies bytes match what the import
+        // left behind.
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("browser");
+        let cookies = root.join("Default/Network/Cookies");
+        fs::create_dir_all(cookies.parent().unwrap()).unwrap();
+        fs::write(&cookies, b"cookies v0").unwrap();
+        let other = t.path().join("other-browser");
+        let other_cookies = other.join("Default/Network/Cookies");
+        fs::create_dir_all(other_cookies.parent().unwrap()).unwrap();
+        fs::write(&other_cookies, b"cookies v1").unwrap();
+        let txn = Txn::begin(&root, &[("cookies", &cookies)]).unwrap();
+        fs::write(&cookies, b"cookies v1").unwrap();
+        txn.commit().unwrap();
+        fs::rename(root.join("Default"), root.join("Default.real")).unwrap();
+        symlink(other.join("Default"), root.join("Default")).unwrap();
+        assert!(matches!(undo_last(&root, false), Err(Error::Refused(_))));
+        assert_eq!(fs::read(&other_cookies).unwrap(), b"cookies v1", "the other profile is untouched");
+        assert!(can_undo(&root).unwrap(), "the undo point survives a refused undo");
+        fs::remove_file(root.join("Default")).unwrap();
+        fs::rename(root.join("Default.real"), root.join("Default")).unwrap();
+        assert_eq!(undo_last(&root, false).unwrap(), Undo::Done);
+        assert_eq!(fs::read(&cookies).unwrap(), b"cookies v0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_when_an_ancestor_was_swapped_mid_move() {
+        // Rollback and crash-recovery share the restore seam with undo: a
+        // folder swapped while the move is still open must refuse the same
+        // way, before any store is put back, and recovery must be able to
+        // finish the job once the link is gone.
+        use std::os::unix::fs::symlink;
+        let f = fx();
+        let before = snap(&f.root);
+        let other = tempfile::tempdir().unwrap();
+        fs::create_dir_all(other.path().join("leveldb")).unwrap();
+        fs::write(other.path().join("leveldb/000003.log"), b"theirs").unwrap();
+        let t = begin(&f.root);
+        write_all_stores(&f.root, 5);
+        fs::remove_dir_all(f.root.join("Local Storage")).unwrap();
+        symlink(other.path(), f.root.join("Local Storage")).unwrap();
+        assert!(matches!(t.rollback(), Err(Error::Refused(_))));
+        assert_eq!(fs::read(other.path().join("leveldb/000003.log")).unwrap(), b"theirs", "the other profile is untouched");
+        assert_eq!(fs::read(f.root.join("Cookies")).unwrap(), b"cookies v1", "nothing was put back before the refusal");
+        fs::remove_file(f.root.join("Local Storage")).unwrap();
+        fs::create_dir_all(f.root.join("Local Storage/leveldb")).unwrap();
+        fs::write(f.root.join("Local Storage/leveldb/000004.log"), b"new").unwrap();
+        assert_eq!(recover(&f.root).unwrap(), Recovery::PutBack);
+        assert_eq!(snap(&f.root), before);
+        assert!(txn_dirs(&f.root).unwrap().is_empty());
     }
 }
