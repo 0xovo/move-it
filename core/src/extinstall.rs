@@ -626,6 +626,9 @@ mod tests {
         assert_eq!(stats.reports.len(), 1);
         assert_eq!(stats.reports[0].status, "installed");
         assert!(dst.path().join("Default/Extensions").join(ID).join(ver).join("bg.js").is_file());
+        // The external json is the Linux and Mac registration route. Windows
+        // registration is registry-based, so no file is written there.
+        #[cfg(not(windows))]
         assert!(dst.path().join("External Extensions").join(format!("{ID}.json")).is_file());
     }
 
