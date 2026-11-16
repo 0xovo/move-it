@@ -1,5 +1,10 @@
+// Saved passwords counts logins alone: core sets logins to every exported
+// login row and passwords to the subset of those rows with a non-empty
+// password value, so summing both double-counts every saved password.
+// The move packs the exported logins list (engine passwords section), so
+// logins is the count the move will actually carry.
 export const kindDefs = [
-  { id: 'passwords', label: 'Saved passwords', keys: ['logins', 'passwords'] },
+  { id: 'passwords', label: 'Saved passwords', keys: ['logins'] },
   { id: 'cookies', label: 'Logins', detail: 'Stay signed in (cookies)' },
   { id: 'bookmarks', label: 'Bookmarks' },
   { id: 'history', label: 'History' },

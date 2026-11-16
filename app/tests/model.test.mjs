@@ -7,8 +7,14 @@ test('kind summary names all data or a partial count', () => {
   assert.equal(kindSummaryText(3), '3 of 5 kinds');
 });
 
-test('saved password counts merge logins and passwords', () => {
-  assert.equal(aggregateKinds({ logins: 3, passwords: 2 }).passwords, 5);
+test('saved password count is the logins total, not logins plus passwords', () => {
+  // Core passwords is a subset of logins (rows with a non-empty password
+  // value), not a separate store. Summing them double-counts.
+  // Staged Brave Profile 1 case: 1 login row, that row has a password.
+  assert.equal(aggregateKinds({ logins: 1, passwords: 1 }).passwords, 1);
+  // 3 exported logins, 2 with a password value: the move carries all 3.
+  assert.equal(aggregateKinds({ logins: 3, passwords: 2 }).passwords, 3);
+  assert.equal(aggregateKinds({ logins: 0, passwords: 0 }).passwords, 0);
 });
 
 test('sending shows what was sent, not zero received', () => {
