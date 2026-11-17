@@ -55,7 +55,7 @@ fn wants_kind(kinds: Option<&[String]>, name: &str) -> bool {
 fn refuse_unreadable_store(store: &str, detail_total: usize, exported: usize, failed: usize) -> Result<()> {
     if detail_total > 0 && exported == 0 && failed > 0 {
         return Err(Error::Refused(format!(
-            "this profile's {store} could not be read: {detail_total} rows are stored but none of them decrypted with the browser key found on this device, so sealing would silently drop them all"
+            "this profile's {store} could not be read: {failed} of {detail_total} stored rows failed to decrypt with the browser key found on this device and not one stored row could be read, so sealing would silently drop them all"
         )));
     }
     Ok(())

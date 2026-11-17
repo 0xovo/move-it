@@ -282,3 +282,31 @@ fn a_partial_cookie_loss_still_seals_and_carries_what_decrypts() {
     let payload = engine::open_box(&sealed, &key).unwrap();
     assert_eq!(payload_len(&payload, "cookies"), 1);
 }
+
+#[test]
+fn seal_fails_when_the_only_movable_cookie_cannot_decrypt() {
+    // One App-Bound row (refused by design) plus one row under another
+    // device's key: nothing exports and one row was lost to a wrong key,
+    // so the seal still fails, and the error counts only the lost row,
+    // not the designed skip.
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    let mut v20 = b"v20".to_vec();
+    v20.extend_from_slice(&[7u8; 40]);
+    let lost = Lock::mac("source-device-pw").encrypt(".lost.test", "gone", HostTag::With).unwrap();
+    let con = rusqlite::Connection::open(a.join("Default/Cookies")).unwrap();
+    con.execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.locked.example', 'sess', '/', ?1)",
+        rusqlite::params![v20],
+    ).unwrap();
+    con.execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.lost.test', 'x', '/', ?1)",
+        rusqlite::params![lost],
+    ).unwrap();
+    drop(con);
+    let wrong = device_keys("other-device-pw");
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let err = engine::seal_box(&profile(&a, &wrong), "fedora:A", &key).unwrap_err();
+    assert!(err.to_string().contains("1 of 2"), "the error must count only the failed row: {err}");
+}
