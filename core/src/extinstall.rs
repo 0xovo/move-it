@@ -325,9 +325,13 @@ fn walk_collect(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) -
             return Err(refuse_link(&ent.path()));
         }
         let name = ent.file_name().to_string_lossy().into_owned();
-        if name == "_metadata" {
-            continue;
-        }
+        // `_metadata` is collected like everything else: its
+        // verified_contents.json is the signed Web Store file Chrome's
+        // content verifier fetches at first startup (it cannot be
+        // regenerated locally, and a failed fetch marks the extension
+        // unverifiable), and computed_hashes.json stays valid because
+        // the binaries are byte copies. Skipping the folder cost the
+        // imported extension its verification files (fix 3 round 2).
         let logical = format!("{prefix}/{name}");
         if ft.is_dir() {
             walk_collect(&ent.path(), &logical, out)?;
@@ -738,6 +742,61 @@ mod tests {
                 "no anchor may be written off the macOS gate"
             );
         }
+    }
+
+    #[test]
+    fn collect_and_install_includes_metadata_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let ver = "1.0_0";
+        let ver_dir = src.path().join(format!("Default/Extensions/{ID}/{ver}"));
+        let meta_dir = ver_dir.join("_metadata");
+        fs::create_dir_all(&meta_dir).unwrap();
+        fs::write(
+            ver_dir.join("manifest.json"),
+            br#"{"version":"1.0","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+        )
+        .unwrap();
+        fs::write(meta_dir.join("verified_contents.json"), br#"{"signed":true}"#).unwrap();
+        fs::write(meta_dir.join("computed_hashes.json"), br#"{"hashes":{}}"#).unwrap();
+        let prefs = src.path().join("Default/Preferences");
+        fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+        fs::write(
+            prefs,
+            format!(
+                r#"{{"extensions":{{"settings":{{"{ID}":{{"manifest":{{"version":"1.0"}},"state":1}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let bins = collect_bins_in(src.path(), "Default").unwrap();
+        let prefix = format!("{EXT_BIN_PREFIX}/{ID}/{ver}/_metadata");
+        assert_eq!(
+            bins.get(&format!("{prefix}/verified_contents.json")).map(Vec::as_slice),
+            Some(br#"{"signed":true}"#.as_slice())
+        );
+        assert_eq!(
+            bins.get(&format!("{prefix}/computed_hashes.json")).map(Vec::as_slice),
+            Some(br#"{"hashes":{}}"#.as_slice())
+        );
+        let regs = collect_registrations_in(src.path(), "Default", &[ID.to_string()]).unwrap();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::linux("peanuts", crate::oscrypt::LinuxPrefix::V10),
+            from_libsecret_v2: false,
+        };
+        install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap();
+        let landed = dst.path().join(format!("Default/Extensions/{ID}/{ver}/_metadata"));
+        assert_eq!(fs::read(landed.join("verified_contents.json")).unwrap(), br#"{"signed":true}"#);
+        assert_eq!(fs::read(landed.join("computed_hashes.json")).unwrap(), br#"{"hashes":{}}"#);
     }
 
     /// Another profile's extension folder, holding the manifest the repro protects.
