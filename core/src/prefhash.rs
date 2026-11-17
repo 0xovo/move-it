@@ -69,18 +69,48 @@ fn remove_empty(val: &mut Value) {
     }
 }
 
-/// Chromium device id used by the pref hash. Linux has no implementation
-/// (device_id_stub.cc returns NOT_IMPLEMENTED), so the id is empty there;
-/// other platforms keep the legacy metrics transform for now.
+/// Chromium device id used by the pref hash (pref_hash_store_impl.cc
+/// GenerateDeviceId: the raw GetDeterministicMachineSpecificId string, or
+/// empty when the platform has none). Linux has no implementation
+/// (device_id_stub.cc returns NOT_IMPLEMENTED), so the id is empty there.
+/// macOS uses the IOPlatformUUID of IOPlatformExpertDevice as printed
+/// (device_id_mac.cc); a failed read is empty, like Chromium. Windows keeps
+/// the legacy metrics transform for now.
 pub fn chromium_device_id() -> String {
     #[cfg(target_os = "linux")]
     {
         String::new()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        mac_platform_uuid().unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         metrics_device_id(&linux_device_id())
     }
+}
+
+/// The machine's IOPlatformUUID, read the way `ioreg` prints it.
+#[cfg(target_os = "macos")]
+fn mac_platform_uuid() -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_ioreg_platform_uuid(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull `"IOPlatformUUID" = "<uuid>"` out of `ioreg` output, unchanged.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ioreg_platform_uuid(out: &str) -> Option<String> {
+    let line = out.lines().find(|l| l.contains("\"IOPlatformUUID\""))?;
+    let value = line.split_once('=')?.1.trim();
+    let uuid = value.strip_prefix('"')?.strip_suffix('"')?;
+    (!uuid.is_empty()).then(|| uuid.to_string())
 }
 
 fn escape_json_string(s: &str, out: &mut String) {
@@ -396,5 +426,37 @@ mod tests {
         let prefs: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
         assert!(prefs["extensions"]["settings"][id].is_object());
         assert!(!slot.join("Secure Preferences").exists());
+    }
+
+    #[test]
+    fn ioreg_platform_uuid_is_read_unchanged() {
+        let out = "+-o J413AP  <class IOPlatformExpertDevice, id 0x100000236>\n    {\n      \"IOPlatformSerialNumber\" = \"XXXXXXXXXX\"\n      \"IOPlatformUUID\" = \"0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9\"\n      \"manufacturer\" = <\"Apple Inc.\">\n    }\n";
+        assert_eq!(
+            parse_ioreg_platform_uuid(out).as_deref(),
+            Some("0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9")
+        );
+        assert_eq!(parse_ioreg_platform_uuid("no such key here"), None);
+        assert_eq!(parse_ioreg_platform_uuid("\"IOPlatformUUID\" = \"\""), None);
+    }
+
+    #[test]
+    fn mac_device_id_is_part_of_the_mac() {
+        // PrefHashCalculator::HmacSign feeds seed-keyed HMAC with device id,
+        // path, value: a different id must change the MAC.
+        let v = json!({"a": 1});
+        let with = hmac_hex(&GOOGLE_CHROME_SEED, "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9", "extensions.settings.x", &v).unwrap();
+        let without = hmac_hex(&GOOGLE_CHROME_SEED, "", "extensions.settings.x", &v).unwrap();
+        assert_ne!(with, without);
+        // The legacy metrics transform of the same UUID is a different id
+        // again: the probe scored it 0/5 against Chrome's own MACs.
+        let metrics = hmac_hex(
+            &GOOGLE_CHROME_SEED,
+            &metrics_device_id("0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9"),
+            "extensions.settings.x",
+            &v,
+        )
+        .unwrap();
+        assert_ne!(with, metrics);
+        assert_ne!(without, metrics);
     }
 }
