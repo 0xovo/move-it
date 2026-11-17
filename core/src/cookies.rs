@@ -180,8 +180,30 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Cookie>> {
     export_counted(path, keys).map(|(cookies, _)| cookies)
 }
 
+/// One cookie store read, split by outcome. The split is what lets the seal
+/// tell "the store was empty" and "everything here is App-Bound by design"
+/// apart from "rows exist but the key found on this device cannot open any
+/// of them": the Mac proof leg found the wrong device's key, every row
+/// failed, and the seal still reported success with zero cookies.
+#[derive(Debug, Default)]
+pub struct ExportDetail {
+    pub cookies: Vec<Cookie>,
+    /// App-Bound (v20) rows: refused by design, they can never move.
+    pub app_bound: usize,
+    /// Rows that failed to decrypt: wrong key, corrupt ciphertext, or a
+    /// prefix this engine cannot interpret. Not a designed refusal.
+    pub failed: usize,
+    /// Every row in the store.
+    pub total: usize,
+}
+
 /// Export movable cookies and count App-Bound (v20) rows left in the browser.
 pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Cookie>, usize)> {
+    export_detailed(path, keys).map(|d| (d.cookies, d.app_bound))
+}
+
+/// Read and decrypt every cookie, reporting each row's outcome class.
+pub fn export_detailed(path: &Path, keys: &Keys) -> Result<ExportDetail> {
     let (_scratch, copy) = crate::util::snapshot_db(path)?;
     let con = open(&copy)?;
     let mut st = con
@@ -210,26 +232,30 @@ pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Cookie>, usize)> 
             ))
         })
         .map_err(sql)?;
-    let mut out = Vec::new();
-    let mut skipped = 0;
+    let mut detail = ExportDetail::default();
     for row in rows {
         let (host, name, path, value, enc, exp, cre, acc, sec, http, ss, upd, tfs) = row.map_err(sql)?;
+        detail.total += 1;
         let value = if enc.is_empty() {
             value
         } else if enc.starts_with(b"v20") {
-            skipped += 1;
+            detail.app_bound += 1;
             continue;
         } else {
             match keys.lock().decrypt(&host, &enc) {
                 Ok(v) => v,
-                Err(Error::AppBound)
-                | Err(Error::WrongBrowserPassword)
-                | Err(Error::Corrupt(_))
-                | Err(Error::Refused(_)) => continue,
+                Err(Error::AppBound) => {
+                    detail.app_bound += 1;
+                    continue;
+                }
+                Err(Error::WrongBrowserPassword) | Err(Error::Corrupt(_)) | Err(Error::Refused(_)) => {
+                    detail.failed += 1;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         };
-        out.push(Cookie {
+        detail.cookies.push(Cookie {
             host,
             name,
             path,
@@ -244,7 +270,7 @@ pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Cookie>, usize)> 
             top_frame_site_key: tfs,
         });
     }
-    Ok((out, skipped))
+    Ok(detail)
 }
 
 /// For Linux, sample the store's existing values to pick the write label before any row changes.
@@ -663,6 +689,59 @@ mod tests {
     }
 
     #[test]
+    fn mac_cookie_write_follows_the_data_folders_own_v11_hashes() {
+        // The fix-2 seam end to end: a user data folder whose browser sealed
+        // v11 pref hashes writes an empty cookie store v11, keyed with the
+        // pepper key, and the row reads back. A folder with no such hashes
+        // still writes v10.
+        use base64::Engine;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Chrome");
+        std::fs::create_dir_all(root.join("Default")).unwrap();
+        let prefs = serde_json::json!({"protection": {
+            "super_encrypted_hash":
+                base64::engine::general_purpose::STANDARD.encode(b"v11-super"),
+        }});
+        std::fs::write(
+            root.join("Default").join("Secure Preferences"),
+            serde_json::to_vec(&prefs).unwrap(),
+        )
+        .unwrap();
+        let keys = Keys::Cbc {
+            lock: Lock::mac("mac-test-safe-storage-pw"),
+            from_libsecret_v2: crate::oscrypt::mac_data_dir_speaks_v11(&root),
+        };
+        let (_t2, p) = db();
+        import(&p, &[cookie(".a.com", "n", "one", 1)], &keys).unwrap();
+        let written: Vec<u8> = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='n'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&written[..3], b"v11");
+        assert_eq!(
+            written,
+            Lock::mac("mac-test-safe-storage-pw")
+                .encrypt_labelled(".a.com", "one", HostTag::With, LinuxPrefix::V11)
+                .unwrap()
+        );
+        assert_eq!(export(&p, &keys).unwrap()[0].value, "one");
+        let bare = tempfile::tempdir().unwrap();
+        let bare_root = bare.path().join("Chrome");
+        std::fs::create_dir_all(bare_root.join("Default")).unwrap();
+        let bare_keys = Keys::Cbc {
+            lock: Lock::mac("mac-test-safe-storage-pw"),
+            from_libsecret_v2: crate::oscrypt::mac_data_dir_speaks_v11(&bare_root),
+        };
+        let (_t3, p3) = db();
+        import(&p3, &[cookie(".a.com", "n", "one", 1)], &bare_keys).unwrap();
+        let bare_written: Vec<u8> = Connection::open(&p3)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='n'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&bare_written[..3], b"v10");
+    }
+
+    #[test]
     fn linux_empty_store_label_is_per_browser_on_linux() {
         let (_t, p) = db();
         let chrome_v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
@@ -791,6 +870,55 @@ mod tests {
         let back = export(&p, &keys()).unwrap();
         assert_eq!(back.len(), 1, "the locked row stays behind, the rest still reads");
         assert_eq!(back[0].value, "hello");
+    }
+
+    #[test]
+    fn export_detailed_counts_rows_no_key_can_open_as_failed() {
+        // Rows sealed under one device's key (a Mac lock, whose key is the
+        // device password itself), read back under another device's key:
+        // the Mac proof leg's shape. A Linux lock would not reproduce it,
+        // since Linux v10 values always open under the fallback key.
+        let (_t, p) = db();
+        let source = Lock::mac("source-device-pw");
+        let con = Connection::open(&p).unwrap();
+        for (host, name, value) in [(".a.com", "sid", "hello"), (".b.com", "t", "world")] {
+            let blob = source.encrypt(host, value, HostTag::With).unwrap();
+            con.execute(
+                "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, ?1, ?2, '/', ?3)",
+                (host, name, blob),
+            )
+            .unwrap();
+        }
+        drop(con);
+        let wrong = Keys::Cbc { lock: Lock::mac("other-device-pw"), from_libsecret_v2: false };
+        let d = export_detailed(&p, &wrong).unwrap();
+        assert_eq!(d.total, 2);
+        assert_eq!(d.failed, 2);
+        assert_eq!(d.app_bound, 0);
+        assert!(d.cookies.is_empty());
+        // The counted form keeps its old meaning: failures are not skips.
+        let (rows, skipped) = export_counted(&p, &wrong).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn export_detailed_counts_app_bound_rows_as_designed_skips_not_failures() {
+        let (_t, p) = db();
+        let con = Connection::open(&p).unwrap();
+        let mut blob = b"v20".to_vec();
+        blob.extend_from_slice(&[7u8; 40]);
+        con.execute(
+            "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.locked.example', 'sess', '/', ?1)",
+            rusqlite::params![blob],
+        )
+        .unwrap();
+        drop(con);
+        let d = export_detailed(&p, &keys()).unwrap();
+        assert_eq!(d.total, 1);
+        assert_eq!(d.app_bound, 1);
+        assert_eq!(d.failed, 0);
+        assert!(d.cookies.is_empty());
     }
 
     #[test]

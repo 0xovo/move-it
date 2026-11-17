@@ -94,10 +94,39 @@ pub fn export(path: &Path, keys: &Keys) -> Result<Vec<Login>> {
     export_counted(path, keys).map(|(logins, _)| logins)
 }
 
+/// One Login Data read, split by outcome, the twin of the cookie store's
+/// split: App-Bound rows are refused by design, while rows that fail to
+/// decrypt mean the key found on this device does not belong to this
+/// profile. The seal needs the split to fail loudly on the second case
+/// instead of writing a box with zero logins and reporting success.
+#[derive(Debug, Default)]
+pub struct ExportDetail {
+    pub logins: Vec<Login>,
+    /// App-Bound (v20) rows: refused by design, they can never move.
+    pub app_bound: usize,
+    /// Rows that failed to decrypt (wrong key or an uninterpretable blob).
+    /// A row whose decrypted bytes are not text is `Corrupt` and still
+    /// fails the whole read, as before; it never reaches this count.
+    pub failed: usize,
+    /// Every row in the store.
+    pub total: usize,
+}
+
 /// Export movable logins and count App-Bound rows left in the browser.
+/// The count keeps its historical meaning: App-Bound rows plus rows that
+/// failed to decrypt.
 pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Login>, usize)> {
+    export_detailed(path, keys).map(|d| {
+        let skipped = d.app_bound + d.failed;
+        (d.logins, skipped)
+    })
+}
+
+/// Read and decrypt every saved login, reporting each row's outcome class.
+/// A profile without a Login Data file exports an all-zero detail.
+pub fn export_detailed(path: &Path, keys: &Keys) -> Result<ExportDetail> {
     if !path.exists() {
-        return Ok((Vec::new(), 0));
+        return Ok(ExportDetail::default());
     }
     let (_scratch, copy) = crate::util::snapshot_db(path)?;
     let con = open(&copy, Duration::from_secs(5))?;
@@ -123,27 +152,27 @@ pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Login>, usize)> {
             ))
         })
         .map_err(sql)?;
-    let mut out = Vec::new();
-    let mut skipped = 0;
+    let mut detail = ExportDetail::default();
     for row in rows {
         let (origin, action, user, blob, created, used, times, realm, pwmod) = row.map_err(sql)?;
+        detail.total += 1;
         if blob.starts_with(b"v20") {
-            skipped += 1;
+            detail.app_bound += 1;
             continue;
         }
         let password_value = match unlock(keys, &origin, &realm, &blob) {
             Ok(value) => value,
             Err(Error::AppBound) => {
-                skipped += 1;
+                detail.app_bound += 1;
                 continue;
             }
             Err(Error::WrongBrowserPassword) | Err(Error::Refused(_)) => {
-                skipped += 1;
+                detail.failed += 1;
                 continue;
             }
             Err(e) => return Err(e),
         };
-        out.push(Login {
+        detail.logins.push(Login {
             origin_url: origin,
             action_url: action,
             username_value: user,
@@ -155,7 +184,7 @@ pub fn export_counted(path: &Path, keys: &Keys) -> Result<(Vec<Login>, usize)> {
             date_password_modified: pwmod,
         });
     }
-    Ok((out, skipped))
+    Ok(detail)
 }
 
 /// Read a real profile's saved logins end to end: find its Login Data store, discover
@@ -691,6 +720,47 @@ mod tests {
         assert_eq!(rows[0].username_value, "movable");
         assert_eq!(rows[0].password_value, "pw");
         assert_eq!(export(&p, &linux()).unwrap(), rows);
+    }
+
+    #[test]
+    fn export_detailed_counts_rows_under_another_key_as_failed() {
+        // Rows under one device's Mac key, read under another's: a Linux
+        // lock would not reproduce the defect, since Linux v10 values
+        // always open under the fallback key.
+        let (_t, p) = db();
+        let source = Lock::mac("source-device-pw");
+        let con = Connection::open(&p).unwrap();
+        for user in ["u1", "u2"] {
+            let blob = source.encrypt("example.com", "pw", HostTag::Without).unwrap();
+            con.execute(
+                "INSERT INTO logins (origin_url, username_value, password_value, date_created, date_last_used, date_password_modified, signon_realm, times_used) VALUES (?1, ?2, ?3, 1, 1, 1, ?4, 0)",
+                (ORIGIN, user, blob, REALM),
+            )
+            .unwrap();
+        }
+        drop(con);
+        let wrong = Keys::Cbc { lock: Lock::mac("other-device-pw"), from_libsecret_v2: false };
+        let d = export_detailed(&p, &wrong).unwrap();
+        assert_eq!(d.total, 2);
+        assert_eq!(d.failed, 2);
+        assert_eq!(d.app_bound, 0);
+        assert!(d.logins.is_empty());
+        // The counted form keeps its historical meaning: App-Bound plus failures.
+        let (rows, skipped) = export_counted(&p, &wrong).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn export_detailed_counts_app_bound_logins_as_designed_skips_not_failures() {
+        let (_t, p) = db();
+        import(&p, &[login("locked", "pw", D1)], &linux(), HostTag::Without).unwrap();
+        Connection::open(&p).unwrap().execute("UPDATE logins SET password_value=x'763230010203' WHERE username_value='locked'", []).unwrap();
+        let d = export_detailed(&p, &linux()).unwrap();
+        assert_eq!(d.total, 1);
+        assert_eq!(d.app_bound, 1);
+        assert_eq!(d.failed, 0);
+        assert!(d.logins.is_empty());
     }
 
     #[test]

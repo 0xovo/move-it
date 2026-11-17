@@ -253,8 +253,37 @@ fn merge_into_prefs_file(path: &Path, regs: &Map<String, Value>) -> Result<usize
     Ok(n)
 }
 
-fn merge_registrations(slot: &Path, browser: &str, regs: &Map<String, Value>) -> Result<usize> {
-    crate::prefhash::merge_registrations(slot, browser, regs)
+fn merge_registrations(
+    slot: &Path,
+    browser: &str,
+    regs: &Map<String, Value>,
+    anchor_lock: Option<&crate::oscrypt::Lock>,
+) -> Result<usize> {
+    crate::prefhash::merge_registrations(slot, browser, regs, anchor_lock)
+}
+
+/// The macOS v11 gate for extension anchors, the same signal fix 2 uses
+/// for v11 cookie and login writes: this platform is macOS and the target
+/// user data folder's own browsers seal their pref hashes as v11
+/// (`mac_data_dir_speaks_v11`, read here before the merge rewrites any
+/// prefs file). Linux and Windows never pass the gate, so their merges
+/// stay anchor-free exactly as before. When the gate passes, the target
+/// lock must be a CBC lock that can seal the anchor; anything else fails
+/// the import loudly instead of writing an unanchored registration.
+fn extension_anchor_lock<'a>(
+    browser_root: &Path,
+    keys: &'a crate::cookies::Keys,
+) -> Result<Option<&'a crate::oscrypt::Lock>> {
+    if Platform::current() != Platform::Mac || !crate::oscrypt::mac_data_dir_speaks_v11(browser_root) {
+        return Ok(None);
+    }
+    match keys {
+        crate::cookies::Keys::Cbc { lock, .. } => Ok(Some(lock)),
+        crate::cookies::Keys::Gcm { .. } => Err(Error::Refused(
+            "cannot seal an extension registration anchor: the target browser key cannot write v11 values"
+                .into(),
+        )),
+    }
 }
 
 /// Collect extension binaries from a live profile slot into logical paths `Extensions/<id>/<ver>/...`.
@@ -296,9 +325,13 @@ fn walk_collect(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) -
             return Err(refuse_link(&ent.path()));
         }
         let name = ent.file_name().to_string_lossy().into_owned();
-        if name == "_metadata" {
-            continue;
-        }
+        // `_metadata` is collected like everything else: its
+        // verified_contents.json is the signed Web Store file Chrome's
+        // content verifier fetches at first startup (it cannot be
+        // regenerated locally, and a failed fetch marks the extension
+        // unverifiable), and computed_hashes.json stays valid because
+        // the binaries are byte copies. Skipping the folder cost the
+        // imported extension its verification files (fix 3 round 2).
         let logical = format!("{prefix}/{name}");
         if ft.is_dir() {
             walk_collect(&ent.path(), &logical, out)?;
@@ -368,6 +401,7 @@ pub fn install_in(
     ids: &[String],
     bins: &BTreeMap<String, Vec<u8>>,
     registrations: &Map<String, Value>,
+    keys: &crate::cookies::Keys,
 ) -> Result<InstallStats> {
     let slot_dir = paths::slot_dir(browser_root, slot);
     let ext_root = slot_dir.join(EXT_BIN_PREFIX);
@@ -382,10 +416,17 @@ pub fn install_in(
     for p in registration_store_paths(browser_root, slot) {
         paths::check_contained(browser_root, &p)?;
     }
+    // The gated anchor check and the registration merge run before any
+    // binary is written: both can refuse (a key that cannot seal the
+    // macOS v11 anchor), and a refusal must not leave a half-installed
+    // extension tree behind for callers without a journal. The merge
+    // does not read the binaries, and the reports below still run
+    // after both writes, so the success path is unchanged.
+    let anchor_lock = extension_anchor_lock(browser_root, keys)?;
+    let _merged = merge_registrations(&slot_dir, browser, registrations, anchor_lock)?;
     if !bins.is_empty() {
         write_bins_from_payload(&slot_dir, bins)?;
     }
-    let _merged = merge_registrations(&slot_dir, browser, registrations)?;
     let mut reports = Vec::new();
     for id in ids {
         if !valid_id(id) {
@@ -621,8 +662,21 @@ mod tests {
         let bins = collect_bins_in(src.path(), "Default").unwrap();
         assert_eq!(bins.len(), 2);
         let regs = collect_registrations_in(src.path(), "Default", &[ID.to_string()]).unwrap();
-        let stats =
-            install_in(dst.path(), "Default", "chrome", "Google Chrome", &[ID.to_string()], &bins, &regs).unwrap();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::linux("peanuts", crate::oscrypt::LinuxPrefix::V10),
+            from_libsecret_v2: false,
+        };
+        let stats = install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap();
         assert_eq!(stats.reports.len(), 1);
         assert_eq!(stats.reports[0].status, "installed");
         assert!(dst.path().join("Default/Extensions").join(ID).join(ver).join("bg.js").is_file());
@@ -630,6 +684,125 @@ mod tests {
         // registration is registry-based, so no file is written there.
         #[cfg(not(windows))]
         assert!(dst.path().join("External Extensions").join(format!("{ID}.json")).is_file());
+    }
+
+    #[test]
+    fn install_writes_no_anchor_off_the_macos_v11_gate() {
+        // Regression guard for the fix A gate: off macOS, even a target
+        // folder whose own pref hashes speak v11 and a Mac lock must
+        // produce no settings_encrypted_hash anchor. The Linux leg is
+        // proven green without engine-written anchors and stays that way.
+        use base64::Engine;
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let ver = "1.0_0";
+        let ver_dir = src.path().join(format!("Default/Extensions/{ID}/{ver}"));
+        fs::create_dir_all(&ver_dir).unwrap();
+        fs::write(
+            ver_dir.join("manifest.json"),
+            br#"{"version":"1.0","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+        )
+        .unwrap();
+        let prefs = src.path().join("Default/Preferences");
+        fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+        fs::write(
+            prefs,
+            format!(
+                r#"{{"extensions":{{"settings":{{"{ID}":{{"manifest":{{"version":"1.0"}},"state":1}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        // The target folder speaks v11 through its own sealed pref hash.
+        let dst_slot = dst.path().join("Default");
+        fs::create_dir_all(&dst_slot).unwrap();
+        let seeded = json!({"protection": {
+            "super_encrypted_hash":
+                base64::engine::general_purpose::STANDARD.encode(b"v11-super"),
+        }});
+        fs::write(dst_slot.join("Secure Preferences"), serde_json::to_vec(&seeded).unwrap()).unwrap();
+        assert!(crate::oscrypt::mac_data_dir_speaks_v11(dst.path()));
+        let bins = collect_bins_in(src.path(), "Default").unwrap();
+        let regs = collect_registrations_in(src.path(), "Default", &[ID.to_string()]).unwrap();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::mac("fixture-safe-storage-pw"),
+            from_libsecret_v2: true,
+        };
+        let stats = install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap();
+        assert_eq!(stats.reports[0].status, "installed");
+        let secure: Value =
+            serde_json::from_slice(&fs::read(dst_slot.join("Secure Preferences")).unwrap()).unwrap();
+        assert!(secure["protection"]["macs"]["extensions"]["settings"][ID].is_string());
+        if crate::oscrypt::Platform::current() != crate::oscrypt::Platform::Mac {
+            assert!(
+                secure["protection"]["macs"]["extensions"].get("settings_encrypted_hash").is_none(),
+                "no anchor may be written off the macOS gate"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_and_install_includes_metadata_files() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let ver = "1.0_0";
+        let ver_dir = src.path().join(format!("Default/Extensions/{ID}/{ver}"));
+        let meta_dir = ver_dir.join("_metadata");
+        fs::create_dir_all(&meta_dir).unwrap();
+        fs::write(
+            ver_dir.join("manifest.json"),
+            br#"{"version":"1.0","update_url":"https://clients2.google.com/service/update2/crx"}"#,
+        )
+        .unwrap();
+        fs::write(meta_dir.join("verified_contents.json"), br#"{"signed":true}"#).unwrap();
+        fs::write(meta_dir.join("computed_hashes.json"), br#"{"hashes":{}}"#).unwrap();
+        let prefs = src.path().join("Default/Preferences");
+        fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+        fs::write(
+            prefs,
+            format!(
+                r#"{{"extensions":{{"settings":{{"{ID}":{{"manifest":{{"version":"1.0"}},"state":1}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let bins = collect_bins_in(src.path(), "Default").unwrap();
+        let prefix = format!("{EXT_BIN_PREFIX}/{ID}/{ver}/_metadata");
+        assert_eq!(
+            bins.get(&format!("{prefix}/verified_contents.json")).map(Vec::as_slice),
+            Some(br#"{"signed":true}"#.as_slice())
+        );
+        assert_eq!(
+            bins.get(&format!("{prefix}/computed_hashes.json")).map(Vec::as_slice),
+            Some(br#"{"hashes":{}}"#.as_slice())
+        );
+        let regs = collect_registrations_in(src.path(), "Default", &[ID.to_string()]).unwrap();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::linux("peanuts", crate::oscrypt::LinuxPrefix::V10),
+            from_libsecret_v2: false,
+        };
+        install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap();
+        let landed = dst.path().join(format!("Default/Extensions/{ID}/{ver}/_metadata"));
+        assert_eq!(fs::read(landed.join("verified_contents.json")).unwrap(), br#"{"signed":true}"#);
+        assert_eq!(fs::read(landed.join("computed_hashes.json")).unwrap(), br#"{"hashes":{}}"#);
     }
 
     /// Another profile's extension folder, holding the manifest the repro protects.
@@ -712,8 +885,21 @@ mod tests {
         )]
         .into();
         let regs = Map::new();
-        let err = install_in(dst.path(), "Default", "chrome", "Google Chrome", &[ID.to_string()], &bins, &regs)
-            .unwrap_err();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::linux("peanuts", crate::oscrypt::LinuxPrefix::V10),
+            from_libsecret_v2: false,
+        };
+        let err = install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::Refused(_)), "{err:?}");
         assert_eq!(
             fs::read(other.path().join(format!("Default/Extensions/{ID}/1.0_0/manifest.json"))).unwrap(),
@@ -736,8 +922,21 @@ mod tests {
         .into();
         let regs: Map<String, Value> =
             serde_json::from_value(json!({ ID: { "state": 1, "from_webstore": true } })).unwrap();
-        let stats =
-            install_in(dst.path(), "Default", "chrome", "Google Chrome", &[ID.to_string()], &bins, &regs).unwrap();
+        let keys = crate::cookies::Keys::Cbc {
+            lock: crate::oscrypt::Lock::linux("peanuts", crate::oscrypt::LinuxPrefix::V10),
+            from_libsecret_v2: false,
+        };
+        let stats = install_in(
+            dst.path(),
+            "Default",
+            "chrome",
+            "Google Chrome",
+            &[ID.to_string()],
+            &bins,
+            &regs,
+            &keys,
+        )
+        .unwrap();
         assert_eq!(stats.reports.len(), 1);
         assert_eq!(stats.reports[0].status, "failed", "{:?}", stats.reports);
         assert!(!outside.path().join(format!("{ID}.json")).exists());
