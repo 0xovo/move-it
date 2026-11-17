@@ -689,6 +689,59 @@ mod tests {
     }
 
     #[test]
+    fn mac_cookie_write_follows_the_data_folders_own_v11_hashes() {
+        // The fix-2 seam end to end: a user data folder whose browser sealed
+        // v11 pref hashes writes an empty cookie store v11, keyed with the
+        // pepper key, and the row reads back. A folder with no such hashes
+        // still writes v10.
+        use base64::Engine;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Chrome");
+        std::fs::create_dir_all(root.join("Default")).unwrap();
+        let prefs = serde_json::json!({"protection": {
+            "super_encrypted_hash":
+                base64::engine::general_purpose::STANDARD.encode(b"v11-super"),
+        }});
+        std::fs::write(
+            root.join("Default").join("Secure Preferences"),
+            serde_json::to_vec(&prefs).unwrap(),
+        )
+        .unwrap();
+        let keys = Keys::Cbc {
+            lock: Lock::mac("mac-test-safe-storage-pw"),
+            from_libsecret_v2: crate::oscrypt::mac_data_dir_speaks_v11(&root),
+        };
+        let (_t2, p) = db();
+        import(&p, &[cookie(".a.com", "n", "one", 1)], &keys).unwrap();
+        let written: Vec<u8> = Connection::open(&p)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='n'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&written[..3], b"v11");
+        assert_eq!(
+            written,
+            Lock::mac("mac-test-safe-storage-pw")
+                .encrypt_labelled(".a.com", "one", HostTag::With, LinuxPrefix::V11)
+                .unwrap()
+        );
+        assert_eq!(export(&p, &keys).unwrap()[0].value, "one");
+        let bare = tempfile::tempdir().unwrap();
+        let bare_root = bare.path().join("Chrome");
+        std::fs::create_dir_all(bare_root.join("Default")).unwrap();
+        let bare_keys = Keys::Cbc {
+            lock: Lock::mac("mac-test-safe-storage-pw"),
+            from_libsecret_v2: crate::oscrypt::mac_data_dir_speaks_v11(&bare_root),
+        };
+        let (_t3, p3) = db();
+        import(&p3, &[cookie(".a.com", "n", "one", 1)], &bare_keys).unwrap();
+        let bare_written: Vec<u8> = Connection::open(&p3)
+            .unwrap()
+            .query_row("SELECT encrypted_value FROM cookies WHERE name='n'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(&bare_written[..3], b"v10");
+    }
+
+    #[test]
     fn linux_empty_store_label_is_per_browser_on_linux() {
         let (_t, p) = db();
         let chrome_v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };

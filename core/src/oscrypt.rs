@@ -3,10 +3,13 @@
 //!
 //! - Linux: `v10`/`v11` + AES-128-CBC, IV = 16 spaces, key = PBKDF2-HMAC-SHA1(password, "saltysalt", 1 round).
 //! - Mac:   `v10`/`v11` + the same CBC, key = PBKDF2-HMAC-SHA1(Keychain password, salt, 1003 rounds);
-//!   the salt is "saltysalt" for `v10` and "pepper" for `v11`. A store that already speaks `v11`
-//!   is followed; an empty store writes `v10`. The old rule (a non-default user data dir writes
-//!   `v11`) is dead: live proof on Chrome 156 and Brave 1.98 showed both writing `v10` in
-//!   non-default dirs, so the folder location no longer proves anything.
+//!   the salt is "saltysalt" for `v10` and "pepper" for `v11`. Chrome 158 in a temp user
+//!   data folder wrote `v11` (probe 2026-11-17: its own rows open under the pepper key,
+//!   5/5 cookies and 9/9 `*_encrypted_hash` values); whether a default-directory profile
+//!   also writes `v11` was not measured. The folder location therefore proves nothing:
+//!   the store's own rows decide first, and for an empty store the folder's own
+//!   `*_encrypted_hash` pref values do ([`mac_data_dir_speaks_v11`]): the browser seals those
+//!   with the same key. No evidence writes `v10`.
 //! - Windows: `v10` + AES-256-GCM with the DPAPI-unwrapped master key from Local State.
 //!   `v20` (App-Bound) is refused, never guessed. On Linux, `v10` is Posix, `v11` is
 //!   Freedesktop Secret, `v12` is portal-decrypt-only; `v20` is Windows App-Bound
@@ -468,7 +471,9 @@ fn host_hash(host: &str) -> [u8; 32] {
 /// unlocked item only; Chrome and Brave keep v10). The folder location never
 /// decides: live proof showed Chrome 156 and Brave 1.98 writing v10 in
 /// non-default dirs, and no Local State field records the scheme, so the store's
-/// own rows are the only evidence for v11.
+/// own rows are the evidence for v11, plus on macOS the folder's pref hashes
+/// (see [`mac_data_dir_speaks_v11`]), which the caller folds into
+/// `from_libsecret_v2`.
 pub fn linux_write_prefix<'a>(values: impl IntoIterator<Item = &'a [u8]>, from_libsecret_v2: bool) -> LinuxPrefix {
     let (mut v10, mut v11) = (0usize, 0usize);
     for v in values {
@@ -609,6 +614,67 @@ fn mac_password_from(
         KeychainOutcome::Unavailable => Err(Error::Io(
             "the macOS security tool did not answer".into(),
         )),
+    }
+}
+
+/// Whether the browser that owns this macOS user data folder seals with the
+/// `v11` (pepper) key. The scheme is chosen per user data folder, so every
+/// profile folder inside it is a witness. Evidence is the label on the
+/// `*_encrypted_hash` values the browser itself wrote into `Preferences` and
+/// `Secure Preferences` (tracked-pref hashes sealed with the same OSCrypt key
+/// as cookies). A strict majority of `v11` labels says yes; no evidence, a tie
+/// or a `v10` majority says no. Folders beside this one are not witnesses:
+/// only this folder and the profile folders inside it. Reads only; never
+/// touches the Keychain.
+///
+/// The argument is the user data folder (the harness `open`/`seal` root),
+/// not one profile inside it: that is what the only caller passes.
+pub fn mac_data_dir_speaks_v11(data_dir: &std::path::Path) -> bool {
+    let mut dirs = vec![data_dir.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    let mut labels: Vec<Vec<u8>> = Vec::new();
+    for d in &dirs {
+        for name in ["Preferences", "Secure Preferences"] {
+            let Ok(bytes) = std::fs::read(d.join(name)) else { continue };
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+            collect_encrypted_hash_labels(&json, &mut labels);
+        }
+    }
+    !labels.is_empty()
+        && linux_write_prefix(labels.iter().map(|l| l.as_slice()), false) == LinuxPrefix::V11
+}
+
+/// Gather the 3-byte scheme label of every `*_encrypted_hash` string in a prefs tree.
+fn collect_encrypted_hash_labels(v: &serde_json::Value, out: &mut Vec<Vec<u8>>) {
+    use base64::Engine;
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                match val {
+                    serde_json::Value::String(s) if k.ends_with("_encrypted_hash") => {
+                        if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
+                            if let Some(label) = raw.get(..3) {
+                                out.push(label.to_vec());
+                            }
+                        }
+                    }
+                    other => collect_encrypted_hash_labels(other, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_encrypted_hash_labels(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1263,5 +1329,56 @@ mod tests {
             resolve_keychain_outcome(AttrOutcome::Unavailable, KeychainOutcome::Unavailable),
             KeychainOutcome::Unavailable
         );
+    }
+
+    #[test]
+    fn mac_data_dir_scheme_follows_the_browsers_own_encrypted_hashes() {
+        use base64::Engine;
+        let b64 = |raw: &[u8]| base64::engine::general_purpose::STANDARD.encode(raw);
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Chrome");
+        let slot = root.join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        // No prefs at all: no evidence, so v10.
+        assert!(!mac_data_dir_speaks_v11(&root));
+        // HMACs alone are not evidence.
+        std::fs::write(
+            slot.join("Secure Preferences"),
+            "{\"protection\":{\"macs\":{\"homepage\":\"ABCDEF\"},\"super_mac\":\"0123\"}}",
+        )
+        .unwrap();
+        assert!(!mac_data_dir_speaks_v11(&root));
+        // The browser's own v11-sealed hashes, nested and top level.
+        let prefs = serde_json::json!({"protection": {
+            "macs": {"homepage": "ABCDEF", "homepage_encrypted_hash": b64(b"v11-sealed-bytes"),
+                     "extensions": {"settings": {"abc_encrypted_hash": b64(b"v11-more")}}},
+            "super_encrypted_hash": b64(b"v11-super"),
+        }});
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(mac_data_dir_speaks_v11(&root));
+        // A sibling profile in the same user data folder is a witness for a
+        // folder whose Default profile has no prefs of its own.
+        let sibling = root.join("Profile 1");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::remove_file(slot.join("Secure Preferences")).unwrap();
+        std::fs::write(sibling.join("Preferences"), serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(mac_data_dir_speaks_v11(&root));
+        // A v11 folder beside this user data folder is no witness for it:
+        // only this folder and the profiles inside it count.
+        std::fs::remove_file(sibling.join("Preferences")).unwrap();
+        let other = t.path().join("OtherBrowser");
+        std::fs::create_dir_all(other.join("Default")).unwrap();
+        std::fs::write(other.join("Default").join("Preferences"), serde_json::to_vec(&prefs).unwrap()).unwrap();
+        assert!(!mac_data_dir_speaks_v11(&root));
+        // A v10 folder stays v10, and junk values prove nothing.
+        let t10 = tempfile::tempdir().unwrap();
+        let slot10 = t10.path().join("Chrome").join("Default");
+        std::fs::create_dir_all(&slot10).unwrap();
+        let prefs10 = serde_json::json!({"protection": {
+            "super_encrypted_hash": b64(b"v10-super"),
+            "macs": {"a_encrypted_hash": "not base64 !!", "b_encrypted_hash": 7},
+        }});
+        std::fs::write(slot10.join("Preferences"), serde_json::to_vec(&prefs10).unwrap()).unwrap();
+        assert!(!mac_data_dir_speaks_v11(&t10.path().join("Chrome")));
     }
 }

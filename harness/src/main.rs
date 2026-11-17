@@ -542,7 +542,6 @@ fn profile_keys(browser: LinuxBrowser, dir: &Path) -> Result<Keys, Error> {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = dir;
         let mb = match mac_browser(browser) {
             Some(mb) => mb,
             None => {
@@ -554,7 +553,10 @@ fn profile_keys(browser: LinuxBrowser, dir: &Path) -> Result<Keys, Error> {
         let (password, from_keychain) = moveit_core::oscrypt::mac_browser_password_for(mb)?;
         return Ok(Keys::Cbc {
             lock: Lock::mac(&password),
-            from_libsecret_v2: mb.empty_store_v11_from_trusted_item(from_keychain),
+            // An empty store follows the scheme this user data folder's own
+            // browser already seals with, read from the browser's own pref hashes.
+            from_libsecret_v2: mb.empty_store_v11_from_trusted_item(from_keychain)
+                || (from_keychain && moveit_core::oscrypt::mac_data_dir_speaks_v11(dir)),
         });
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
