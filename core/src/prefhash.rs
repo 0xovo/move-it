@@ -277,6 +277,57 @@ fn stamp_settings_anchors(
     Ok(())
 }
 
+/// The macs tree pruned to its `*_encrypted_hash` leaves: an entry
+/// survives when its key names an encrypted hash (its whole value goes
+/// along, e.g. the flat id-to-anchor map under `settings_encrypted_hash`)
+/// or when a descendant survives; every other entry is dropped. This
+/// filtered tree is what the super anchor seals (probe-verified against
+/// Chrome's own `super_encrypted_hash`, fix 3 round 2 Q1: MATCH).
+fn filter_encrypted_only(value: &Value) -> Value {
+    // Mirrors the probe's filter_encrypted_only exactly: a key ending in
+    // "_encrypted_hash" keeps its whole value; any other dict value is
+    // replaced by its own filtered form and kept only when that is
+    // non-empty; anything else is dropped, and a non-dict input filters
+    // to an empty dict.
+    let mut out = Map::new();
+    if let Value::Object(map) = value {
+        for (k, v) in map {
+            if k.ends_with("_encrypted_hash") {
+                out.insert(k.clone(), v.clone());
+            } else if v.is_object() {
+                let sub = filter_encrypted_only(v);
+                if !matches!(&sub, Value::Object(m) if m.is_empty()) {
+                    out.insert(k.clone(), sub);
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Recompute `protection.super_encrypted_hash` over the final macs tree:
+/// the anchor recipe with an empty path over the filtered tree. Adding a
+/// per-extension anchor changes the filtered tree, so an inherited super
+/// anchor goes stale by construction the moment fix A stamps a new one;
+/// leaving it would hand Chrome an internally inconsistent protection
+/// block.
+fn stamp_super_encrypted_hash(root: &mut Value, seed: &[u8], lock: &Lock) -> Result<()> {
+    let macs = root
+        .get("protection")
+        .and_then(|p| p.get("macs"))
+        .cloned()
+        .unwrap_or(json!({}));
+    let anchor = encrypted_hash_anchor(seed, "", &filter_encrypted_only(&macs), lock)?;
+    let prot = root
+        .as_object_mut()
+        .and_then(|o| o.entry("protection").or_insert_with(|| json!({})).as_object_mut());
+    let Some(prot) = prot else {
+        return Err(Error::Corrupt("cannot build protection in preferences".into()));
+    };
+    prot.insert("super_encrypted_hash".into(), json!(anchor));
+    Ok(())
+}
+
 pub fn uses_secure_extension_prefs(browser: &str) -> bool {
     !matches!(browser, "brave")
 }
@@ -402,6 +453,7 @@ pub fn merge_registrations_secure(
     macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, true)?;
     if let Some(lock) = anchor_lock {
         stamp_settings_anchors(&mut secure, &secure_settings, regs, seed, lock)?;
+        stamp_super_encrypted_hash(&mut secure, seed, lock)?;
     }
     write_json(&secure_path, &secure)?;
     Ok(regs.len())
@@ -626,6 +678,76 @@ mod tests {
         regs.insert(id.into(), json!({"location": 1}));
         let lock = Lock::windows([7u8; 32]);
         assert!(merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).is_err());
+    }
+
+    /// Test-side anchor seal, written from the recipe directly (pepper
+    /// PBKDF2 + AES-CBC + v11 prefix), not via the production helpers.
+    fn seal_anchor(pw: &str, digest: &[u8]) -> String {
+        use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        use base64::Engine;
+        let mut key = [0u8; 16];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(pw.as_bytes(), b"pepper", 1003, &mut key);
+        let body = cbc::Encryptor::<aes::Aes128>::new((&key).into(), (&[b' '; 16]).into())
+            .encrypt_padded_vec_mut::<Pkcs7>(digest);
+        base64::engine::general_purpose::STANDARD.encode([b"v11".as_slice(), &body].concat())
+    }
+
+    #[test]
+    fn adding_an_anchor_recomputes_the_super_anchor() {
+        use sha2::{Digest, Sha256};
+        let pw = "fixture-safe-storage-pw";
+        let other = "admccjkmockfdflocgggjfgdacdodkdf";
+        let new_id = "nngceckbapebfimnlniiiahkandclblb";
+        // The pre-merge filtered tree holds only the inherited anchor
+        // leaves; the plain HMAC leaves never take part. The seeded
+        // super anchor is the CORRECT one over that tree, exactly the
+        // probe's Q1 situation: consistent before the merge.
+        let pre_canonical = format!(
+            r#"{{"extensions":{{"settings_encrypted_hash":{{"{other}":"b2xk"}}}}}}"#
+        );
+        let mut h = Sha256::new();
+        h.update(GOOGLE_CHROME_SEED);
+        h.update(pre_canonical.as_bytes());
+        let pre_super = seal_anchor(pw, &h.finalize());
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let seeded = json!({
+            "extensions": {"settings": {other: {"location": 6}}},
+            "protection": {
+                "super_encrypted_hash": pre_super,
+                "macs": {
+                    "extensions": {
+                        "settings": {other: "DEADBEEF"},
+                        "settings_encrypted_hash": {other: "b2xk"},
+                    },
+                    "homepage": "DEADBEEF",
+                },
+            },
+        });
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&seeded).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(new_id.into(), json!({"location": 1, "path": "x/2026.10.2_0"}));
+        let lock = Lock::mac(pw);
+        merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).unwrap();
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        let new_anchor = secure["protection"]["macs"]["extensions"]["settings_encrypted_hash"][new_id]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let super_now = secure["protection"]["super_encrypted_hash"].as_str().unwrap();
+        assert_ne!(super_now, pre_super, "the super anchor must move when an anchor is added");
+        // Independent recomputation over the final tree: the filtered
+        // tree keeps both anchor leaves (ids sorted), drops every plain
+        // HMAC leaf, and the path is empty.
+        let final_canonical = format!(
+            r#"{{"extensions":{{"settings_encrypted_hash":{{"{other}":"b2xk","{new_id}":"{new_anchor}"}}}}}}"#
+        );
+        let mut h = Sha256::new();
+        h.update(GOOGLE_CHROME_SEED);
+        h.update(final_canonical.as_bytes());
+        assert_eq!(decrypt_anchor(pw, super_now), h.finalize().to_vec());
     }
 
     #[test]
