@@ -416,11 +416,17 @@ pub fn install_in(
     for p in registration_store_paths(browser_root, slot) {
         paths::check_contained(browser_root, &p)?;
     }
+    // The gated anchor check and the registration merge run before any
+    // binary is written: both can refuse (a key that cannot seal the
+    // macOS v11 anchor), and a refusal must not leave a half-installed
+    // extension tree behind for callers without a journal. The merge
+    // does not read the binaries, and the reports below still run
+    // after both writes, so the success path is unchanged.
+    let anchor_lock = extension_anchor_lock(browser_root, keys)?;
+    let _merged = merge_registrations(&slot_dir, browser, registrations, anchor_lock)?;
     if !bins.is_empty() {
         write_bins_from_payload(&slot_dir, bins)?;
     }
-    let anchor_lock = extension_anchor_lock(browser_root, keys)?;
-    let _merged = merge_registrations(&slot_dir, browser, registrations, anchor_lock)?;
     let mut reports = Vec::new();
     for id in ids {
         if !valid_id(id) {
