@@ -5,6 +5,7 @@ use std::path::Path;
 
 use moveit_core::cookies::{self, Cookie, Keys};
 use moveit_core::engine::{self, Profile};
+use moveit_core::logins::{self, Login};
 use moveit_core::oscrypt::{HostTag, LinuxPrefix, Lock};
 use moveit_core::sealed::SyncKey;
 
@@ -157,4 +158,127 @@ fn a_locked_cookie_db_rolls_the_whole_import_back() {
     let err = engine::import(&profile(&b, &k), &payload, 1);
     assert!(err.is_err(), "a locked store must fail the move");
     assert_eq!(std::fs::read(b.join("Default/Bookmarks")).unwrap(), b"OLD BOOKMARKS", "bookmarks rolled back");
+}
+
+/// A device key the way a Mac carries it: derived from that device's own
+/// Safe Storage password, so another device's key genuinely cannot open
+/// its rows. (A wrong Linux password would not reproduce the defect:
+/// Linux v10 values always open under the compiled-in fallback key.)
+fn device_keys(password: &str) -> Keys {
+    Keys::Cbc { lock: Lock::mac(password), from_libsecret_v2: false }
+}
+
+fn login(user: &str, pw: &str, created: i64) -> Login {
+    Login {
+        origin_url: "https://mail.example.com/login".into(),
+        action_url: "https://mail.example.com/auth".into(),
+        username_value: user.into(),
+        password_value: pw.into(),
+        date_created: created,
+        date_last_used: created + 500,
+        times_used: 3,
+        signon_realm: "https://mail.example.com".into(),
+        date_password_modified: created,
+    }
+}
+
+fn plant_logins(dir: &Path, ls: &[Login]) {
+    logins::import(&dir.join("Default/Login Data"), ls, &keys(), HostTag::Without).unwrap();
+}
+
+fn payload_len(payload: &moveit_core::sealed::Payload, key: &str) -> usize {
+    payload.manifest.get(key).and_then(|v| v.as_array()).map_or(0, |a| a.len())
+}
+
+#[test]
+fn seal_fails_when_no_cookie_decrypts_under_the_found_key() {
+    // The Mac proof leg: the profile's rows were sealed on a device whose
+    // discovered key belonged to a different browser install, every row
+    // failed to decrypt, and the seal reported success with zero cookies.
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    let blob = Lock::mac("source-device-pw").encrypt(".acme.test", "SECRET-SESSION", HostTag::With).unwrap();
+    rusqlite::Connection::open(a.join("Default/Cookies")).unwrap().execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (100, '.acme.test', 'sid', '/', ?1)",
+        rusqlite::params![blob],
+    ).unwrap();
+    let wrong = device_keys("other-device-pw");
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let err = engine::seal_box(&profile(&a, &wrong), "fedora:A", &key).unwrap_err();
+    assert!(err.to_string().contains("cookies"), "the error must name the store: {err}");
+}
+
+#[test]
+fn seal_fails_when_no_login_decrypts_under_the_found_key() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    let blob = Lock::mac("source-device-pw").encrypt("example.com", "pw1", HostTag::Without).unwrap();
+    rusqlite::Connection::open(a.join("Default/Login Data")).unwrap().execute(
+        "INSERT INTO logins (origin_url, username_value, password_value, date_created, date_last_used, date_password_modified, signon_realm, times_used) VALUES ('https://mail.example.com/login', 'u1', ?1, 1, 1, 1, 'https://mail.example.com', 0)",
+        rusqlite::params![blob],
+    ).unwrap();
+    let wrong = device_keys("other-device-pw");
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let err = engine::seal_box(&profile(&a, &wrong), "fedora:A", &key).unwrap_err();
+    assert!(err.to_string().contains("saved logins"), "the error must name the store: {err}");
+}
+
+#[test]
+fn an_empty_profile_still_seals() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    let k = keys();
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let sealed = engine::seal_box(&profile(&a, &k), "fedora:A", &key).unwrap();
+    let payload = engine::open_box(&sealed, &key).unwrap();
+    assert_eq!(payload_len(&payload, "cookies"), 0);
+    assert_eq!(payload_len(&payload, "passwords"), 0);
+}
+
+#[test]
+fn a_profile_of_only_app_bound_rows_still_seals() {
+    // App-Bound rows are refused by design, not lost to a wrong key: a store
+    // holding nothing else is not the defect case and must still seal.
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    let mut blob = b"v20".to_vec();
+    blob.extend_from_slice(&[7u8; 40]);
+    rusqlite::Connection::open(a.join("Default/Cookies")).unwrap().execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.locked.example', 'sess', '/', ?1)",
+        rusqlite::params![blob],
+    ).unwrap();
+    plant_logins(&a, &[login("locked", "pw", 13350001000000000)]);
+    rusqlite::Connection::open(a.join("Default/Login Data")).unwrap()
+        .execute("UPDATE logins SET password_value=x'763230010203' WHERE username_value='locked'", []).unwrap();
+    let k = keys();
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let sealed = engine::seal_box(&profile(&a, &k), "fedora:A", &key).unwrap();
+    let payload = engine::open_box(&sealed, &key).unwrap();
+    assert_eq!(payload_len(&payload, "cookies"), 0);
+    assert_eq!(payload_len(&payload, "passwords"), 0);
+    assert_eq!(payload.manifest.get("skipped_cookies").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(payload.manifest.get("skipped_logins").and_then(|v| v.as_u64()), Some(1));
+}
+
+#[test]
+fn a_partial_cookie_loss_still_seals_and_carries_what_decrypts() {
+    let t = tempfile::tempdir().unwrap();
+    let a = t.path().join("A");
+    fresh_profile(&a);
+    plant_cookies(&a, &[cookie(".acme.test", "sid", "SECRET-SESSION", 100)]);
+    let lost = Lock::mac("other-device-pw")
+        .encrypt(".lost.test", "gone", HostTag::With).unwrap();
+    rusqlite::Connection::open(a.join("Default/Cookies")).unwrap().execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (1, '.lost.test', 'x', '/', ?1)",
+        rusqlite::params![lost],
+    ).unwrap();
+    let k = keys();
+    let key = SyncKey::from_bytes([3u8; 32]);
+    let sealed = engine::seal_box(&profile(&a, &k), "fedora:A", &key).unwrap();
+    let payload = engine::open_box(&sealed, &key).unwrap();
+    assert_eq!(payload_len(&payload, "cookies"), 1);
 }

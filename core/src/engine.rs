@@ -44,6 +44,23 @@ fn wants_kind(kinds: Option<&[String]>, name: &str) -> bool {
     }
 }
 
+/// A credential store that holds rows, exports none of them, and lost rows
+/// to decryption failure must fail the seal: the key found on this device
+/// does not belong to this profile, and sealing anyway would write a box
+/// with no credentials in it and call that success (the Mac proof leg did
+/// exactly this). A genuinely empty store (no rows at all) seals fine, and
+/// a store whose rows are all App-Bound seals fine too: those rows are
+/// refused by design, not lost to a wrong key. Partial loss keeps the old
+/// behaviour: what decrypts moves, the rest is counted as skipped.
+fn refuse_unreadable_store(store: &str, detail_total: usize, exported: usize, failed: usize) -> Result<()> {
+    if detail_total > 0 && exported == 0 && failed > 0 {
+        return Err(Error::Refused(format!(
+            "this profile's {store} could not be read: {detail_total} rows are stored but none of them decrypted with the browser key found on this device, so sealing would silently drop them all"
+        )));
+    }
+    Ok(())
+}
+
 /// Read everything movable out of a profile and build a v2 payload.
 /// When `kinds` is set, only those sections are packed; importers skip missing keys.
 pub fn export(p: &Profile, origin: &str, kinds: Option<&[String]>) -> Result<Payload> {
@@ -54,14 +71,16 @@ pub fn export(p: &Profile, origin: &str, kinds: Option<&[String]>) -> Result<Pay
     let mut ext_bins = std::collections::BTreeMap::new();
     let mut bm_bytes = None;
     if wants_kind(kinds, "cookies") {
-        let (cookies, skipped_cookies) = cookies::export_counted(&paths::cookies_in(p.dir, p.slot), p.keys)?;
-        m.insert("cookies".into(), serde_json::to_value(&cookies).map_err(ser)?);
-        m.insert("skipped_cookies".into(), skipped_cookies.into());
+        let detail = cookies::export_detailed(&paths::cookies_in(p.dir, p.slot), p.keys)?;
+        refuse_unreadable_store("cookies", detail.total, detail.cookies.len(), detail.failed)?;
+        m.insert("cookies".into(), serde_json::to_value(&detail.cookies).map_err(ser)?);
+        m.insert("skipped_cookies".into(), detail.app_bound.into());
     }
     if wants_kind(kinds, "passwords") {
-        let (logins, skipped_logins) =
-            logins::export_counted(&paths::login_data_in(p.dir, p.slot), p.keys)?;
-        m.insert("passwords".into(), serde_json::to_value(&logins).map_err(ser)?);
+        let detail = logins::export_detailed(&paths::login_data_in(p.dir, p.slot), p.keys)?;
+        refuse_unreadable_store("saved logins", detail.total, detail.logins.len(), detail.failed)?;
+        let skipped_logins = detail.app_bound + detail.failed;
+        m.insert("passwords".into(), serde_json::to_value(&detail.logins).map_err(ser)?);
         m.insert("skipped_logins".into(), skipped_logins.into());
     }
     if wants_kind(kinds, "history") {
