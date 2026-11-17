@@ -371,15 +371,26 @@ fn macs_for_extensions(root: &mut Value, settings: &Map<String, Value>, seed: &[
         macs.insert(id.clone(), json!(hmac_hex(seed, device_id, &path, entry)?));
     }
     if stamp_super {
-        let macs_val = root
-            .get("protection")
-            .and_then(|p| p.get("macs"))
-            .cloned()
-            .unwrap_or(json!({}));
-        let digest = calculate_super_mac(seed, device_id, &macs_val)?;
-        if let Some(prot) = root.as_object_mut().and_then(|o| o.get_mut("protection")).and_then(Value::as_object_mut) {
-            prot.insert("super_mac".into(), json!(digest));
-        }
+        stamp_super_mac(root, seed, device_id)?;
+    }
+    Ok(())
+}
+
+/// Stamp `protection.super_mac` over the macs tree exactly as it stands
+/// in `root` right now. Callers that go on mutating the macs tree (the
+/// gated macOS anchor path inserts `settings_encrypted_hash` leaves
+/// after the per-entry HMACs) must stamp this only once the tree is
+/// final: PrefHashStoreImpl validates the super MAC over the whole
+/// macs dict, so a super stamped earlier is stale by construction.
+fn stamp_super_mac(root: &mut Value, seed: &[u8], device_id: &str) -> Result<()> {
+    let macs_val = root
+        .get("protection")
+        .and_then(|p| p.get("macs"))
+        .cloned()
+        .unwrap_or(json!({}));
+    let digest = calculate_super_mac(seed, device_id, &macs_val)?;
+    if let Some(prot) = root.as_object_mut().and_then(|o| o.get_mut("protection")).and_then(Value::as_object_mut) {
+        prot.insert("super_mac".into(), json!(digest));
     }
     Ok(())
 }
@@ -445,16 +456,28 @@ pub fn merge_registrations_secure(
             ext.remove("settings_encrypted_hash");
         }
     }
-    write_json(&prefs_path, &prefs)?;
-
     let secure_path = slot.join("Secure Preferences");
     let mut secure = read_json(&secure_path)?;
     let secure_settings = merge_into_file(&mut secure, regs)?;
-    macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, true)?;
     if let Some(lock) = anchor_lock {
+        // Gated macOS path: per-entry HMACs first without the super,
+        // then the encrypted-hash anchors (which mutate the macs tree),
+        // then BOTH supers last over the finished tree. Stamping
+        // super_mac inside macs_for_extensions here would leave it
+        // covering the pre-anchor tree: the same stale-super defect
+        // the super_encrypted_hash recompute fixed, one layer over.
+        macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, false)?;
         stamp_settings_anchors(&mut secure, &secure_settings, regs, seed, lock)?;
+        stamp_super_mac(&mut secure, seed, &device_id)?;
         stamp_super_encrypted_hash(&mut secure, seed, lock)?;
+    } else {
+        macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, true)?;
     }
+    // Both files are written only after every fallible step above has
+    // succeeded, so a seal failure (keyless lock) leaves Preferences
+    // and Secure Preferences exactly as they were for direct callers
+    // without a journal around this merge.
+    write_json(&prefs_path, &prefs)?;
     write_json(&secure_path, &secure)?;
     Ok(regs.len())
 }
@@ -595,6 +618,19 @@ mod tests {
             .unwrap()
     }
 
+    /// Independent super_mac recomputation over a macs tree read back
+    /// from disk: HMAC-SHA256 keyed by the seed over
+    /// device_id || canonical(macs), written from the recipe directly
+    /// rather than via `calculate_super_mac`.
+    fn recomputed_super_mac(macs: &Value) -> String {
+        use hmac::Mac as _;
+        let body = value_as_string(macs).unwrap();
+        let mut mac = HmacSha256::new_from_slice(&GOOGLE_CHROME_SEED).unwrap();
+        mac.update(chromium_device_id().as_bytes());
+        mac.update(body.as_bytes());
+        hex_upper(&mac.finalize().into_bytes())
+    }
+
     #[test]
     fn merged_extension_gets_a_verifiable_encrypted_hash_anchor() {
         use sha2::{Digest, Sha256};
@@ -619,6 +655,14 @@ mod tests {
         h.update(format!("extensions.settings.{id}").as_bytes());
         h.update(br#"{"location":1,"path":"x/2026.10.2_0"}"#);
         assert_eq!(plain, h.finalize().to_vec());
+        // The final super_mac must verify over the final macs dict,
+        // anchors included, not the pre-anchor tree.
+        let stored_super = secure["protection"]["super_mac"].as_str().unwrap();
+        assert_eq!(stored_super, recomputed_super_mac(&secure["protection"]["macs"]));
+        assert_eq!(
+            stored_super,
+            calculate_super_mac(&GOOGLE_CHROME_SEED, &chromium_device_id(), &secure["protection"]["macs"]).unwrap()
+        );
         // The plain Preferences copy stays anchor-free, as before.
         let prefs: Value =
             serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
@@ -669,15 +713,41 @@ mod tests {
     #[test]
     fn anchor_with_a_keyless_lock_fails_loudly() {
         // A GCM (Windows) lock cannot seal a v11 anchor: the merge must
-        // refuse rather than write a registration without its anchor.
-        let t = tempfile::tempdir().unwrap();
-        let slot = t.path().join("Default");
-        std::fs::create_dir_all(&slot).unwrap();
+        // refuse rather than write a registration without its anchor,
+        // and the refusal must leave the target exactly as it was:
+        // Preferences, Secure Preferences and the extension tree are
+        // byte-identical afterwards, because the seal is computed
+        // before any file is written.
         let id = "nngceckbapebfimnlniiiahkandclblb";
         let mut regs = Map::new();
         regs.insert(id.into(), json!({"location": 1}));
         let lock = Lock::windows([7u8; 32]);
+
+        // Case 1: pre-existing files and extension tree stay untouched.
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let prefs_bytes = br#"{"preexisting":"prefs"}"#.to_vec();
+        let secure_bytes = br#"{"preexisting":"secure"}"#.to_vec();
+        std::fs::write(slot.join("Preferences"), &prefs_bytes).unwrap();
+        std::fs::write(slot.join("Secure Preferences"), &secure_bytes).unwrap();
+        let manifest = slot.join("Extensions").join(id).join("1.0_0").join("manifest.json");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let manifest_bytes = br#"{"version":"1.0"}"#.to_vec();
+        std::fs::write(&manifest, &manifest_bytes).unwrap();
         assert!(merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).is_err());
+        assert_eq!(std::fs::read(slot.join("Preferences")).unwrap(), prefs_bytes);
+        assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), secure_bytes);
+        assert_eq!(std::fs::read(&manifest).unwrap(), manifest_bytes);
+
+        // Case 2: absent files stay absent.
+        let t2 = tempfile::tempdir().unwrap();
+        let slot2 = t2.path().join("Default");
+        std::fs::create_dir_all(&slot2).unwrap();
+        assert!(merge_registrations_secure(&slot2, "chrome", &regs, Some(&lock)).is_err());
+        assert!(!slot2.join("Preferences").exists());
+        assert!(!slot2.join("Secure Preferences").exists());
+        assert!(!slot2.join("Extensions").exists());
     }
 
     /// Test-side anchor seal, written from the recipe directly (pepper
@@ -748,6 +818,15 @@ mod tests {
         h.update(GOOGLE_CHROME_SEED);
         h.update(final_canonical.as_bytes());
         assert_eq!(decrypt_anchor(pw, super_now), h.finalize().to_vec());
+        // Same for the HMAC super: it must verify over the final macs
+        // dict (both anchor leaves included), not the pre-anchor tree
+        // that was current when the per-entry HMACs were stamped.
+        let stored_super_mac = secure["protection"]["super_mac"].as_str().unwrap();
+        assert_eq!(stored_super_mac, recomputed_super_mac(&secure["protection"]["macs"]));
+        assert_eq!(
+            stored_super_mac,
+            calculate_super_mac(&GOOGLE_CHROME_SEED, &chromium_device_id(), &secure["protection"]["macs"]).unwrap()
+        );
     }
 
     #[test]
