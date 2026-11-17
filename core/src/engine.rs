@@ -218,7 +218,7 @@ fn apply_one(
             .cloned()
             .unwrap_or_default();
         a.extension_installs =
-            extinstall::install_in(root, slot, browser, display, &ids, &d.payload.ext_bins, &regs)?;
+            extinstall::install_in(root, slot, browser, display, &ids, &d.payload.ext_bins, &regs, keys)?;
     }
     Ok(a)
 }
@@ -327,8 +327,16 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            a.extension_installs =
-                extinstall::install_in(p.dir, p.slot, browser, display, &ids, &box_payload.ext_bins, &regs)?;
+            a.extension_installs = extinstall::install_in(
+                p.dir,
+                p.slot,
+                browser,
+                display,
+                &ids,
+                &box_payload.ext_bins,
+                &regs,
+                p.keys,
+            )?;
         }
         Ok(a)
     })();

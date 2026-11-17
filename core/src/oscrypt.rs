@@ -406,6 +406,23 @@ impl Lock {
         }
     }
 
+    /// Seal raw bytes under this lock's v11 key: `v11` followed by the
+    /// AES-128-CBC / PKCS7 body with the space IV, the same body a
+    /// v11-labelled `encrypt` writes but without the host tag or text
+    /// framing. The macOS pref-hash anchors seal a raw SHA256 digest this
+    /// way. `None` when the lock carries no v11 key (a Windows GCM lock,
+    /// or a caller-built CBC lock without one).
+    pub fn seal_v11_raw(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Lock::Cbc { v11_key: Some(k), .. } => {
+                let body = CbcEnc::new(k.into(), &IV.into())
+                    .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+                Some([b"v11".as_slice(), &body].concat())
+            }
+            _ => None,
+        }
+    }
+
     /// Unlock one value; a matching SHA256(host) tag in front is removed.
     pub fn decrypt(&self, host: &str, data: &[u8]) -> Result<String> {
         let label = data.get(..3).unwrap_or(data);
