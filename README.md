@@ -65,14 +65,18 @@ Move It transfers supported browser data between your devices: cookies, saved pa
 The engine targets Chromium-family profiles. These are implementation and
 verification states, not a promise that every login or extension will survive.
 Linux is proven on real profiles in real browsers, including a signed-in
-readback. Windows and macOS are proven on fixture profiles; real-profile
-readback on those two is still to come.
+readback. Chrome on macOS is also proven on real profiles, as source and
+target, including a signed-in readback. Windows, and the other browsers
+on macOS, are proven on fixture profiles; real-profile readback there is
+still to come. The macOS fixes proven in this round are on main and are
+not yet in a release; the shipped v0.1.0 release still carries those
+macOS defects.
 
 | Browser | Linux | Windows | macOS |
 |---|---|---|---|
 | Brave | v10/v11; proven on real profiles, as source and target | DPAPI v10; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; engine proven on fixture profiles, real-profile readback pending |
-| Chrome | v10/v11; proven on real profiles, signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; engine proven on fixture profiles, real-profile readback pending |
-| Edge | Profile discovery and v10/v11 implemented; not run, Edge was not installed on the test machine | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain support implemented; engine proven on fixture profiles, real-profile readback pending |
+| Chrome | v10/v11; proven on real profiles, signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; proven on real profiles, as source and target, signed-in readback included; the v11 cookie and extension registration fixes are on main, not yet in a release |
+| Edge | v10/v11; proven on real profiles, as source and target (Edge 157), signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain support implemented; engine proven on fixture profiles, real-profile readback pending |
 | Chromium | v10/v11; proven on real profiles as a move target | DPAPI v10; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; engine proven on fixture profiles, real-profile readback pending |
 | Firefox | Not supported | Not supported | Not supported |
 
@@ -83,9 +87,11 @@ readback on those two is still to come.
   v2 keyring item. A missing item can use the browser's v10 fallback; a locked or
   unavailable keyring fails closed. Never-launched profiles still need live proof.
 - Unit and fixture tests verify engine behavior. Real-browser acceptance is
-  proven on Linux with real profiles. On Windows and macOS, acceptance rests
-  on fixture profiles so far, and the macOS extension registration path
-  changed after those proofs, so its acceptance there is not yet re-verified.
+  proven on Linux with real profiles, and for Chrome on macOS with real
+  profiles. On Windows, and for the other browsers on macOS, acceptance
+  rests on fixture profiles so far. The macOS extension registration path
+  is now proven on a real Chrome profile; its fix is on main and is not
+  yet in a release.
 - Firefox profiles, passkeys, and device-bound credentials are not transferred.
   See [SECURITY.md](SECURITY.md) for encryption, pairing, and local-backup limits.
 
