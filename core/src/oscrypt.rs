@@ -652,16 +652,29 @@ pub fn mac_data_dir_speaks_v11(data_dir: &std::path::Path) -> bool {
 }
 
 /// Gather the 3-byte scheme label of every `*_encrypted_hash` string in a prefs tree.
+/// An object-valued `*_encrypted_hash` (Chrome's per-extension
+/// `protection.macs.extensions.settings_encrypted_hash`, extension id to sealed
+/// hash) contributes one label per string value inside it.
 fn collect_encrypted_hash_labels(v: &serde_json::Value, out: &mut Vec<Vec<u8>>) {
-    use base64::Engine;
+    fn push_label(s: &str, out: &mut Vec<Vec<u8>>) {
+        use base64::Engine;
+        if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
+            if let Some(label) = raw.get(..3) {
+                out.push(label.to_vec());
+            }
+        }
+    }
     match v {
         serde_json::Value::Object(map) => {
             for (k, val) in map {
                 match val {
                     serde_json::Value::String(s) if k.ends_with("_encrypted_hash") => {
-                        if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(s) {
-                            if let Some(label) = raw.get(..3) {
-                                out.push(label.to_vec());
+                        push_label(s, out);
+                    }
+                    serde_json::Value::Object(inner) if k.ends_with("_encrypted_hash") => {
+                        for s in inner.values() {
+                            if let serde_json::Value::String(s) = s {
+                                push_label(s, out);
                             }
                         }
                     }
@@ -1380,5 +1393,53 @@ mod tests {
         }});
         std::fs::write(slot10.join("Preferences"), serde_json::to_vec(&prefs10).unwrap()).unwrap();
         assert!(!mac_data_dir_speaks_v11(&t10.path().join("Chrome")));
+    }
+
+    #[test]
+    fn mac_data_dir_scheme_counts_the_per_extension_hash_object() {
+        use base64::Engine;
+        let b64 = |raw: &[u8]| base64::engine::general_purpose::STANDARD.encode(raw);
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("Chrome");
+        let slot = root.join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        // The per-extension hashes live in an object, not a string:
+        // protection.macs.extensions.settings_encrypted_hash maps each
+        // extension id to its own sealed hash. With nothing else in the
+        // file, those object entries are the only v11 evidence.
+        let object_only = serde_json::json!({"protection": {"macs": {"extensions": {
+            "settings_encrypted_hash": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": b64(b"v11-ext-one"),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": b64(b"v11-ext-two"),
+            },
+        }}}});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&object_only).unwrap()).unwrap();
+        assert!(mac_data_dir_speaks_v11(&root));
+        // Mixed case: the counted strings are a v10 majority (2 v10, 0 v11),
+        // but the object holds the larger v11 set (3 v11), so the folder
+        // still speaks v11.
+        let mixed = serde_json::json!({"protection": {
+            "super_encrypted_hash": b64(b"v10-super"),
+            "macs": {
+                "homepage_encrypted_hash": b64(b"v10-home"),
+                "extensions": {"settings_encrypted_hash": {
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": b64(b"v11-ext-one"),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": b64(b"v11-ext-two"),
+                    "cccccccccccccccccccccccccccccccc": b64(b"v11-ext-three"),
+                }},
+            },
+        }});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&mixed).unwrap()).unwrap();
+        assert!(mac_data_dir_speaks_v11(&root));
+        // The object votes both ways: a v10 object majority stays v10.
+        let object_v10 = serde_json::json!({"protection": {
+            "super_encrypted_hash": b64(b"v11-super"),
+            "macs": {"extensions": {"settings_encrypted_hash": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": b64(b"v10-ext-one"),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": b64(b"v10-ext-two"),
+            }}},
+        }});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&object_v10).unwrap()).unwrap();
+        assert!(!mac_data_dir_speaks_v11(&root));
     }
 }
