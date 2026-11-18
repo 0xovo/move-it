@@ -758,17 +758,26 @@ fn cmd_seal(browser: LinuxBrowser, dir: &str, out_box: &str) -> ! {
 }
 
 /// Harness writes stay in explicit temporary fixture folders, including through links.
-fn require_scratch_dir(dir: &Path) -> Result<(), Error> {
+/// A target outside the temp folder is accepted only when the invocation
+/// deliberately passes --allow-real-dir; the default still refuses.
+fn require_scratch_dir(dir: &Path, allow_real_dir: bool) -> Result<(), Error> {
     let canonical = std::fs::canonicalize(dir)
         .map_err(|_| Error::Refused("the harness needs an existing scratch profile directory".into()))?;
+    if !canonical.is_dir() {
+        return Err(Error::Refused("the harness only writes profiles inside a scratch directory under the system temp folder".into()));
+    }
+    if allow_real_dir {
+        return Ok(());
+    }
     let temp = std::fs::canonicalize(std::env::temp_dir()).map_err(|e| Error::Io(e.to_string()))?;
-    if !canonical.is_dir() || canonical == temp || !canonical.starts_with(&temp) {
+    if canonical == temp || !canonical.starts_with(&temp) {
         return Err(Error::Refused("the harness only writes profiles inside a scratch directory under the system temp folder".into()));
     }
     Ok(())
 }
 
 fn require_api_profiles(args: &[String]) -> Result<(), Error> {
+    let allow_real_dir = args.iter().any(|a| a == "--allow-real-dir");
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
     let opt = |name: &str| args.iter().position(|a| a == name)
         .and_then(|i| args.get(i + 1)).filter(|v| !v.starts_with("--"));
@@ -784,7 +793,7 @@ fn require_api_profiles(args: &[String]) -> Result<(), Error> {
         }
     }
     for flag in ["--profile", "--from", "--to", "--browser-base"] {
-        if let Some(dir) = opt(flag) { require_scratch_dir(Path::new(dir))?; }
+        if let Some(dir) = opt(flag) { require_scratch_dir(Path::new(dir), allow_real_dir)?; }
     }
     Ok(())
 }
@@ -799,8 +808,8 @@ fn harness_browser_display(browser: LinuxBrowser) -> String {
     }
 }
 
-fn cmd_open(browser: LinuxBrowser, dir: &str, in_box: &str) -> ! {
-    if let Err(e) = require_scratch_dir(Path::new(dir)) { fail_engine(e); }
+fn cmd_open(browser: LinuxBrowser, dir: &str, in_box: &str, allow_real_dir: bool) -> ! {
+    if let Err(e) = require_scratch_dir(Path::new(dir), allow_real_dir) { fail_engine(e); }
     if paths::never_launched(Path::new(dir), "Default") {
         fail_engine(Error::NeverLaunched {
             browser: harness_browser_display(browser),
@@ -920,9 +929,9 @@ fn main() {
     }
     if argv.get(1).map(String::as_str) == Some("open") {
         match (argv.get(2), argv.get(3), argv.get(4)) {
-            (Some(browser), Some(dir), Some(inbox)) => cmd_open(parse_browser(browser), dir, inbox),
+            (Some(browser), Some(dir), Some(inbox)) => cmd_open(parse_browser(browser), dir, inbox, argv.iter().any(|a| a == "--allow-real-dir")),
             _ => {
-                eprintln!("usage: moveit-harness open <browser> <profile-dir> <in.box>");
+                eprintln!("usage: moveit-harness open <browser> <profile-dir> <in.box> [--allow-real-dir]");
                 std::process::exit(2);
             }
         }
@@ -1233,12 +1242,29 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let args = ["api", "local_move", "brave", "chrome", "--from", t.path().to_str().unwrap(), "--to", t.path().to_str().unwrap()];
         assert!(require_api_profiles(&args.map(String::from)).is_ok());
-        assert!(require_scratch_dir(&std::env::temp_dir()).is_err());
+        assert!(require_scratch_dir(&std::env::temp_dir(), false).is_err());
         #[cfg(unix)]
         {
             let link = t.path().join("escape");
             std::os::unix::fs::symlink("/", &link).unwrap();
-            assert!(require_scratch_dir(&link).is_err());
+            assert!(require_scratch_dir(&link, false).is_err());
         }
+    }
+
+    #[test]
+    fn real_dir_targets_need_the_opt_in_flag() {
+        // The crate dir is a real directory outside the system temp folder.
+        let here = std::env::current_dir().unwrap();
+        assert!(require_scratch_dir(&here, false).is_err());
+        assert!(require_scratch_dir(&here, true).is_ok());
+        // Missing and non-directory paths refuse even with the flag.
+        assert!(require_scratch_dir(&here.join("no-such-dir"), true).is_err());
+        assert!(require_scratch_dir(&here.join("Cargo.toml"), true).is_err());
+        let args: Vec<String> = ["api", "local_move", "brave", "chrome", "--from", here.to_str().unwrap(), "--to", here.to_str().unwrap()]
+            .into_iter().map(String::from).collect();
+        assert!(matches!(require_api_profiles(&args), Err(Error::Refused(_))));
+        let mut args = args;
+        args.push("--allow-real-dir".into());
+        assert!(require_api_profiles(&args).is_ok());
     }
 }
