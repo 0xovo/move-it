@@ -75,7 +75,7 @@ macOS defects.
 | Browser | Linux | Windows | macOS |
 |---|---|---|---|
 | Brave | v10/v11; proven on real profiles, as source and target | DPAPI v10; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; engine proven on fixture profiles, real-profile readback pending |
-| Chrome | v10/v11; proven on real profiles, signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; proven on real profiles, as source and target, signed-in readback included; the v11 cookie and extension registration fixes are on main, not yet in a release |
+| Chrome | v10/v11; proven on real profiles, signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; proven on real profiles, as source and target, signed-in readback included; the v11 cookie fix and the extension registration fix for v10 and v11 targets are on main, not yet in a release |
 | Edge | v10/v11; proven on real profiles, as source and target (Edge 157), signed-in readback included | DPAPI v10; App-Bound v20 skipped; engine proven on fixture profiles, real-profile readback pending | Keychain support implemented; engine proven on fixture profiles, real-profile readback pending |
 | Chromium | v10/v11; proven on real profiles as a move target | DPAPI v10; engine proven on fixture profiles, real-profile readback pending | Keychain v10/v11; engine proven on fixture profiles, real-profile readback pending |
 | Firefox | Not supported | Not supported | Not supported |
@@ -90,8 +90,8 @@ macOS defects.
   proven on Linux with real profiles, and for Chrome on macOS with real
   profiles. On Windows, and for the other browsers on macOS, acceptance
   rests on fixture profiles so far. The macOS extension registration path
-  is now proven on a real Chrome profile; its fix is on main and is not
-  yet in a release.
+  is now proven on real Chrome profiles, including a v10-sealing
+  default-directory profile; its fix is on main and is not yet in a release.
 - Firefox profiles, passkeys, and device-bound credentials are not transferred.
   See [SECURITY.md](SECURITY.md) for encryption, pairing, and local-backup limits.
 
