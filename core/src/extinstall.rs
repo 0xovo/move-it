@@ -257,32 +257,52 @@ fn merge_registrations(
     slot: &Path,
     browser: &str,
     regs: &Map<String, Value>,
-    anchor_lock: Option<&crate::oscrypt::Lock>,
+    anchor_lock: Option<crate::prefhash::AnchorLock<'_>>,
 ) -> Result<usize> {
     crate::prefhash::merge_registrations(slot, browser, regs, anchor_lock)
 }
 
-/// The macOS v11 gate for extension anchors, the same signal fix 2 uses
-/// for v11 cookie and login writes: this platform is macOS and the target
-/// user data folder's own browsers seal their pref hashes as v11
-/// (`mac_data_dir_speaks_v11`, read here before the merge rewrites any
-/// prefs file). Linux and Windows never pass the gate, so their merges
-/// stay anchor-free exactly as before. When the gate passes, the target
-/// lock must be a CBC lock that can seal the anchor; anything else fails
-/// the import loudly instead of writing an unanchored registration.
-fn extension_anchor_lock<'a>(
+/// The macOS gate for extension anchors: this platform is macOS.
+/// Linux and Windows never pass the gate, so their merges stay
+/// anchor-free exactly as before. On macOS every target gets an
+/// anchor, sealed under the label the target folder itself seals
+/// with (`anchor_label_for`). A v10-sealing macOS folder is a real
+/// target shape (a profile born while its keychain was unavailable
+/// carries v10 anchors of Chrome's own), and an unanchored
+/// registration is stripped there exactly as on a v11 folder
+/// (fix 3 round 3). When the gate passes, the target lock must be a
+/// CBC lock that can seal the anchor; anything else fails the import
+/// loudly instead of writing an unanchored registration.
+fn extension_anchor<'a>(
     browser_root: &Path,
     keys: &'a crate::cookies::Keys,
-) -> Result<Option<&'a crate::oscrypt::Lock>> {
-    if Platform::current() != Platform::Mac || !crate::oscrypt::mac_data_dir_speaks_v11(browser_root) {
+) -> Result<Option<crate::prefhash::AnchorLock<'a>>> {
+    if Platform::current() != Platform::Mac {
         return Ok(None);
     }
     match keys {
-        crate::cookies::Keys::Cbc { lock, .. } => Ok(Some(lock)),
+        crate::cookies::Keys::Cbc { lock, .. } => Ok(Some((lock, anchor_label_for(browser_root)))),
         crate::cookies::Keys::Gcm { .. } => Err(Error::Refused(
-            "cannot seal an extension registration anchor: the target browser key cannot write v11 values"
+            "cannot seal an extension registration anchor: the target browser key cannot write v10 or v11 values"
                 .into(),
         )),
+    }
+}
+
+/// The label a macOS target folder seals its encrypted-hash anchors
+/// under, read from the folder's own labels before the merge rewrites
+/// any prefs file: v11 when they speak v11 (`mac_data_dir_speaks_v11`,
+/// the same signal fix 2 uses for cookie and login writes), v10
+/// otherwise, including a folder with no labels yet. (One split from
+/// the cookie path: a Mac Chromium empty store with a keychain hit
+/// writes its cookies v11, while an anchor here still goes v10 when
+/// the folder has no labels; both keys derive from the same password
+/// and anchor verification reads the prefix, so the anchor opens.)
+fn anchor_label_for(browser_root: &Path) -> crate::oscrypt::LinuxPrefix {
+    if crate::oscrypt::mac_data_dir_speaks_v11(browser_root) {
+        crate::oscrypt::LinuxPrefix::V11
+    } else {
+        crate::oscrypt::LinuxPrefix::V10
     }
 }
 
@@ -418,11 +438,11 @@ pub fn install_in(
     }
     // The gated anchor check and the registration merge run before any
     // binary is written: both can refuse (a key that cannot seal the
-    // macOS v11 anchor), and a refusal must not leave a half-installed
+    // macOS anchor), and a refusal must not leave a half-installed
     // extension tree behind for callers without a journal. The merge
     // does not read the binaries, and the reports below still run
     // after both writes, so the success path is unchanged.
-    let anchor_lock = extension_anchor_lock(browser_root, keys)?;
+    let anchor_lock = extension_anchor(browser_root, keys)?;
     let _merged = merge_registrations(&slot_dir, browser, registrations, anchor_lock)?;
     if !bins.is_empty() {
         write_bins_from_payload(&slot_dir, bins)?;
@@ -687,11 +707,13 @@ mod tests {
     }
 
     #[test]
-    fn install_writes_no_anchor_off_the_macos_v11_gate() {
+    fn install_writes_no_anchor_off_macos() {
         // Regression guard for the fix A gate: off macOS, even a target
         // folder whose own pref hashes speak v11 and a Mac lock must
         // produce no settings_encrypted_hash anchor. The Linux leg is
         // proven green without engine-written anchors and stays that way.
+        // (On macOS the same folder would get its anchor sealed v11,
+        // and a v10-speaking folder a v10 anchor, fix 3 round 3.)
         use base64::Engine;
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
@@ -803,6 +825,31 @@ mod tests {
         let landed = dst.path().join(format!("Default/Extensions/{ID}/{ver}/_metadata"));
         assert_eq!(fs::read(landed.join("verified_contents.json")).unwrap(), br#"{"signed":true}"#);
         assert_eq!(fs::read(landed.join("computed_hashes.json")).unwrap(), br#"{"hashes":{}}"#);
+    }
+
+    #[test]
+    fn anchor_label_follows_the_folder_labels() {
+        // The label is read off the folder's own encrypted-hash
+        // labels: v11 when they speak v11, v10 when they speak v10,
+        // and v10 for a folder with no labels yet.
+        use base64::Engine;
+        let label_of = |seeded_super: Option<&[u8]>| {
+            let dst = tempfile::tempdir().unwrap();
+            let slot = dst.path().join("Default");
+            fs::create_dir_all(&slot).unwrap();
+            let root = match seeded_super {
+                Some(raw) => json!({"protection": {
+                    "super_encrypted_hash":
+                        base64::engine::general_purpose::STANDARD.encode(raw),
+                }}),
+                None => json!({}),
+            };
+            fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&root).unwrap()).unwrap();
+            anchor_label_for(dst.path())
+        };
+        assert_eq!(label_of(Some(b"v11-super")), crate::oscrypt::LinuxPrefix::V11);
+        assert_eq!(label_of(Some(b"v10-super")), crate::oscrypt::LinuxPrefix::V10);
+        assert_eq!(label_of(None), crate::oscrypt::LinuxPrefix::V10);
     }
 
     /// Another profile's extension folder, holding the manifest the repro protects.

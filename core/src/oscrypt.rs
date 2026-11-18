@@ -406,6 +406,31 @@ impl Lock {
         }
     }
 
+    /// Seal raw bytes as an OSCrypt encrypted-hash anchor under the
+    /// label the caller names: the label followed by the AES-128-CBC /
+    /// PKCS7 body with the space IV, sealed under the key that label
+    /// names in this lock (the main saltysalt key for v10, the pepper
+    /// key for v11), without the host tag or text framing `encrypt`
+    /// adds. The macOS pref-hash anchors seal a raw SHA256 digest this
+    /// way, under the label the target folder itself seals with.
+    /// `None` when the lock carries no key for the label (a Windows
+    /// GCM lock, or a caller-built CBC lock without a v11 key asked
+    /// for v11).
+    pub fn seal_anchor_raw(&self, plaintext: &[u8], label: LinuxPrefix) -> Option<Vec<u8>> {
+        match self {
+            Lock::Cbc { key, v11_key, .. } => {
+                let k = match label {
+                    LinuxPrefix::V10 => key,
+                    LinuxPrefix::V11 => v11_key.as_ref()?,
+                };
+                let body = CbcEnc::new(k.into(), &IV.into())
+                    .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
+                Some([label.bytes().as_slice(), &body].concat())
+            }
+            _ => None,
+        }
+    }
+
     /// Seal raw bytes under this lock's v11 key: `v11` followed by the
     /// AES-128-CBC / PKCS7 body with the space IV, the same body a
     /// v11-labelled `encrypt` writes but without the host tag or text
@@ -413,14 +438,7 @@ impl Lock {
     /// way. `None` when the lock carries no v11 key (a Windows GCM lock,
     /// or a caller-built CBC lock without one).
     pub fn seal_v11_raw(&self, plaintext: &[u8]) -> Option<Vec<u8>> {
-        match self {
-            Lock::Cbc { v11_key: Some(k), .. } => {
-                let body = CbcEnc::new(k.into(), &IV.into())
-                    .encrypt_padded_vec_mut::<Pkcs7>(plaintext);
-                Some([b"v11".as_slice(), &body].concat())
-            }
-            _ => None,
-        }
+        self.seal_anchor_raw(plaintext, LinuxPrefix::V11)
     }
 
     /// Unlock one value; a matching SHA256(host) tag in front is removed.

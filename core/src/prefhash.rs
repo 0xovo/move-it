@@ -9,7 +9,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::oscrypt::Lock;
+use crate::oscrypt::{LinuxPrefix, Lock};
 use crate::{Error, Result};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -211,28 +211,47 @@ fn calculate_super_mac(seed: &[u8], device_id: &str, macs: &Value) -> Result<Str
     Ok(hex_upper(&mac.finalize().into_bytes()))
 }
 
+/// The target's OSCrypt lock plus the label its folder seals
+/// encrypted-hash anchors under, as decided by the caller from the
+/// folder's own labels. Every anchor the merge writes (the
+/// per-extension settings anchors and the super anchor) is sealed
+/// under that label, mirroring the anchors the folder already
+/// carries: a folder born while its keychain was unavailable seals
+/// v10 and carries v10 anchors of Chrome's own, and its anchors are
+/// expected under that label there.
+pub type AnchorLock<'a> = (&'a Lock, LinuxPrefix);
+
 /// One OSCrypt encrypted-hash anchor, the value Chrome seals into
 /// `protection.super_encrypted_hash` and
 /// `protection.macs.extensions.settings_encrypted_hash.<id>`:
-/// base64("v11" || AES-128-CBC-PKCS7(pepper key, IV = sixteen 0x20 bytes,
-/// raw SHA256(seed || path || canonical JSON of the value))). The pepper
-/// key rides in the target lock's v11 slot (`Lock::mac` derives it from
-/// the browser's Safe Storage password with salt "pepper", 1003 rounds);
-/// the device id is not an input. The recipe is pinned byte-for-byte by
-/// the Mac probes (round 1: 9/9 of Chrome's own anchors; round 2: the
-/// inherited anchors and Chrome's own Bitwarden anchor verify, Q2/Q4).
-fn encrypted_hash_anchor(seed: &[u8], path: &str, value: &Value, lock: &Lock) -> Result<String> {
+/// base64(label || AES-128-CBC-PKCS7(the label's key, IV = sixteen
+/// 0x20 bytes, raw SHA256(seed || path || canonical JSON of the
+/// value))). The label is the one the target folder seals with: v11
+/// takes the pepper key from the target lock's v11 slot (`Lock::mac`
+/// derives it from the browser's Safe Storage password with salt
+/// "pepper", 1003 rounds), v10 the saltysalt key in the main slot;
+/// the device id is not an input. The v11 recipe is pinned
+/// byte-for-byte by the Mac probes (round 1: 9/9 of Chrome's own
+/// anchors; round 2: the inherited anchors and Chrome's own
+/// Bitwarden anchor verify, Q2/Q4); the v10 form mirrors the anchors
+/// Chrome itself wrote into the v10-sealing default-directory
+/// profile (fix 3 round 3).
+fn encrypted_hash_anchor(seed: &[u8], path: &str, value: &Value, anchor: AnchorLock) -> Result<String> {
+    let (lock, label) = anchor;
     let body = value_as_string(value)?;
     let mut h = Sha256::new();
     h.update(seed);
     h.update(path.as_bytes());
     h.update(body.as_bytes());
     let digest: [u8; 32] = h.finalize().into();
-    let sealed = lock.seal_v11_raw(&digest).ok_or_else(|| {
-        Error::Refused(
-            "cannot seal an extension registration anchor: the target browser key has no v11 (pepper) key"
-                .into(),
-        )
+    let sealed = lock.seal_anchor_raw(&digest, label).ok_or_else(|| {
+        Error::Refused(format!(
+            "cannot seal an extension registration anchor: the target browser key has no {} key",
+            match label {
+                LinuxPrefix::V10 => "v10 (saltysalt)",
+                LinuxPrefix::V11 => "v11 (pepper)",
+            }
+        ))
     })?;
     Ok(base64::engine::general_purpose::STANDARD.encode(sealed))
 }
@@ -248,7 +267,7 @@ fn stamp_settings_anchors(
     settings: &Map<String, Value>,
     regs: &Map<String, Value>,
     seed: &[u8],
-    lock: &Lock,
+    anchor: AnchorLock,
 ) -> Result<()> {
     // Seal every anchor before mutating the tree, so a key failure
     // leaves the file exactly as it was.
@@ -258,7 +277,7 @@ fn stamp_settings_anchors(
             Error::Corrupt(format!("merged settings are missing extension {id}"))
         })?;
         let path = format!("extensions.settings.{id}");
-        anchors.insert(id.clone(), json!(encrypted_hash_anchor(seed, &path, entry, lock)?));
+        anchors.insert(id.clone(), json!(encrypted_hash_anchor(seed, &path, entry, anchor)?));
     }
     let hashes = root
         .as_object_mut()
@@ -311,13 +330,13 @@ fn filter_encrypted_only(value: &Value) -> Value {
 /// anchor goes stale by construction the moment fix A stamps a new one;
 /// leaving it would hand Chrome an internally inconsistent protection
 /// block.
-fn stamp_super_encrypted_hash(root: &mut Value, seed: &[u8], lock: &Lock) -> Result<()> {
+fn stamp_super_encrypted_hash(root: &mut Value, seed: &[u8], anchor: AnchorLock) -> Result<()> {
     let macs = root
         .get("protection")
         .and_then(|p| p.get("macs"))
         .cloned()
         .unwrap_or(json!({}));
-    let anchor = encrypted_hash_anchor(seed, "", &filter_encrypted_only(&macs), lock)?;
+    let anchor = encrypted_hash_anchor(seed, "", &filter_encrypted_only(&macs), anchor)?;
     let prot = root
         .as_object_mut()
         .and_then(|o| o.entry("protection").or_insert_with(|| json!({})).as_object_mut());
@@ -420,17 +439,19 @@ fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<Map<St
 /// In `Preferences` the OSCrypt encrypted-hash anchors are dropped: that
 /// copy is not the authoritative store on macOS and Linux Chrome re-signs
 /// what it reads there. In `Secure Preferences`, when the caller passes
-/// the target's macOS v11 lock (`anchor_lock`), each installed extension
-/// also gets its `settings_encrypted_hash` anchor: on macOS Chrome does
-/// NOT regenerate a missing anchor for a third-party entry, it strips
-/// the entry and deletes its files at first startup (fix 3 round 2).
-/// Without a lock (Linux, Windows, non-v11 macOS folders) no anchor is
-/// written, exactly as before.
+/// the target's macOS anchor lock (`anchor_lock`: the lock plus the
+/// label the folder seals with), each installed extension also gets
+/// its `settings_encrypted_hash` anchor, sealed under that label: on
+/// macOS Chrome does NOT regenerate a missing anchor for a third-party
+/// entry, it strips the entry and deletes its files at first startup
+/// (fix 3 round 2; the strip hits v10-sealing folders the same way,
+/// round 3). Without a lock (Linux, Windows) no anchor is written,
+/// exactly as before.
 pub fn merge_registrations_secure(
     slot: &Path,
     browser: &str,
     regs: &Map<String, Value>,
-    anchor_lock: Option<&Lock>,
+    anchor_lock: Option<AnchorLock>,
 ) -> Result<usize> {
     if regs.is_empty() {
         return Ok(0);
@@ -459,7 +480,7 @@ pub fn merge_registrations_secure(
     let secure_path = slot.join("Secure Preferences");
     let mut secure = read_json(&secure_path)?;
     let secure_settings = merge_into_file(&mut secure, regs)?;
-    if let Some(lock) = anchor_lock {
+    if let Some(anchor) = anchor_lock {
         // Gated macOS path: per-entry HMACs first without the super,
         // then the encrypted-hash anchors (which mutate the macs tree),
         // then BOTH supers last over the finished tree. Stamping
@@ -467,9 +488,9 @@ pub fn merge_registrations_secure(
         // covering the pre-anchor tree: the same stale-super defect
         // the super_encrypted_hash recompute fixed, one layer over.
         macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, false)?;
-        stamp_settings_anchors(&mut secure, &secure_settings, regs, seed, lock)?;
+        stamp_settings_anchors(&mut secure, &secure_settings, regs, seed, anchor)?;
         stamp_super_mac(&mut secure, seed, &device_id)?;
-        stamp_super_encrypted_hash(&mut secure, seed, lock)?;
+        stamp_super_encrypted_hash(&mut secure, seed, anchor)?;
     } else {
         macs_for_extensions(&mut secure, &secure_settings, seed, &device_id, true)?;
     }
@@ -513,7 +534,7 @@ pub fn merge_registrations(
     slot: &Path,
     browser: &str,
     regs: &Map<String, Value>,
-    anchor_lock: Option<&Lock>,
+    anchor_lock: Option<AnchorLock>,
 ) -> Result<usize> {
     if uses_secure_extension_prefs(browser) {
         merge_registrations_secure(slot, browser, regs, anchor_lock)
@@ -606,13 +627,21 @@ mod tests {
     /// and compare against SHA256(seed || path || canonical JSON) with
     /// the canonical JSON written out by hand for this entry.
     fn decrypt_anchor(pw: &str, b64: &str) -> Vec<u8> {
+        decrypt_anchor_labelled(pw, b"pepper", b"v11", b64)
+    }
+
+    /// The same independent check for an anchor sealed under the
+    /// other label: the salt is the PBKDF2 salt that label's key is
+    /// derived with ("saltysalt" for v10, "pepper" for v11), and the
+    /// stored value must carry the label as its prefix.
+    fn decrypt_anchor_labelled(pw: &str, salt: &[u8], prefix: &[u8], b64: &str) -> Vec<u8> {
         use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
         use base64::Engine;
         let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(raw.len(), 51, "anchor must decode to 51 bytes");
-        assert_eq!(&raw[..3], b"v11", "anchor must carry the v11 prefix");
+        assert_eq!(&raw[..3], prefix, "anchor must carry its label as prefix");
         let mut key = [0u8; 16];
-        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(pw.as_bytes(), b"pepper", 1003, &mut key);
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(pw.as_bytes(), salt, 1003, &mut key);
         cbc::Decryptor::<aes::Aes128>::new((&key).into(), (&[b' '; 16]).into())
             .decrypt_padded_vec_mut::<Pkcs7>(&raw[3..])
             .unwrap()
@@ -641,7 +670,7 @@ mod tests {
         let mut regs = Map::new();
         regs.insert(id.into(), json!({"location": 1, "path": "x/2026.10.2_0"}));
         let lock = Lock::mac("fixture-safe-storage-pw");
-        merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).unwrap();
+        merge_registrations_secure(&slot, "chrome", &regs, Some((&lock, LinuxPrefix::V11))).unwrap();
         let secure: Value =
             serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
         let anchor = secure["protection"]["macs"]["extensions"]["settings_encrypted_hash"][id]
@@ -670,6 +699,53 @@ mod tests {
     }
 
     #[test]
+    fn merged_extension_gets_a_verifiable_v10_anchor() {
+        // The v10-sealing target (fix 3 round 3): the anchor must be
+        // present, carry the v10 prefix, and decrypt under the
+        // saltysalt key to the same digest recipe as v11; the super
+        // anchor follows the same label.
+        use sha2::{Digest, Sha256};
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nngceckbapebfimnlniiiahkandclblb";
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"location": 1, "path": "x/2026.10.2_0"}));
+        let lock = Lock::mac("fixture-safe-storage-pw");
+        merge_registrations_secure(&slot, "chrome", &regs, Some((&lock, LinuxPrefix::V10))).unwrap();
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        let anchor = secure["protection"]["macs"]["extensions"]["settings_encrypted_hash"][id]
+            .as_str()
+            .expect("installed extension must carry a settings_encrypted_hash anchor on a v10 target too");
+        let plain = decrypt_anchor_labelled("fixture-safe-storage-pw", b"saltysalt", b"v10", anchor);
+        let mut h = Sha256::new();
+        h.update(GOOGLE_CHROME_SEED);
+        h.update(format!("extensions.settings.{id}").as_bytes());
+        h.update(br#"{"location":1,"path":"x/2026.10.2_0"}"#);
+        assert_eq!(plain, h.finalize().to_vec());
+        // The super anchor is sealed under v10 too, over the final
+        // filtered tree (only the new anchor leaf survives the filter).
+        let super_anchor = secure["protection"]["super_encrypted_hash"].as_str().unwrap();
+        let final_canonical =
+            format!(r#"{{"extensions":{{"settings_encrypted_hash":{{"{id}":"{anchor}"}}}}}}"#);
+        let mut h = Sha256::new();
+        h.update(GOOGLE_CHROME_SEED);
+        h.update(final_canonical.as_bytes());
+        assert_eq!(
+            decrypt_anchor_labelled("fixture-safe-storage-pw", b"saltysalt", b"v10", super_anchor),
+            h.finalize().to_vec()
+        );
+        // And the final super_mac verifies over the final macs dict.
+        let stored_super = secure["protection"]["super_mac"].as_str().unwrap();
+        assert_eq!(stored_super, recomputed_super_mac(&secure["protection"]["macs"]));
+        // The plain Preferences copy stays anchor-free, as before.
+        let prefs: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert!(prefs["protection"]["macs"]["extensions"].get("settings_encrypted_hash").is_none());
+    }
+
+    #[test]
     fn anchor_changes_when_the_entry_changes() {
         let id = "nngceckbapebfimnlniiiahkandclblb";
         let lock = Lock::mac("fixture-safe-storage-pw");
@@ -679,7 +755,7 @@ mod tests {
             std::fs::create_dir_all(&slot).unwrap();
             let mut regs = Map::new();
             regs.insert(id.into(), entry);
-            merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).unwrap();
+            merge_registrations_secure(&slot, "chrome", &regs, Some((&lock, LinuxPrefix::V11))).unwrap();
             let secure: Value =
                 serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap())
                     .unwrap();
@@ -695,7 +771,7 @@ mod tests {
 
     #[test]
     fn no_anchor_without_a_lock() {
-        // The Linux / non-v11 path: merge passes no lock and the Secure
+        // The Linux path: merge passes no lock and the Secure
         // Preferences must stay exactly as anchor-free as before fix A.
         let t = tempfile::tempdir().unwrap();
         let slot = t.path().join("Default");
@@ -712,7 +788,8 @@ mod tests {
 
     #[test]
     fn anchor_with_a_keyless_lock_fails_loudly() {
-        // A GCM (Windows) lock cannot seal a v11 anchor: the merge must
+        // A GCM (Windows) lock cannot seal an anchor under either
+        // label (case 1 asks for v11, case 2 for v10): the merge must
         // refuse rather than write a registration without its anchor,
         // and the refusal must leave the target exactly as it was:
         // Preferences, Secure Preferences and the extension tree are
@@ -723,7 +800,7 @@ mod tests {
         regs.insert(id.into(), json!({"location": 1}));
         let lock = Lock::windows([7u8; 32]);
 
-        // Case 1: pre-existing files and extension tree stay untouched.
+        // Case 1 (v11): pre-existing files and extension tree stay untouched.
         let t = tempfile::tempdir().unwrap();
         let slot = t.path().join("Default");
         std::fs::create_dir_all(&slot).unwrap();
@@ -735,16 +812,16 @@ mod tests {
         std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
         let manifest_bytes = br#"{"version":"1.0"}"#.to_vec();
         std::fs::write(&manifest, &manifest_bytes).unwrap();
-        assert!(merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).is_err());
+        assert!(merge_registrations_secure(&slot, "chrome", &regs, Some((&lock, LinuxPrefix::V11))).is_err());
         assert_eq!(std::fs::read(slot.join("Preferences")).unwrap(), prefs_bytes);
         assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), secure_bytes);
         assert_eq!(std::fs::read(&manifest).unwrap(), manifest_bytes);
 
-        // Case 2: absent files stay absent.
+        // Case 2 (v10): absent files stay absent.
         let t2 = tempfile::tempdir().unwrap();
         let slot2 = t2.path().join("Default");
         std::fs::create_dir_all(&slot2).unwrap();
-        assert!(merge_registrations_secure(&slot2, "chrome", &regs, Some(&lock)).is_err());
+        assert!(merge_registrations_secure(&slot2, "chrome", &regs, Some((&lock, LinuxPrefix::V10))).is_err());
         assert!(!slot2.join("Preferences").exists());
         assert!(!slot2.join("Secure Preferences").exists());
         assert!(!slot2.join("Extensions").exists());
@@ -799,7 +876,7 @@ mod tests {
         let mut regs = Map::new();
         regs.insert(new_id.into(), json!({"location": 1, "path": "x/2026.10.2_0"}));
         let lock = Lock::mac(pw);
-        merge_registrations_secure(&slot, "chrome", &regs, Some(&lock)).unwrap();
+        merge_registrations_secure(&slot, "chrome", &regs, Some((&lock, LinuxPrefix::V11))).unwrap();
         let secure: Value =
             serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
         let new_anchor = secure["protection"]["macs"]["extensions"]["settings_encrypted_hash"][new_id]
