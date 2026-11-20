@@ -52,9 +52,11 @@ pub struct BrowserDef {
     pub mac_services: &'static [&'static str],
     /// macOS Keychain account of the Safe Storage item.
     pub mac_account: &'static str,
-    /// Linux Secret Service label of the Safe Storage item. Forks alias:
-    /// Vivaldi stores under Chrome's label, Opera under Chromium's.
-    pub linux_label: &'static str,
+    /// Linux Secret Service labels of the Safe Storage item, in probe
+    /// order. Almost every browser has exactly one; Opera (and GX) carry
+    /// two because Opera's own historical label and the Chromium label it
+    /// aliases on Linux are both live candidates (see the Opera row).
+    pub linux_labels: &'static [&'static str],
     /// Linux Secret Service `application` attribute values, in probe order.
     /// The first is the browser's own; later entries are the aliased stable
     /// browser's, tried when the browser kept the stable browser's item.
@@ -124,7 +126,7 @@ const fn channel(
         layout: LayoutKind::Standard,
         mac_services: base.mac_services,
         mac_account: base.mac_account,
-        linux_label: base.linux_label,
+        linux_labels: base.linux_labels,
         linux_apps: base.linux_apps,
         secret_of: Some(base.id),
         channel_of: Some(base.id),
@@ -143,7 +145,7 @@ pub const BRAVE: BrowserDef = BrowserDef {
     layout: LayoutKind::Standard,
     mac_services: &["Brave Safe Storage"],
     mac_account: "Brave",
-    linux_label: "Brave Safe Storage",
+    linux_labels: &["Brave Safe Storage"],
     linux_apps: &["brave"],
     secret_of: None,
     channel_of: None,
@@ -161,7 +163,7 @@ pub const CHROME: BrowserDef = BrowserDef {
     layout: LayoutKind::Standard,
     mac_services: &["Chrome Safe Storage"],
     mac_account: "Chrome",
-    linux_label: "Chrome Safe Storage",
+    linux_labels: &["Chrome Safe Storage"],
     linux_apps: &["chrome"],
     secret_of: None,
     channel_of: None,
@@ -179,7 +181,7 @@ pub const CHROMIUM: BrowserDef = BrowserDef {
     layout: LayoutKind::Standard,
     mac_services: &["Chromium Safe Storage"],
     mac_account: "Chromium",
-    linux_label: "Chromium Safe Storage",
+    linux_labels: &["Chromium Safe Storage"],
     linux_apps: &["chromium"],
     secret_of: None,
     channel_of: None,
@@ -200,7 +202,7 @@ pub const EDGE: BrowserDef = BrowserDef {
     layout: LayoutKind::Standard,
     mac_services: &["Microsoft Edge Safe Storage"],
     mac_account: "Microsoft Edge",
-    linux_label: "Microsoft Edge Safe Storage",
+    linux_labels: &["Microsoft Edge Safe Storage"],
     // Edge brands the libsecret item with the product name, not "edge".
     linux_apps: &["Microsoft Edge"],
     secret_of: None,
@@ -220,9 +222,11 @@ pub const OPERA: BrowserDef = BrowserDef {
     layout: LayoutKind::SingleProfile,
     mac_services: &["Opera Safe Storage"],
     mac_account: "Opera",
-    // On Linux Opera aliases Chromium's keyring item (label and, as a
-    // fallback probe, the application attribute).
-    linux_label: "Chromium Safe Storage",
+    // On Linux Opera's Safe Storage item has been seen under both its own
+    // label (the pre-registry code's only label) and Chromium's, which the
+    // census says real Opera aliases. Probe both, its own first; the
+    // application attribute chain below works the same way.
+    linux_labels: &["Opera Safe Storage", "Chromium Safe Storage"],
     linux_apps: &["Opera", "chromium"],
     secret_of: None,
     channel_of: None,
@@ -244,7 +248,7 @@ pub const VIVALDI: BrowserDef = BrowserDef {
     // the application attribute is probed vivaldi first, then chrome (the
     // aliased browser's), because the exact attribute Vivaldi stamps is
     // not firmly sourced.
-    linux_label: "Chrome Safe Storage",
+    linux_labels: &["Chrome Safe Storage"],
     linux_apps: &["vivaldi", "chrome"],
     secret_of: None,
     channel_of: None,
@@ -266,10 +270,11 @@ pub const OPERA_GX: BrowserDef = BrowserDef {
     // that answers; do not treat either name as settled.
     mac_services: &["Opera Safe Storage 2023", "Opera Safe Storage"],
     mac_account: "Opera",
-    // Linux: aliased to Chromium like Opera, on the same evidence; GX's
-    // own application attribute is unverified, so its guessed name is
-    // probed first and Opera's aliasing chain follows.
-    linux_label: "Chromium Safe Storage",
+    // Linux: aliased to Chromium like Opera, on the same evidence, so it
+    // carries Opera's two candidate labels too; GX's own application
+    // attribute is unverified, so its guessed name is probed first and
+    // Opera's aliasing chain follows.
+    linux_labels: &["Opera Safe Storage", "Chromium Safe Storage"],
     linux_apps: &["Opera GX", "Opera", "chromium"],
     secret_of: None,
     channel_of: None,
@@ -411,7 +416,8 @@ mod tests {
             );
             assert!(!d.mac_services.is_empty(), "{} mac service", d.id);
             assert!(!d.mac_account.is_empty(), "{} mac account", d.id);
-            assert!(!d.linux_label.is_empty(), "{} linux label", d.id);
+            assert!(!d.linux_labels.is_empty(), "{} linux labels", d.id);
+            assert!(d.linux_labels.iter().all(|l| !l.is_empty()), "{} linux label", d.id);
             assert!(!d.linux_apps.is_empty(), "{} linux apps", d.id);
         }
     }
@@ -441,7 +447,7 @@ mod tests {
             assert_eq!(c.secret_def().id, stable, "{chan}");
             assert_eq!(c.mac_services, s.mac_services, "{chan} mac service");
             assert_eq!(c.mac_account, s.mac_account, "{chan} mac account");
-            assert_eq!(c.linux_label, s.linux_label, "{chan} linux label");
+            assert_eq!(c.linux_labels, s.linux_labels, "{chan} linux labels");
             assert_eq!(c.linux_apps, s.linux_apps, "{chan} linux apps");
             assert_eq!(c.app_bound, s.app_bound, "{chan} app-bound");
             assert_ne!(c.linux_dir, s.linux_dir, "{chan} has its own folder");
@@ -452,24 +458,98 @@ mod tests {
 
     #[test]
     fn the_original_five_rows_match_the_pre_registry_facts() {
-        // The refactor must not move any existing browser's facts.
-        assert_eq!(BRAVE.mac_services, ["Brave Safe Storage"]);
-        assert_eq!(BRAVE.mac_account, "Brave");
-        assert_eq!(BRAVE.linux_label, "Brave Safe Storage");
-        assert_eq!(BRAVE.linux_apps, ["brave"]);
-        assert_eq!(CHROME.mac_services, ["Chrome Safe Storage"]);
-        assert_eq!(CHROME.linux_apps, ["chrome"]);
-        assert_eq!(CHROMIUM.mac_services, ["Chromium Safe Storage"]);
-        assert_eq!(CHROMIUM.linux_label, "Chromium Safe Storage");
-        assert_eq!(EDGE.mac_services, ["Microsoft Edge Safe Storage"]);
-        assert_eq!(EDGE.mac_account, "Microsoft Edge");
-        assert_eq!(EDGE.linux_apps, ["Microsoft Edge"]);
-        assert_eq!(OPERA.mac_services, ["Opera Safe Storage"]);
-        assert_eq!(OPERA.mac_account, "Opera");
-        assert_eq!(OPERA.linux_apps[0], "Opera");
-        assert_eq!(BRAVE.linux_dir, Some("BraveSoftware/Brave-Browser"));
-        assert_eq!(CHROME.linux_dir, Some("google-chrome"));
-        assert_eq!(EDGE.mac_dir, Some("Microsoft Edge"));
+        // The refactor must not move any existing browser's facts. Every
+        // field of the five pre-registry rows is pinned here against the
+        // f646484 behaviour (oscrypt.rs / profiles.rs at that commit),
+        // with ONE deliberate change: Opera's Linux label is now a
+        // two-label probe set, its own historical "Opera Safe Storage"
+        // (the f646484 label) plus the "Chromium Safe Storage" the
+        // registry had switched to on census evidence.
+        fn check(
+            d: &BrowserDef,
+            id: &str,
+            display: &str,
+            linux_dir: Option<&str>,
+            mac_dir: Option<&str>,
+            win_local: Option<&str>,
+            win_roaming: Option<&str>,
+            layout: LayoutKind,
+            mac_services: &[&str],
+            mac_account: &str,
+            linux_labels: &[&str],
+            linux_apps: &[&str],
+            app_bound: bool,
+            flatpak: Option<(&[&str], &str)>,
+        ) {
+            assert_eq!(d.id, id, "{id} id");
+            assert_eq!(d.display, display, "{id} display");
+            assert_eq!(d.linux_dir, linux_dir, "{id} linux_dir");
+            assert_eq!(d.mac_dir, mac_dir, "{id} mac_dir");
+            assert_eq!(d.win_local_dir, win_local, "{id} win_local_dir");
+            assert_eq!(d.win_roaming_dir, win_roaming, "{id} win_roaming_dir");
+            assert_eq!(d.layout, layout, "{id} layout");
+            assert_eq!(d.mac_services, mac_services, "{id} mac_services");
+            assert_eq!(d.mac_account, mac_account, "{id} mac_account");
+            assert_eq!(d.linux_labels, linux_labels, "{id} linux_labels");
+            assert_eq!(d.linux_apps, linux_apps, "{id} linux_apps");
+            assert_eq!(d.secret_of, None, "{id} secret_of");
+            assert_eq!(d.channel_of, None, "{id} channel_of");
+            assert_eq!(d.app_bound, app_bound, "{id} app_bound");
+            assert_eq!(d.flatpak, flatpak, "{id} flatpak");
+        }
+        check(
+            &BRAVE, "brave", "Brave",
+            Some("BraveSoftware/Brave-Browser"), Some("BraveSoftware/Brave-Browser"),
+            Some("BraveSoftware/Brave-Browser/User Data"), None,
+            LayoutKind::Standard,
+            &["Brave Safe Storage"], "Brave",
+            &["Brave Safe Storage"], &["brave"],
+            true,
+            Some((&["com.brave.Browser"] as &[&str], "BraveSoftware/Brave-Browser")),
+        );
+        check(
+            &CHROME, "chrome", "Google Chrome",
+            Some("google-chrome"), Some("Google/Chrome"),
+            Some("Google/Chrome/User Data"), None,
+            LayoutKind::Standard,
+            &["Chrome Safe Storage"], "Chrome",
+            &["Chrome Safe Storage"], &["chrome"],
+            true,
+            Some((&["com.google.Chrome"] as &[&str], "google-chrome")),
+        );
+        check(
+            &CHROMIUM, "chromium", "Chromium",
+            Some("chromium"), Some("Chromium"),
+            Some("Chromium/User Data"), None,
+            LayoutKind::Standard,
+            &["Chromium Safe Storage"], "Chromium",
+            &["Chromium Safe Storage"], &["chromium"],
+            false,
+            Some((&["org.chromium.Chromium", "io.github.ungoogled_software.ungoogled_chromium"] as &[&str], "chromium")),
+        );
+        check(
+            &EDGE, "edge", "Microsoft Edge",
+            Some("microsoft-edge"), Some("Microsoft Edge"),
+            Some("Microsoft/Edge/User Data"), None,
+            LayoutKind::Standard,
+            &["Microsoft Edge Safe Storage"], "Microsoft Edge",
+            &["Microsoft Edge Safe Storage"], &["Microsoft Edge"],
+            true,
+            Some((&["com.microsoft.Edge"] as &[&str], "microsoft-edge")),
+        );
+        check(
+            &OPERA, "opera", "Opera",
+            Some("opera"), Some("com.operasoftware.Opera"),
+            None, Some("Opera Software/Opera Stable"),
+            LayoutKind::SingleProfile,
+            &["Opera Safe Storage"], "Opera",
+            // Deliberate change from both ancestors: f646484 probed only
+            // "Opera Safe Storage", the first registry version only
+            // "Chromium Safe Storage"; the probe set is now both.
+            &["Opera Safe Storage", "Chromium Safe Storage"], &["Opera", "chromium"],
+            false,
+            Some((&["com.opera.Opera"] as &[&str], "opera")),
+        );
     }
 
     #[test]
@@ -491,7 +571,7 @@ mod tests {
 
     #[test]
     fn vivaldi_linux_aliases_chrome_with_vivaldi_probed_first() {
-        assert_eq!(VIVALDI.linux_label, "Chrome Safe Storage");
+        assert_eq!(VIVALDI.linux_labels, ["Chrome Safe Storage"]);
         assert_eq!(VIVALDI.linux_apps, ["vivaldi", "chrome"]);
         assert!(!VIVALDI.app_bound);
     }

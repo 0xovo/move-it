@@ -200,13 +200,34 @@ pub fn discover(profile_dir: &Path, browser: crate::oscrypt::LinuxBrowser) -> Re
             "browser password discovery is implemented for Linux only so far".into(),
         ));
     }
-    let (password, from_trusted) = crate::oscrypt::linux_browser_password_for(browser)?;
+    // Validated discovery: a candidate password that exists but cannot
+    // open this store does not end the search - the next candidate is
+    // tried (see `oscrypt::linux_browser_password_validated_for`). The
+    // check is this store's own readability: a store with rows that all
+    // fail to decrypt under a candidate is unreadable under that key.
+    let path = crate::paths::login_data(profile_dir);
+    let readable = |keys: &Keys| -> bool {
+        match export_detailed(&path, keys) {
+            Ok(d) => d.total == 0 || !d.logins.is_empty() || d.failed == 0,
+            Err(_) => false,
+        }
+    };
+    let (password, from_trusted) = crate::oscrypt::linux_browser_password_validated_for(
+        browser,
+        &|pw, from_trusted| {
+            let keys = Keys::Cbc {
+                lock: crate::oscrypt::Lock::linux(pw, LinuxPrefix::V10),
+                from_libsecret_v2: browser.empty_store_v11_from_trusted_item(from_trusted),
+            };
+            readable(&keys)
+        },
+    )?;
     let keys = Keys::Cbc {
         // The write label is irrelevant for reading: the decryptor accepts both.
         lock: crate::oscrypt::Lock::linux(&password, LinuxPrefix::V10),
         from_libsecret_v2: browser.empty_store_v11_from_trusted_item(from_trusted),
     };
-    export(&crate::paths::login_data(profile_dir), &keys)
+    export(&path, &keys)
 }
 
 /// The macOS twin of [`discover`]: find that browser's Safe Storage password in
@@ -219,12 +240,32 @@ pub fn discover_mac(profile_dir: &Path, browser: crate::oscrypt::MacBrowser) -> 
             "browser password discovery for macOS only runs on a Mac".into(),
         ));
     }
-    let (password, from_keychain) = crate::oscrypt::mac_browser_password_for(browser)?;
+    // Validated discovery, the macOS twin of `discover`: a wrong key
+    // under an earlier Keychain service candidate (Opera GX carries
+    // two) falls through to the next candidate when it cannot open
+    // this store, instead of shadowing the store's real key.
+    let path = crate::paths::login_data(profile_dir);
+    let readable = |keys: &Keys| -> bool {
+        match export_detailed(&path, keys) {
+            Ok(d) => d.total == 0 || !d.logins.is_empty() || d.failed == 0,
+            Err(_) => false,
+        }
+    };
+    let (password, from_keychain) = crate::oscrypt::mac_browser_password_validated_for(
+        browser,
+        &|pw| {
+            let keys = Keys::Cbc {
+                lock: crate::oscrypt::Lock::mac(pw),
+                from_libsecret_v2: browser.empty_store_v11_from_trusted_item(true),
+            };
+            readable(&keys)
+        },
+    )?;
     let keys = Keys::Cbc {
         lock: crate::oscrypt::Lock::mac(&password),
         from_libsecret_v2: browser.empty_store_v11_from_trusted_item(from_keychain),
     };
-    export(&crate::paths::login_data(profile_dir), &keys)
+    export(&path, &keys)
 }
 
 /// The label Linux values are written with: a vote over the store's existing password blobs,

@@ -158,6 +158,65 @@ pub fn linux_browser_password_for_at(
     linux_browser_password_from(browser, std::env::var(LINUX_PASSWORD_ENV).ok(), lookup, install_root)
 }
 
+/// The probe steps of one Linux password discovery, in order, as
+/// (attribute set, is-a-v2-item) pairs. The order is the historical one
+/// for a single-candidate browser (v2-schema item, application-only
+/// item, label), generalised for the multi-candidate rows:
+///
+/// 1. the v2-schema item for each application candidate in row order;
+/// 2. a combined (application, label) item for each label x application
+///    pair - a combined match proves the item carries BOTH names, so an
+///    aliased application value (`chromium` for Opera, `chrome` for
+///    Vivaldi) can only serve the browser whose label it also carries;
+/// 3. the application-only item for each application candidate that is
+///    not another stable browser's own application value: an
+///    application-only hit for `chromium` is Chromium's own item, and
+///    serving it to Opera on that evidence alone would shadow Opera's
+///    password with a different browser's (step 2 is the only way the
+///    aliased item may serve, and there its label must also match);
+/// 4. the label-only item for each label candidate in row order.
+fn linux_probe_steps(browser: LinuxBrowser) -> Vec<(Vec<(&'static str, &'static str)>, bool)> {
+    let apps = browser.keyring_apps();
+    let labels = browser.keyring_labels();
+    let mut steps: Vec<(Vec<(&'static str, &'static str)>, bool)> = Vec::new();
+    for app in apps {
+        steps.push((vec![("application", *app), ("xdg:schema", LIBSECRET_V2_SCHEMA)], true));
+    }
+    for label in labels {
+        for app in apps {
+            steps.push((vec![("application", *app), ("label", *label)], false));
+        }
+    }
+    // The stable browser this row's secrets belong to (itself, or the
+    // stable browser for a channel build): an application value that is
+    // a DIFFERENT stable browser's own first value is shadow-prone.
+    let stable = browser.def().secret_def().id;
+    let shadow_prone = |app: &str| {
+        crate::browsers::all().iter().any(|d| {
+            d.channel_of.is_none() && d.id != stable && d.linux_apps.first() == Some(&app)
+        })
+    };
+    for app in apps {
+        if !shadow_prone(app) {
+            steps.push((vec![("application", *app)], false));
+        }
+    }
+    for label in labels {
+        steps.push((vec![("label", *label)], true));
+    }
+    steps
+}
+
+fn note_flatpak(install_root: Option<&std::path::Path>) {
+    if let Some(root) = install_root {
+        if let Some(_app_id) = flatpak_app_id_from_install(root) {
+            // Flatpak browsers keep a host Secret Service item for the portal; when
+            // that is locked away we still notice the sandbox layout below.
+            let _flatpak_keyrings = flatpak_keyrings_dir(_app_id);
+        }
+    }
+}
+
 /// The ordering logic of [`linux_browser_password_for`], with the browser, the
 /// environment value and the secret-service lookup injected so it can be tested
 /// without a keyring.
@@ -172,32 +231,73 @@ fn linux_browser_password_from(
             return Ok((pw, false));
         }
     }
-    if let Some(root) = install_root {
-        if let Some(_app_id) = flatpak_app_id_from_install(root) {
-            // Flatpak browsers keep a host Secret Service item for the portal; when
-            // that is locked away we still notice the sandbox layout below.
-            let _flatpak_keyrings = flatpak_keyrings_dir(_app_id);
+    note_flatpak(install_root);
+    for (attrs, from_v2) in linux_probe_steps(browser) {
+        if let Some(pw) = lookup(&attrs)? {
+            return Ok((pw, from_v2));
         }
     }
-    let label = browser.keyring_label();
-    // Probe each application candidate in registry order (the browser's own
-    // first, then the aliased stable browser's). For a browser with one
-    // candidate this is exactly the historical order: the v2-schema item
-    // first (it is the one a current browser actually uses, and its
-    // provenance decides the write label for an empty store), then the
-    // application-only item, then the label.
-    for app in browser.keyring_apps() {
-        if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)])? {
-            return Ok((pw, true));
-        }
-        if let Some(pw) = lookup(&[("application", app)])? {
+    Ok((LINUX_FALLBACK_PASSWORD.to_string(), false))
+}
+
+/// Like [`linux_browser_password_for`], but a candidate that exists is
+/// not the end of the search: `check` is the caller's decrypt test
+/// against the store being opened (the store readability path), and
+/// the first candidate whose password PASSES it wins. A candidate that
+/// fails is set aside and the next probe step runs, so a wrong key
+/// stored under an earlier candidate (a stale or aliased item) cannot
+/// shadow the key the store was actually sealed with. When no
+/// candidate passes, the first candidate found is returned, so the
+/// caller's own refusal path reports the failure exactly as before;
+/// when nothing is found at all, the compiled-in fallback applies, as
+/// in [`linux_browser_password_for`]. The environment override is the
+/// person's explicit pin and is returned unchecked.
+pub fn linux_browser_password_validated_for(
+    browser: LinuxBrowser,
+    check: &dyn Fn(&str, bool) -> bool,
+) -> Result<(String, bool)> {
+    let lookup = &|attrs: &[(&str, &str)]| secret_service_lookup(attrs);
+    linux_browser_password_validated_from(
+        browser,
+        std::env::var(LINUX_PASSWORD_ENV).ok(),
+        lookup,
+        None,
+        check,
+    )
+}
+
+/// The ordering logic of [`linux_browser_password_validated_for`], with
+/// the lookup and the decrypt check injected for tests.
+fn linux_browser_password_validated_from(
+    browser: LinuxBrowser,
+    env: Option<String>,
+    lookup: &dyn Fn(&[(&str, &str)]) -> Result<Option<String>>,
+    install_root: Option<&std::path::Path>,
+    check: &dyn Fn(&str, bool) -> bool,
+) -> Result<(String, bool)> {
+    if let Some(pw) = env {
+        if !pw.is_empty() {
             return Ok((pw, false));
         }
     }
-    if let Some(pw) = lookup(&[("label", label)])? {
-        return Ok((pw, true));
+    note_flatpak(install_root);
+    let mut first_found: Option<(String, bool)> = None;
+    let mut tried: Vec<String> = Vec::new();
+    for (attrs, from_v2) in linux_probe_steps(browser) {
+        if let Some(pw) = lookup(&attrs)? {
+            if tried.iter().any(|t| t == &pw) {
+                continue;
+            }
+            tried.push(pw.clone());
+            if check(&pw, from_v2) {
+                return Ok((pw, from_v2));
+            }
+            if first_found.is_none() {
+                first_found = Some((pw, from_v2));
+            }
+        }
     }
-    Ok((LINUX_FALLBACK_PASSWORD.to_string(), false))
+    Ok(first_found.unwrap_or_else(|| (LINUX_FALLBACK_PASSWORD.to_string(), false)))
 }
 
 /// Flatpak app id when `install_root` lives under `~/.var/app/<id>/config/`.
@@ -237,11 +337,20 @@ fn flatpak_keyrings_dir(app_id: &str) -> Option<std::path::PathBuf> {
 }
 
 impl LinuxBrowser {
-    /// The Secret Service label Chromium stamps on its item (`secret-tool search label …`).
-    /// Aliasing browsers carry the aliased browser's label: Vivaldi stores
-    /// under Chrome's, Opera and Opera GX under Chromium's.
+    /// The Secret Service label Chromium stamps on its item (`secret-tool search label …`):
+    /// the first of this browser's candidate labels.
+    /// Aliasing browsers carry the aliased browser's label among their
+    /// candidates: Vivaldi stores under Chrome's, and Opera and Opera GX
+    /// probe their own historical label first, then Chromium's.
     pub fn keyring_label(self) -> &'static str {
-        self.def().linux_label
+        self.def().linux_labels[0]
+    }
+
+    /// Every Secret Service label to probe for this browser's Safe
+    /// Storage item, in probe order. Only the Opera family has more
+    /// than one.
+    pub fn keyring_labels(self) -> &'static [&'static str] {
+        self.def().linux_labels
     }
 }
 
@@ -722,13 +831,10 @@ pub fn mac_browser_password_for(browser: MacBrowser) -> Result<(String, bool)> {
     mac_password_from(browser, &security_cli_lookup)
 }
 
-/// The error mapping of [`mac_browser_password_for`], with the lookup injected so it
-/// can be tested without a keychain.
-fn mac_password_from(
-    browser: MacBrowser,
-    lookup: &dyn Fn(MacBrowser) -> KeychainOutcome,
-) -> Result<(String, bool)> {
-    match lookup(browser) {
+/// How one combined Keychain outcome becomes the password layer's
+/// answer (or its error).
+fn mac_outcome_result(browser: MacBrowser, outcome: KeychainOutcome) -> Result<(String, bool)> {
+    match outcome {
         KeychainOutcome::Found(pw) if !pw.is_empty() => Ok((pw, true)),
         KeychainOutcome::Found(_) | KeychainOutcome::Missing => Err(Error::Refused(format!(
             "no Safe Storage password for {} was found in the Keychain",
@@ -739,6 +845,76 @@ fn mac_password_from(
             "the macOS security tool did not answer".into(),
         )),
     }
+}
+
+/// The error mapping of [`mac_browser_password_for`], with the lookup injected so it
+/// can be tested without a keychain.
+fn mac_password_from(
+    browser: MacBrowser,
+    lookup: &dyn Fn(MacBrowser) -> KeychainOutcome,
+) -> Result<(String, bool)> {
+    mac_outcome_result(browser, lookup(browser))
+}
+
+/// Like [`mac_browser_password_for`], but a candidate that exists is
+/// not the end of the search: `check` is the caller's decrypt test
+/// against the store being opened, and the first candidate (in the
+/// browser's Keychain service probe order) whose password PASSES it
+/// wins. This is the Opera GX shape: a wrong or stale key under the
+/// first service must not shadow the key the store was sealed with
+/// under the second. When no candidate passes, the first candidate
+/// found is returned, so the caller's own refusal path reports the
+/// failure exactly as before; when no candidate exists at all, the
+/// combined outcome maps to the usual error.
+pub fn mac_browser_password_validated_for(
+    browser: MacBrowser,
+    check: &dyn Fn(&str) -> bool,
+) -> Result<(String, bool)> {
+    mac_password_validated_from(browser, &security_lookup_one_dispatch, check)
+}
+
+/// The ordering logic of [`mac_browser_password_validated_for`], with
+/// the per-service lookup and the decrypt check injected for tests.
+fn mac_password_validated_from(
+    browser: MacBrowser,
+    lookup_one: &dyn Fn(&str, &str) -> KeychainOutcome,
+    check: &dyn Fn(&str) -> bool,
+) -> Result<(String, bool)> {
+    let mut outcomes: Vec<KeychainOutcome> = Vec::new();
+    let mut first_found: Option<String> = None;
+    for service in browser.keychain_services() {
+        let outcome = lookup_one(service, browser.keychain_account());
+        let found: Option<String> = match &outcome {
+            KeychainOutcome::Found(pw) if !pw.is_empty() => Some(pw.clone()),
+            _ => None,
+        };
+        outcomes.push(outcome);
+        if let Some(pw) = found {
+            if first_found.is_none() {
+                first_found = Some(pw.clone());
+            }
+            if check(&pw) {
+                return Ok((pw, true));
+            }
+        }
+    }
+    if let Some(pw) = first_found {
+        return Ok((pw, true));
+    }
+    mac_outcome_result(browser, pick_keychain_outcome(outcomes))
+}
+
+/// One per-service Keychain lookup through the `security` tool (the
+/// dispatch [`security_cli_lookup`] is built from), or Unavailable off
+/// macOS, where there is no Keychain to ask.
+#[cfg(target_os = "macos")]
+fn security_lookup_one_dispatch(service: &str, account: &str) -> KeychainOutcome {
+    security_lookup_one(service, account)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn security_lookup_one_dispatch(_service: &str, _account: &str) -> KeychainOutcome {
+    KeychainOutcome::Unavailable
 }
 
 /// Whether the browser that owns this macOS user data folder seals with the
@@ -919,7 +1095,6 @@ fn security_output(args: &[&str]) -> Option<std::process::Output> {
 /// with a password wins; a refusal anywhere means an item exists but the
 /// read was refused; missing everywhere means missing. Pure, so the
 /// candidate order is pinned by tests off-macOS too.
-#[cfg(any(target_os = "macos", test))]
 fn pick_keychain_outcome(outcomes: Vec<KeychainOutcome>) -> KeychainOutcome {
     let mut saw_missing = false;
     let mut saw_refused = false;
@@ -1672,7 +1847,9 @@ mod registry_browser_tests {
     #[test]
     fn opera_linux_aliases_chromium_but_keeps_its_own_app_first() {
         let o = LinuxBrowser::from_name("opera").unwrap();
-        assert_eq!(o.keyring_label(), "Chromium Safe Storage");
+        // Both labels are probed, Opera's own historical one first.
+        assert_eq!(o.keyring_labels(), ["Opera Safe Storage", "Chromium Safe Storage"]);
+        assert_eq!(o.keyring_label(), "Opera Safe Storage");
         assert_eq!(o.keyring_apps(), ["Opera", "chromium"]);
         assert_eq!(o.keyring_app(), "Opera", "the pre-registry app value is unchanged");
         let m = MacBrowser::from_name("opera").unwrap();
@@ -1709,5 +1886,122 @@ mod registry_browser_tests {
         let m = MacBrowser::from_name("vivaldi").unwrap();
         assert_eq!(m.keychain_service(), "Vivaldi Safe Storage");
         assert_eq!(m.keychain_account(), "Vivaldi");
+    }
+    #[test]
+    fn opera_linux_combined_probe_serves_the_alias_but_app_only_chromium_does_not() {
+        let o = LinuxBrowser::from_name("opera").unwrap();
+        // Opera's own label answers: served (the combined step ties the
+        // application to that label; provenance is not a v2 item here).
+        let own_label = |attrs: &[(&str, &str)]| {
+            Ok(attrs
+                .iter()
+                .any(|(k, v)| *k == "label" && *v == "Opera Safe Storage")
+                .then(|| "opera-pw".to_string()))
+        };
+        assert_eq!(
+            linux_browser_password_from(o, None, &own_label, None).unwrap(),
+            ("opera-pw".to_string(), false)
+        );
+        // The aliased Chromium item answers a COMBINED (application,
+        // label) probe: both names match a candidate, so it may serve.
+        let combined = |attrs: &[(&str, &str)]| {
+            let app = attrs.iter().any(|(k, v)| *k == "application" && *v == "chromium");
+            let label = attrs.iter().any(|(k, v)| *k == "label" && *v == "Chromium Safe Storage");
+            Ok((app && label).then(|| "aliased-pw".to_string()))
+        };
+        assert_eq!(
+            linux_browser_password_from(o, None, &combined, None).unwrap().0,
+            "aliased-pw"
+        );
+        // An application-only hit for `chromium` alone is Chromium's own
+        // item answering a different browser's question: it must NOT
+        // serve Opera when nothing ties it to a candidate label.
+        let app_only_chromium = |attrs: &[(&str, &str)]| {
+            Ok((attrs.len() == 1
+                && attrs.iter().any(|(k, v)| *k == "application" && *v == "chromium"))
+            .then(|| "chromium-pw".to_string()))
+        };
+        assert_eq!(
+            linux_browser_password_from(o, None, &app_only_chromium, None).unwrap(),
+            (LINUX_FALLBACK_PASSWORD.to_string(), false)
+        );
+    }
+
+    #[test]
+    fn opera_gx_mac_validated_probe_falls_through_a_wrong_first_key() {
+        // A store sealed under the SECOND candidate's key, while a wrong
+        // key exists under the first candidate service.
+        let sample = Lock::mac("right-pw")
+            .encrypt(".example.com", "gx-value", HostTag::With)
+            .unwrap();
+        let lookup_one = |service: &str, _account: &str| match service {
+            "Opera Safe Storage 2023" => KeychainOutcome::Found("wrong-pw".to_string()),
+            "Opera Safe Storage" => KeychainOutcome::Found("right-pw".to_string()),
+            _ => KeychainOutcome::Missing,
+        };
+        // The unvalidated probe stops at the first existing candidate.
+        let combined = |b: MacBrowser| {
+            pick_keychain_outcome(
+                b.keychain_services()
+                    .iter()
+                    .map(|svc| lookup_one(svc, b.keychain_account()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            mac_password_from(MacBrowser::OperaGx, &combined).unwrap().0,
+            "wrong-pw"
+        );
+        // The validated probe tries the next candidate when the first
+        // key cannot decrypt the store, and the store opens.
+        let check = |pw: &str| Lock::mac(pw).decrypt(".example.com", &sample).is_ok();
+        let (pw, _) =
+            mac_password_validated_from(MacBrowser::OperaGx, &lookup_one, &check).unwrap();
+        assert_eq!(pw, "right-pw");
+        assert_eq!(
+            Lock::mac(&pw).decrypt(".example.com", &sample).unwrap(),
+            "gx-value"
+        );
+    }
+
+    #[test]
+    fn opera_linux_validated_probe_falls_through_a_wrong_first_key() {
+        // Same shape on Linux: the store is sealed under the aliased
+        // candidate's key while Opera's own first candidate holds a
+        // wrong key.
+        let sample = Lock::linux("right-pw", LinuxPrefix::V11)
+            .encrypt(".example.com", "opera-value", HostTag::With)
+            .unwrap();
+        let lookup = |attrs: &[(&str, &str)]| {
+            let app = attrs
+                .iter()
+                .find(|(k, _)| *k == "application")
+                .map(|(_, v)| *v);
+            Ok(match app {
+                Some("Opera") => Some("wrong-pw".to_string()),
+                Some("chromium") => Some("right-pw".to_string()),
+                _ => None,
+            })
+        };
+        let o = LinuxBrowser::from_name("opera").unwrap();
+        assert_eq!(
+            linux_browser_password_from(o, None, &lookup, None).unwrap().0,
+            "wrong-pw",
+            "the unvalidated probe stops at the first existing candidate"
+        );
+        let check = |pw: &str, _from_v2: bool| {
+            Lock::linux(pw, LinuxPrefix::V11)
+                .decrypt(".example.com", &sample)
+                .is_ok()
+        };
+        let (pw, _) =
+            linux_browser_password_validated_from(o, None, &lookup, None, &check).unwrap();
+        assert_eq!(pw, "right-pw");
+        assert_eq!(
+            Lock::linux(&pw, LinuxPrefix::V11)
+                .decrypt(".example.com", &sample)
+                .unwrap(),
+            "opera-value"
+        );
     }
 }
