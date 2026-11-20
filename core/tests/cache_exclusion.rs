@@ -52,6 +52,7 @@ const LOGINS_SCHEMA: &str = "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE P
     CREATE INDEX logins_signon ON logins (signon_realm);";
 
 const EXT_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EXT_ID2: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn make_db(path: &Path, schema: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -216,14 +217,19 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
     write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/gpucache/junk.bin")), b"nested-junk");
     write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/gpucache/junk.bin")), b"nested-junk");
     // A cache-named FILE (final component) in the same trees: data, carried.
-    // It sits one folder down, not beside the cache directory above: a
-    // `GPUCache` file and a `gpucache` directory cannot be siblings on a
-    // case-insensitive filesystem (NTFS, APFS), so planting them side by
-    // side made the fixture itself impossible there. The assertions are
-    // unchanged: the lowercase cache dirs are still pruned from both
-    // trees, and a file whose name is a cache name still travels whole.
-    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/keep/GPUCache")), b"state-file-bytes");
-    write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/keep/GPUCache")), b"bin-file-bytes");
+    // Each file is a DIRECT child of a carried extension folder - the
+    // second extension's state folder, and its binary version folder -
+    // and neither of those folders holds a lowercase cache directory
+    // (the `gpucache` dirs above live under the FIRST extension's
+    // folders). Siblings are the one shape that is impossible on a
+    // case-insensitive filesystem (NTFS, APFS): a `GPUCache` file
+    // beside a `gpucache` directory in the SAME folder. A direct child
+    // in a different parent folder is the honest equivalent, and it
+    // keeps the assertion at full strength: a cache-named file sitting
+    // exactly where a cache directory would be pruned still travels
+    // whole, byte-identical.
+    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID2}/GPUCache")), b"state-file-bytes");
+    write(&a.join(format!("Default/Extensions/{EXT_ID2}/1.0_0/GPUCache")), b"bin-file-bytes");
 
     let key = SyncKey::from_bytes([5u8; 32]);
     let sealed = engine::seal_box(&profile(&a, &k), "fixture:A", &key).unwrap();
@@ -232,7 +238,7 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
     assert!(payload
         .ext_files
         .keys()
-        .any(|l| l == &format!("Local Extension Settings/{EXT_ID}/keep/GPUCache")));
+        .any(|l| l == &format!("Local Extension Settings/{EXT_ID2}/GPUCache")));
     assert!(payload
         .ext_bins
         .keys()
@@ -248,11 +254,11 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
         assert!(!paths::is_cache_dir_name(&name), "cache dir {name} landed in the target");
     }
     assert_eq!(
-        std::fs::read(b.join(format!("Default/Local Extension Settings/{EXT_ID}/keep/GPUCache"))).unwrap(),
+        std::fs::read(b.join(format!("Default/Local Extension Settings/{EXT_ID2}/GPUCache"))).unwrap(),
         b"state-file-bytes"
     );
     assert_eq!(
-        std::fs::read(b.join(format!("Default/Extensions/{EXT_ID}/1.0_0/keep/GPUCache"))).unwrap(),
+        std::fs::read(b.join(format!("Default/Extensions/{EXT_ID2}/1.0_0/GPUCache"))).unwrap(),
         b"bin-file-bytes"
     );
 }
