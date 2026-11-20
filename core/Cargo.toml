@@ -1,6 +1,6 @@
 [package]
 name = "moveit-core"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "Move It engine: reads, seals, carries and merges a browser's cookies, logins, extensions, bookmarks and history."
