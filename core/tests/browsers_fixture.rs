@@ -15,6 +15,7 @@ use moveit_core::logins::{self, Login};
 use moveit_core::oscrypt::{HostTag, LinuxPrefix, Lock};
 use moveit_core::paths;
 use moveit_core::profiles;
+use moveit_core::txn;
 use moveit_core::sealed::SyncKey;
 
 const COOKIES_SCHEMA: &str = "CREATE TABLE meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
@@ -262,4 +263,111 @@ fn opera_gx_fixture_uses_the_single_profile_layout_too() {
     let dst = plant_fixture(&t.path().join("config2"), "opera-gx", 0);
     round_trip(&gx, paths::SINGLE_SLOT, "opera-gx", &dst, paths::SINGLE_SLOT, "opera-gx");
     assert_eq!(census(&dst, paths::SINGLE_SLOT), (1, 1, 1));
+}
+
+/// Seal `src`'s single profile into a payload, ready for `import_many`.
+fn sealed_payload(src: &Path, src_id: &str) -> moveit_core::sealed::Payload {
+    let k = keys();
+    let key = SyncKey::from_bytes([7u8; 32]);
+    let def = browsers::by_id(src_id).unwrap();
+    let sealed = engine::seal_box(
+        &profile(src, paths::SINGLE_SLOT, &k, src_id, def.display),
+        "fixture:src",
+        &key,
+    )
+    .unwrap();
+    engine::open_box(&sealed, &key).unwrap()
+}
+
+/// The sync landing path (`import_many`, not the single-profile
+/// `engine::import`) into an EXISTING Opera profile: it must land, the
+/// content must decrypt, the profile must not be reported as created,
+/// no folder named after the slot may appear, and Local State must not
+/// gain a bogus slot entry for it.
+#[test]
+fn opera_import_many_lands_in_an_existing_single_profile() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let xdg = t.path().join("config");
+    std::fs::create_dir_all(&home).unwrap();
+    let src = plant_fixture(&xdg, "opera", 2);
+    let dst = plant_fixture(&t.path().join("config2"), "opera", 0);
+    let ls_before = std::fs::read(dst.join("Local State")).unwrap();
+    let payload = sealed_payload(&src, "opera");
+    let k = keys();
+    let landed = engine::import_many(
+        &dst,
+        &k,
+        HostTag::Without,
+        &[engine::Job {
+            target: engine::Target::Slot(paths::SINGLE_SLOT.to_string()),
+            payload: &payload,
+        }],
+        17_000_000_000_000i64,
+        "opera",
+        "Opera",
+    )
+    .unwrap();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].slot, paths::SINGLE_SLOT);
+    assert!(!landed[0].created, "an existing Opera profile is not created by the move");
+    assert!(!dst.join(paths::SINGLE_SLOT).exists(), "no subfolder named after the slot");
+    assert_eq!(census(&dst, paths::SINGLE_SLOT), (2, 1, 1));
+    let got = cookies::export(&paths::cookies_in(&dst, paths::SINGLE_SLOT), &k).unwrap();
+    assert!(got.iter().any(|c| c.host == ".host1.test" && c.value == "value-1"));
+    // Local State is untouched: no registration, and in particular no
+    // entry named after the single slot.
+    assert_eq!(std::fs::read(dst.join("Local State")).unwrap(), ls_before);
+    let ls: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dst.join("Local State")).unwrap()).unwrap();
+    assert!(ls
+        .pointer("/profile/info_cache/Single")
+        .is_none());
+    // One undo takes the landing back out whole.
+    assert_eq!(txn::undo_last(&dst, false).unwrap(), txn::Undo::Done);
+    assert_eq!(census(&dst, paths::SINGLE_SLOT), (0, 1, 1));
+}
+
+/// The same landing into a fresh, empty Opera root (no stores, no
+/// Local State): the engine creates the profile in the root itself,
+/// reports it as created, and still registers no slot in Local State.
+#[test]
+fn opera_import_many_into_a_fresh_empty_root() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let xdg = t.path().join("config");
+    std::fs::create_dir_all(&home).unwrap();
+    let src = plant_fixture(&xdg, "opera", 2);
+    let dst = t.path().join("config2").join("opera");
+    std::fs::create_dir_all(&dst).unwrap();
+    let payload = sealed_payload(&src, "opera");
+    let k = keys();
+    let landed = engine::import_many(
+        &dst,
+        &k,
+        HostTag::Without,
+        &[engine::Job {
+            target: engine::Target::Slot(paths::SINGLE_SLOT.to_string()),
+            payload: &payload,
+        }],
+        17_000_000_000_000i64,
+        "opera",
+        "Opera",
+    )
+    .unwrap();
+    assert_eq!(landed.len(), 1);
+    assert!(landed[0].created, "a fresh empty root's profile is created by the move");
+    assert!(!dst.join(paths::SINGLE_SLOT).exists(), "no subfolder named after the slot");
+    assert_eq!(census(&dst, paths::SINGLE_SLOT), (2, 1, 1));
+    // No Local State registration for the single slot: the file is
+    // either absent (the browser writes its own on first launch) or
+    // carries no entry named after the slot.
+    if let Ok(bytes) = std::fs::read(dst.join("Local State")) {
+        let ls: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(ls.pointer("/profile/info_cache/Single").is_none());
+    }
+    // Undo removes the created profile's files from the root.
+    assert_eq!(txn::undo_last(&dst, false).unwrap(), txn::Undo::Done);
+    assert!(!dst.join("Preferences").exists());
+    assert!(!dst.join("Network").join("Cookies").exists());
 }

@@ -78,6 +78,20 @@ fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         .map_err(|e| io(e, "cannot list", &dir))?;
     names.sort_by_key(|e| e.file_name());
     for e in names {
+        // A store that IS a browser folder (a SingleProfile profile is
+        // its browser's root) contains this journal and the folder lock
+        // as direct children. They are the move's own machinery, never
+        // store data: hashing or copying them would make the snapshot
+        // describe the journal itself (and change while it is written),
+        // so a top-level walk skips them, the same way a Standard
+        // profile's snapshot never contains them (they live outside the
+        // slot folder there).
+        if rel.as_os_str().is_empty()
+            && (e.file_name().to_string_lossy().starts_with(TXN_PREFIX)
+                || e.file_name() == LOCK_FILE)
+        {
+            continue;
+        }
         let ft = e.file_type().map_err(|err| io(err, "cannot stat", &e.path()))?;
         let r = rel.join(e.file_name());
         if ft.is_symlink() {

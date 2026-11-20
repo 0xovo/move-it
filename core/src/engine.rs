@@ -439,15 +439,32 @@ pub(crate) fn import_many_preserving(
     };
 
     // Resolve each job's slot, and whether this move creates it.
+    // A SingleProfile target is special in both halves: its one slot IS
+    // the root, so "created" is whether the root itself already holds a
+    // profile (a folder named after the slot never exists, and testing
+    // for one reported every existing Opera profile as brand new), and
+    // a created single profile is never registered in Local State (the
+    // root has no slot list to extend; registering would plant a bogus
+    // profile entry named after the slot).
+    let single = crate::browsers::by_id(browser)
+        .is_some_and(|d| d.layout == crate::browsers::LayoutKind::SingleProfile);
     let mut reserved: Vec<String> = Vec::new();
     let mut slots: Vec<String> = Vec::new();
     let mut displays: Vec<String> = Vec::new();
     let mut created: Vec<bool> = Vec::new();
+    let mut register: Vec<bool> = Vec::new();
     for job in jobs {
         match &job.target {
             Target::Slot(name) => {
                 reserved.push(name.clone());
-                created.push(!root.join(name).is_dir());
+                let is_single_slot = single && name == paths::SINGLE_SLOT;
+                let was_created = if is_single_slot {
+                    !crate::browsers::has_single_profile_markers(root)
+                } else {
+                    !root.join(name).is_dir()
+                };
+                created.push(was_created);
+                register.push(was_created && !is_single_slot);
                 displays.push(
                     job.payload
                         .manifest
@@ -455,24 +472,45 @@ pub(crate) fn import_many_preserving(
                         .and_then(Value::as_str)
                         .filter(|s| !s.trim().is_empty())
                         .map(str::to_string)
-                        .unwrap_or_else(|| name.clone()),
+                        .unwrap_or_else(|| {
+                            if is_single_slot && !display.is_empty() {
+                                display.to_string()
+                            } else {
+                                name.clone()
+                            }
+                        }),
                 );
                 slots.push(name.clone());
             }
-            Target::Fresh { display } => {
-                let name = profiles::fresh_slot_name(root, &reserved);
-                reserved.push(name.clone());
-                created.push(true);
-                displays.push(display.clone());
-                slots.push(name);
+            Target::Fresh { display: fresh_display } => {
+                if single {
+                    // A routed box for a single-profile browser lands in
+                    // its one slot, never in an invented subfolder.
+                    reserved.push(paths::SINGLE_SLOT.to_string());
+                    let was_created = !crate::browsers::has_single_profile_markers(root);
+                    created.push(was_created);
+                    register.push(false);
+                    displays.push(fresh_display.clone());
+                    slots.push(paths::SINGLE_SLOT.to_string());
+                } else {
+                    let name = profiles::fresh_slot_name(root, &reserved);
+                    reserved.push(name.clone());
+                    created.push(true);
+                    register.push(true);
+                    displays.push(fresh_display.clone());
+                    slots.push(name);
+                }
             }
         }
     }
     // Slot names become folder paths. A name that did not come from this engine
     // (a box can carry one) must be a name Chromium itself would use, nothing else:
     // no separators, no dots, no traversal.
+    let layout = crate::browsers::by_id(browser)
+        .map(|d| d.layout)
+        .unwrap_or(crate::browsers::LayoutKind::Standard);
     for s in &slots {
-        if !profiles::is_slot_name(s) {
+        if !profiles::is_slot_name_for(s, layout) {
             return Err(Error::Refused(format!("{s:?} is not a profile name Move It will write to")));
         }
     }
@@ -487,17 +525,30 @@ pub(crate) fn import_many_preserving(
         }
     }
     let any_created = created.iter().any(|c| *c);
+    let any_registered = register.iter().any(|c| *c);
 
     // Every store every job would touch, snapshotted together. A created profile's
     // folder itself is a store (absent before, so undo removes the whole folder),
     // and so is Local State when any registration will be written into it.
+    // A created single profile is the exception: its folder is the root
+    // itself, which contains the journal, so snapshotting it as a store
+    // would hash and copy the journal into its own snapshot. Its created
+    // files are snapshotted individually instead (Preferences and the
+    // landing marker; the stores below cover the databases), and undo
+    // takes those back out, leaving the (possibly pre-existing) root
+    // folder in place.
     let mut stores: Vec<(String, PathBuf)> = Vec::new();
-    if any_created {
+    if any_registered {
         stores.push(("localstate".into(), ls_path.clone()));
     }
     for (i, slot) in slots.iter().enumerate() {
         if created[i] {
-            stores.push((format!("slotdir{i}"), paths::slot_dir(root, slot)));
+            if single && slot == paths::SINGLE_SLOT {
+                stores.push((format!("prefs{i}"), root.join("Preferences")));
+                stores.push((format!("marker{i}"), root.join(LANDING_MARKER)));
+            } else {
+                stores.push((format!("slotdir{i}"), paths::slot_dir(root, slot)));
+            }
         }
         stores.push((format!("cookies{i}"), paths::cookies_in(root, slot)));
         stores.push((format!("history{i}"), paths::history_in(root, slot)));
@@ -576,16 +627,18 @@ pub(crate) fn import_many_preserving(
                         .map_err(|e| Error::Io(format!("cannot write {}: {e}", mp.display())))?;
                 }
             }
-            let mut ls = ls_now.clone().unwrap_or_else(|| Value::Object(Map::new()));
-            for (i, slot) in slots.iter().enumerate() {
-                if created[i] {
-                    ls = profiles::local_state_with_slot(&ls, slot, &displays[i], (now_us / 1_000_000) as u64);
+            if any_registered {
+                let mut ls = ls_now.clone().unwrap_or_else(|| Value::Object(Map::new()));
+                for (i, slot) in slots.iter().enumerate() {
+                    if register[i] {
+                        ls = profiles::local_state_with_slot(&ls, slot, &displays[i], (now_us / 1_000_000) as u64);
+                    }
                 }
+                let bytes = serde_json::to_vec(&ls).map_err(|e| Error::Io(e.to_string()))?;
+                let tmp = root.join("Local State.moveit-tmp");
+                std::fs::write(&tmp, bytes).map_err(|e| Error::Io(format!("cannot write {}: {e}", tmp.display())))?;
+                std::fs::rename(&tmp, &ls_path).map_err(|e| Error::Io(format!("cannot write {}: {e}", ls_path.display())))?;
             }
-            let bytes = serde_json::to_vec(&ls).map_err(|e| Error::Io(e.to_string()))?;
-            let tmp = root.join("Local State.moveit-tmp");
-            std::fs::write(&tmp, bytes).map_err(|e| Error::Io(format!("cannot write {}: {e}", tmp.display())))?;
-            std::fs::rename(&tmp, &ls_path).map_err(|e| Error::Io(format!("cannot write {}: {e}", ls_path.display())))?;
         }
         let mut out = Vec::new();
         for (i, d) in decoded.iter().enumerate() {

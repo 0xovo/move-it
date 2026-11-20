@@ -44,6 +44,29 @@ pub fn is_slot_name(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// [`is_slot_name`], scoped to one browser's layout: the single-profile
+/// slot name is a real slot ONLY for a SingleProfile browser. Everywhere
+/// else it names no folder (a Standard root's slot folders are `Default`
+/// and `Profile N`), so accepting it there would aim writes at the
+/// browser root itself. Listing keeps using the unscoped predicate (a
+/// folder scan does not know which browser it belongs to yet); the
+/// validation seams (a box's named slot, an engine landing) use this.
+pub fn is_slot_name_for(name: &str, layout: crate::browsers::LayoutKind) -> bool {
+    if name == SINGLE_SLOT {
+        return layout == crate::browsers::LayoutKind::SingleProfile;
+    }
+    is_slot_name(name)
+}
+
+/// [`is_slot_name_for`], with the layout taken from the registry row for
+/// `browser` (Standard for a name the registry does not know).
+pub fn is_slot_name_for_browser(name: &str, browser: &str) -> bool {
+    let layout = crate::browsers::by_id(browser)
+        .map(|d| d.layout)
+        .unwrap_or(crate::browsers::LayoutKind::Standard);
+    is_slot_name_for(name, layout)
+}
+
 /// The browser's Local State as JSON, when it is there and parses.
 pub fn read_local_state(root: &Path) -> Option<Value> {
     let bytes = std::fs::read(root.join("Local State")).ok()?;
@@ -382,6 +405,21 @@ mod tests {
         let slots = list_slots(&root);
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].display, "From Prefs");
+    }
+
+    #[test]
+    fn single_slot_is_only_a_slot_for_single_profile_browsers() {
+        use crate::browsers::LayoutKind;
+        assert!(is_slot_name_for("Single", LayoutKind::SingleProfile));
+        assert!(!is_slot_name_for("Single", LayoutKind::Standard));
+        assert!(is_slot_name_for_browser("Single", "opera"));
+        assert!(is_slot_name_for_browser("Single", "opera-gx"));
+        assert!(!is_slot_name_for_browser("Single", "chrome"));
+        assert!(!is_slot_name_for_browser("Single", "brave"));
+        // Ordinary slots are accepted under either layout check.
+        assert!(is_slot_name_for_browser("Default", "chrome"));
+        assert!(is_slot_name_for_browser("Profile 2", "chrome"));
+        assert!(!is_slot_name_for_browser("Profile X", "chrome"));
     }
 
     #[test]
