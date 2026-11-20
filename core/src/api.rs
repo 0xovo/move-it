@@ -813,7 +813,7 @@ impl Incoming {
         Incoming {
             origin: get("origin").unwrap_or_default(),
             origin_key: get("origin_id").unwrap_or_else(|| get("origin").unwrap_or_default()),
-            slot_ok: profiles::is_slot_name(&slot),
+            slot_ok: profiles::is_slot_name_for_browser(&slot, &b.to_lowercase()),
             src_name: get("profile_name").unwrap_or_else(|| slot.clone()),
             // Browser names match case-insensitively; slot names do
             // not (they are folder names, and case is real there).
@@ -2323,11 +2323,28 @@ impl App {
                             if let Some(h) = &l.applied.history {
                                 report.history_urls += (h.urls_inserted + h.urls_updated) as u64;
                             }
+                            let into_profile = if l.slot == paths::SINGLE_SLOT {
+                                // "Single" is the engine's name for the
+                                // one profile a single-profile browser
+                                // holds, not a profile name a person would
+                                // recognise: report that profile's own
+                                // name, as listed from the landed root.
+                                profiles::list_slots_for(
+                                    &root,
+                                    crate::browsers::LayoutKind::SingleProfile,
+                                )
+                                .into_iter()
+                                .next()
+                                .map(|s| s.display)
+                                .unwrap_or_else(|| display.clone())
+                            } else {
+                                l.slot.clone()
+                            };
                             lines.insert(*i, RouteLine {
                                 profile: id.clone(),
                                 from_browser: src.clone(),
                                 to_browser: dest.clone(),
-                                into_profile: Some(l.slot.clone()),
+                                into_profile: Some(into_profile),
                                 created: l.created,
                                 status: "moved".into(),
                                 reason: None,
@@ -3287,6 +3304,14 @@ fn store_locked(db: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_is_exactly_the_registry_ids() {
+        // The comment on FAMILY claims a registry test pins the two lists
+        // to each other; this is that test.
+        let registry: Vec<&str> = crate::browsers::all().iter().map(|d| d.id).collect();
+        assert_eq!(FAMILY.to_vec(), registry);
+    }
 
     fn state() -> (tempfile::TempDir, App) {
         let t = tempfile::tempdir().unwrap();

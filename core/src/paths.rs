@@ -35,15 +35,25 @@ pub const PROFILE_CACHE_DIRS: &[&str] = &[
 ];
 
 /// True when `name` is one of the cache folders, at either level.
+/// Matching is case-insensitive: Chromium writes the same class with
+/// different casing on different platforms and builds (`GPUCache`,
+/// `gpucache`, `GpuCache` are one class), and a case-sensitive match
+/// silently carried the other spellings.
 pub fn is_cache_dir_name(name: &str) -> bool {
-    ROOT_CACHE_DIRS.contains(&name) || PROFILE_CACHE_DIRS.contains(&name)
+    ROOT_CACHE_DIRS.iter().any(|c| c.eq_ignore_ascii_case(name))
+        || PROFILE_CACHE_DIRS.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
-/// True when any component of a `/`-joined logical payload path is a
-/// cache folder: such an entry is excluded on the way into a box and on
-/// the way out of one.
+/// True when a `/`-joined logical payload path passes THROUGH a cache
+/// folder: such an entry is excluded on the way into a box and on the
+/// way out of one. Only directory components count. The final component
+/// is the payload file itself, and a file that happens to be named like
+/// a cache folder (`GPUCache` as a file inside an extension folder) is
+/// data, not a cache directory: it is carried like any other file.
 pub fn logical_path_has_cache_dir(logical: &str) -> bool {
-    logical.split('/').any(is_cache_dir_name)
+    let parts: Vec<&str> = logical.split('/').collect();
+    let dirs = if parts.len() > 1 { &parts[..parts.len() - 1] } else { &[][..] };
+    dirs.iter().any(|c| is_cache_dir_name(c))
 }
 
 /// The folder one profile lives in, inside its browser's folder.

@@ -193,4 +193,60 @@ fn the_cache_name_sets_match_the_two_levels() {
     assert!(!paths::is_cache_dir_name("Network"));
     assert!(paths::logical_path_has_cache_dir("Extensions/x/1.0_0/Code Cache/junk"));
     assert!(!paths::logical_path_has_cache_dir("Extensions/x/1.0_0/code.js"));
+    // Matching is case-insensitive, in the predicate and through a path.
+    assert!(paths::is_cache_dir_name("gpucache"));
+    assert!(paths::is_cache_dir_name("GpuCache"));
+    assert!(paths::is_cache_dir_name("code cache"));
+    assert!(paths::logical_path_has_cache_dir("Extensions/x/1.0_0/gpucache/junk.bin"));
+    // The final component of a payload path is a FILE: a file named like
+    // a cache folder is data, so a path ending in one has no cache dir.
+    assert!(!paths::logical_path_has_cache_dir("Local Extension Settings/x/GPUCache"));
+    assert!(!paths::logical_path_has_cache_dir("GPUCache"));
+}
+
+#[test]
+fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
+    let t = tempfile::tempdir().unwrap();
+    let (a, b) = (t.path().join("A"), t.path().join("B"));
+    fresh_profile(&a);
+    fresh_profile(&b);
+    let k = keys();
+
+    // A lowercase cache DIRECTORY inside carried trees: pruned on seal.
+    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/gpucache/junk.bin")), b"nested-junk");
+    write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/gpucache/junk.bin")), b"nested-junk");
+    // A cache-named FILE (final component) in the same trees: data, carried.
+    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/GPUCache")), b"state-file-bytes");
+    write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/GPUCache")), b"bin-file-bytes");
+
+    let key = SyncKey::from_bytes([5u8; 32]);
+    let sealed = engine::seal_box(&profile(&a, &k), "fixture:A", &key).unwrap();
+    let payload = engine::open_box(&sealed, &key).unwrap();
+    // The box carries the cache-named files and no cache directory path.
+    assert!(payload
+        .ext_files
+        .keys()
+        .any(|l| l == &format!("Local Extension Settings/{EXT_ID}/GPUCache")));
+    assert!(payload
+        .ext_bins
+        .keys()
+        .any(|l| l.ends_with("/GPUCache")));
+    for logical in payload.ext_files.keys().chain(payload.ext_bins.keys()) {
+        assert!(!paths::logical_path_has_cache_dir(logical), "box carries {logical}");
+    }
+
+    engine::import(&profile(&b, &k), &payload, 17_000_000_000_000i64).unwrap();
+
+    // No cache directory (any casing) landed, and the files survived whole.
+    for name in dir_names_under(&b) {
+        assert!(!paths::is_cache_dir_name(&name), "cache dir {name} landed in the target");
+    }
+    assert_eq!(
+        std::fs::read(b.join(format!("Default/Local Extension Settings/{EXT_ID}/GPUCache"))).unwrap(),
+        b"state-file-bytes"
+    );
+    assert_eq!(
+        std::fs::read(b.join(format!("Default/Extensions/{EXT_ID}/1.0_0/GPUCache"))).unwrap(),
+        b"bin-file-bytes"
+    );
 }
