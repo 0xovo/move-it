@@ -71,7 +71,7 @@ pub fn sqlite_path(profile: &Path) -> PathBuf {
 }
 
 pub fn sqlite_path_in(profile: &Path, slot: &str) -> PathBuf {
-    profile.join(slot).join("LocalStorage")
+    crate::paths::slot_dir(profile, slot).join("LocalStorage")
 }
 
 pub fn leveldb_path(profile: &Path) -> PathBuf {
@@ -79,7 +79,7 @@ pub fn leveldb_path(profile: &Path) -> PathBuf {
 }
 
 pub fn leveldb_path_in(profile: &Path, slot: &str) -> PathBuf {
-    profile.join(slot).join("Local Storage").join("leveldb")
+    crate::paths::slot_dir(profile, slot).join("Local Storage").join("leveldb")
 }
 
 /// Now as a Chromium timestamp: microseconds since 1601-01-01.

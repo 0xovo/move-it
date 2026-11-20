@@ -146,31 +146,38 @@ fn kinds_for_profile<'a>(map: Option<&'a ProfileKinds>, profile_id: &str) -> Opt
 }
 
 fn browser_display(name: &str) -> String {
-    match name {
-        "brave" => "Brave".to_string(),
-        "chrome" => "Google Chrome".to_string(),
-        "chromium" => "Chromium".to_string(),
-        "edge" => "Microsoft Edge".to_string(),
-        "opera" => "Opera".to_string(),
-        other => other.to_string(),
-    }
+    crate::browsers::display_for(name)
+        .map(str::to_string)
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// The browsers profiles can live in and be routed between: one store format
 /// family (Chromium). Anything else (Firefox, Safari) keeps its own format and
 /// is never a move target.
-pub const FAMILY: [&str; 5] = ["brave", "chrome", "chromium", "edge", "opera"];
+/// Every id here is a registry row in `crate::browsers`, in listing order
+/// (a registry test pins the two lists to each other).
+pub const FAMILY: [&str; 14] = [
+    "brave",
+    "chrome",
+    "chromium",
+    "edge",
+    "opera",
+    "vivaldi",
+    "chrome-beta",
+    "chrome-dev",
+    "chrome-canary",
+    "edge-beta",
+    "edge-dev",
+    "brave-beta",
+    "brave-nightly",
+    "opera-gx",
+];
 
-/// The folder one browser keeps its profiles in, under the config base.
+/// The folder one browser keeps its profiles in, under the config base
+/// (the registry's Linux folder; this surface's non-Linux base has always
+/// used the same folder names).
 fn browser_subdir(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "brave" => "BraveSoftware/Brave-Browser",
-        "chrome" => "google-chrome",
-        "chromium" => "chromium",
-        "edge" => "microsoft-edge",
-        "opera" => "opera",
-        _ => return None,
-    })
+    crate::browsers::by_id(name).and_then(|d| d.linux_dir)
 }
 
 /// The base the browsers live under (Linux: `$XDG_CONFIG_HOME` or `~/.config`).
@@ -631,7 +638,7 @@ impl App {
                     continue;
                 }
                 let name = install.browser.as_str();
-                for slot in profiles::list_slots(&install.dir) {
+                for slot in profiles::list_slots_for(&install.dir, install.layout) {
                     if out.iter().any(|s: &SourceProfile| s.id == profile_id(name, &slot.name)) {
                         continue; // two folder names, one id: the first keeps it
                     }
@@ -651,7 +658,7 @@ impl App {
                 if !root.is_dir() {
                     continue;
                 }
-                for slot in profiles::list_slots(&root) {
+                for slot in profiles::list_slots_for_browser(&root, name) {
                     if out.iter().any(|s: &SourceProfile| s.id == profile_id(name, &slot.name)) {
                         continue;
                     }
@@ -669,7 +676,7 @@ impl App {
             if !out.iter().any(|s| s.root == wp.dir) {
                 // The pinned profile's folder was not under the detected
                 // base: every slot in it is a source, not just Default.
-                for slot in profiles::list_slots(&wp.dir) {
+                for slot in profiles::list_slots_for_browser(&wp.dir, &wp.browser) {
                     out.push(SourceProfile {
                         id: profile_id(&wp.browser, &slot.name),
                         browser: wp.browser.clone(),
@@ -1088,7 +1095,13 @@ fn incoming_landing_target(
     routed: bool,
     root: &Path,
     landed_book: &LandedBook,
+    single_profile: bool,
 ) -> (engine::Target, bool) {
+    if single_profile {
+        // The dest folder is the profile: every box for this browser
+        // lands in its one slot, never in a created subfolder.
+        return (engine::Target::Slot(paths::SINGLE_SLOT.to_string()), false);
+    }
     if routed {
         match landed_book.home(&inc.origin_key, &inc.src_browser, &inc.src_slot, root) {
             Some(home) => (engine::Target::Slot(home), false),
@@ -1106,6 +1119,11 @@ fn incoming_landing_target(
 
 /// True when at least one profile slot under this browser root has been opened once.
 fn browser_landing_ready(root: &Path) -> bool {
+    if crate::browsers::has_single_profile_markers(root)
+        && !paths::never_launched(root, paths::SINGLE_SLOT)
+    {
+        return true;
+    }
     for slot in profiles::list_slots(root) {
         if !paths::never_launched(root, &slot.name) {
             return true;
@@ -2209,9 +2227,16 @@ impl App {
                     continue;
                 };
                 let (target, was_fresh) =
-                    incoming_landing_target(inc, routed, &root, &landed_book);
+                    incoming_landing_target(
+                        inc,
+                        routed,
+                        &root,
+                        &landed_book,
+                        crate::browsers::by_id(&dest)
+                            .is_some_and(|d| d.layout == crate::browsers::LayoutKind::SingleProfile),
+                    );
                 if let engine::Target::Slot(slot) = &target {
-                    if root.join(slot).is_dir() && paths::never_launched(&root, slot) {
+                    if paths::slot_dir(&root, slot).is_dir() && paths::never_launched(&root, slot) {
                         fail(
                             &mut lines,
                             format!(
@@ -2762,7 +2787,7 @@ impl App {
         self.local_browser_roots()
             .into_iter()
             .map(|p| LocalBrowserProfiles {
-                profiles: profiles::list_slots(&p.dir)
+                profiles: profiles::list_slots_for_browser(&p.dir, &p.browser)
                     .into_iter()
                     .map(|s| LocalProfileChoice { slot: s.name, name: s.display })
                     .collect(),
@@ -3037,11 +3062,21 @@ fn profile_open(p: &DetectedProfile) -> bool {
 }
 
 fn root_open(root: &Path) -> bool {
-    singleton_live(root) || profiles::list_slots(root).iter().any(|s| {
+    if singleton_live(root) {
+        return true;
+    }
+    if profiles::list_slots(root).iter().any(|s| {
         store_locked(&paths::cookies_in(root, &s.name))
             || store_locked(&paths::login_data_in(root, &s.name))
             || store_locked(&paths::history_in(root, &s.name))
-    })
+    }) {
+        return true;
+    }
+    // A SingleProfile root's stores sit at the root itself.
+    crate::browsers::has_single_profile_markers(root)
+        && (store_locked(&paths::cookies_in(root, paths::SINGLE_SLOT))
+            || store_locked(&paths::login_data_in(root, paths::SINGLE_SLOT))
+            || store_locked(&paths::history_in(root, paths::SINGLE_SLOT)))
 }
 
 /// The browser leaves a `SingletonLock` marker naming its process while it runs.

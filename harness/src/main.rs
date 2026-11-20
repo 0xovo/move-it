@@ -337,11 +337,9 @@ fn arg(name: &str, default: u64) -> u64 {
 #[cfg(target_os = "macos")]
 fn mac_browser(browser: LinuxBrowser) -> Option<MacBrowser> {
     match browser {
-        LinuxBrowser::Brave => Some(MacBrowser::Brave),
-        LinuxBrowser::Chrome => Some(MacBrowser::Chrome),
-        LinuxBrowser::Chromium => Some(MacBrowser::Chromium),
-        LinuxBrowser::Edge => Some(MacBrowser::Edge),
+        // Opera keeps its historical harness behaviour: no macOS route.
         LinuxBrowser::Opera => None,
+        b => MacBrowser::from_name(b.id()),
     }
 }
 
@@ -511,7 +509,7 @@ fn parse_browser(name: &str) -> LinuxBrowser {
         Some(b) => b,
         None => {
             eprintln!(
-                "unknown browser {name} (brave, chrome, chromium, edge, opera)"
+                "unknown browser {name} (any registry id: brave, chrome, chromium, edge, opera, vivaldi, chrome-beta, chrome-dev, chrome-canary, edge-beta, edge-dev, brave-beta, brave-nightly, opera-gx)"
             );
             std::process::exit(2);
         }
@@ -799,13 +797,7 @@ fn require_api_profiles(args: &[String]) -> Result<(), Error> {
 }
 
 fn harness_browser_display(browser: LinuxBrowser) -> String {
-    match browser {
-        LinuxBrowser::Brave => "Brave".into(),
-        LinuxBrowser::Chrome => "Google Chrome".into(),
-        LinuxBrowser::Chromium => "Chromium".into(),
-        LinuxBrowser::Edge => "Microsoft Edge".into(),
-        LinuxBrowser::Opera => "Opera".into(),
-    }
+    browser.def().display.to_string()
 }
 
 fn cmd_open(browser: LinuxBrowser, dir: &str, in_box: &str, allow_real_dir: bool) -> ! {

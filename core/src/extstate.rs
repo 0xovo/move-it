@@ -74,7 +74,7 @@ fn default_dir(profile: &Path) -> PathBuf {
 }
 
 fn slot_dir(profile: &Path, slot: &str) -> PathBuf {
-    profile.join(slot)
+    crate::paths::slot_dir(profile, slot)
 }
 
 fn ids_at(default: &Path) -> Result<Vec<String>> {

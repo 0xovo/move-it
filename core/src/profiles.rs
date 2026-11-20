@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::paths::DEFAULT_SLOT;
+use crate::paths::{DEFAULT_SLOT, SINGLE_SLOT};
 use crate::oscrypt::{Platform, LINUX_PASSWORD_ENV};
 use crate::{Error, Result};
 
@@ -37,7 +37,7 @@ fn io(e: std::io::Error, what: &str, p: &Path) -> Error {
 /// never list, never receive.) This is also the write-side gate: a slot name from
 /// anywhere else (a box manifest, a route) must pass it before it becomes a path.
 pub fn is_slot_name(name: &str) -> bool {
-    if name == DEFAULT_SLOT {
+    if name == DEFAULT_SLOT || name == SINGLE_SLOT {
         return true;
     }
     name.strip_prefix("Profile ")
@@ -136,6 +136,45 @@ pub fn list_slots(root: &Path) -> Vec<Slot> {
         }
     }
     out
+}
+
+/// Every profile slot in this browser folder, under its layout. A
+/// SingleProfile root has exactly one slot, [`SINGLE_SLOT`], whose folder
+/// is the root itself, and only when the root actually holds a profile.
+pub fn list_slots_for(root: &Path, layout: crate::browsers::LayoutKind) -> Vec<Slot> {
+    match layout {
+        crate::browsers::LayoutKind::Standard => list_slots(root),
+        crate::browsers::LayoutKind::SingleProfile => list_slots_single(root),
+    }
+}
+
+/// [`list_slots_for`], with the layout taken from the registry row for
+/// `browser` (Standard for a name the registry does not know).
+pub fn list_slots_for_browser(root: &Path, browser: &str) -> Vec<Slot> {
+    let layout = crate::browsers::by_id(browser)
+        .map(|d| d.layout)
+        .unwrap_or(crate::browsers::LayoutKind::Standard);
+    list_slots_for(root, layout)
+}
+
+fn list_slots_single(root: &Path) -> Vec<Slot> {
+    if !crate::browsers::has_single_profile_markers(root) {
+        return Vec::new();
+    }
+    let mut display = "Default".to_string();
+    if let Ok(bytes) = std::fs::read(root.join("Preferences")) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(n) = v
+                .get("profile")
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                display = n.to_string();
+            }
+        }
+    }
+    vec![Slot { name: SINGLE_SLOT.to_string(), display, dir: root.to_path_buf() }]
 }
 
 /// The folder name a brand-new profile should get: `Default` when the browser
@@ -397,56 +436,25 @@ mod tests {
 
 // ---- detection: which browsers are installed, and where ----
 
-/// A browser profile found on this device: a user-data folder with a `Default` inside.
+/// A browser install found on this device: a user-data folder that
+/// holds profile data (a `Default` inside for a Standard browser, the
+/// profile itself for a SingleProfile one).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectedProfile {
-    /// Short name the engine knows: brave, chrome, chromium, edge.
+    /// Short name the engine knows: brave, chrome, chromium, edge, ...
     pub browser: String,
     /// The name a person calls it: Brave, Google Chrome, ...
     pub display: String,
     pub dir: PathBuf,
+    /// How this browser lays its profiles out (from the registry).
+    pub layout: crate::browsers::LayoutKind,
 }
 
 fn browser_display(name: &str) -> String {
-    match name {
-        "brave" => "Brave".to_string(),
-        "chrome" => "Google Chrome".to_string(),
-        "chromium" => "Chromium".to_string(),
-        "edge" => "Microsoft Edge".to_string(),
-        "opera" => "Opera".to_string(),
-        "vivaldi" => "Vivaldi".to_string(),
-        other => other.to_string(),
-    }
+    crate::browsers::display_for(name)
+        .map(str::to_string)
+        .unwrap_or_else(|| name.to_string())
 }
-
-/// Chromium-family browsers in listing order on Linux.
-const LINUX_FAMILY: &[&str] = &["brave", "chrome", "chromium", "edge", "opera"];
-
-/// (short name, folder under the config base) pairs, Linux.
-fn linux_subs() -> [(&'static str, &'static str); 5] {
-    [
-        ("brave", "BraveSoftware/Brave-Browser"),
-        ("chrome", "google-chrome"),
-        ("chromium", "chromium"),
-        ("edge", "microsoft-edge"),
-        ("opera", "opera"),
-    ]
-}
-
-/// Flatpak app id, browser short name, folder under `config/`.
-const LINUX_FLATPAK: &[(&str, &str, &str)] = &[
-    ("com.brave.Browser", "brave", "BraveSoftware/Brave-Browser"),
-    ("com.google.Chrome", "chrome", "google-chrome"),
-    ("org.chromium.Chromium", "chromium", "chromium"),
-    (
-        "io.github.ungoogled_software.ungoogled_chromium",
-        "chromium",
-        "chromium",
-    ),
-    ("com.microsoft.Edge", "edge", "microsoft-edge"),
-    ("com.vivaldi.Vivaldi", "vivaldi", "vivaldi"),
-    ("com.opera.Opera", "opera", "opera"),
-];
 
 /// Where a Chromium browser keeps its user-data on this machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -454,6 +462,8 @@ pub struct ChromiumInstallRoot {
     pub browser: String,
     pub display: String,
     pub dir: PathBuf,
+    /// How this browser lays its profiles out (from the registry).
+    pub layout: crate::browsers::LayoutKind,
 }
 
 fn xdg_config_under(home: &Path) -> PathBuf {
@@ -464,50 +474,61 @@ fn xdg_config_under(home: &Path) -> PathBuf {
 
 /// Every Chromium install root under `home` / `xdg_config`: native XDG first,
 /// then Flatpak fills browsers that are still missing. The same browser never
-/// appears twice; native wins over Flatpak.
+/// appears twice; native wins over Flatpak. The browser set, the folders,
+/// the listing order and the per-browser presence test all come from the
+/// registry (`crate::browsers`): a Standard browser is present when its
+/// folder holds a `Default`, a SingleProfile browser when the folder
+/// itself holds a profile.
 pub fn linux_chromium_install_roots_at(home: &Path, xdg_config: &Path) -> Vec<ChromiumInstallRoot> {
     let mut by_name: std::collections::BTreeMap<String, ChromiumInstallRoot> =
         std::collections::BTreeMap::new();
-    for p in scan(xdg_config, &linux_subs()) {
-        by_name.insert(
-            p.browser.clone(),
-            ChromiumInstallRoot {
-                browser: p.browser,
-                display: p.display,
-                dir: p.dir,
-            },
-        );
+    for def in crate::browsers::all() {
+        let Some(sub) = def.linux_dir else { continue };
+        let dir = xdg_config.join(sub);
+        if def.present_at(&dir) {
+            by_name.insert(
+                def.id.to_string(),
+                ChromiumInstallRoot {
+                    browser: def.id.to_string(),
+                    display: def.display.to_string(),
+                    dir,
+                    layout: def.layout,
+                },
+            );
+        }
     }
     let flatpak = std::env::var(LINUX_PASSWORD_ENV)
         .ok()
         .is_none_or(|p| p.is_empty());
     if flatpak {
-    for (app_id, name, sub) in LINUX_FLATPAK {
-        if by_name.contains_key(*name) {
-            continue;
+        for def in crate::browsers::all() {
+            let Some((app_ids, sub)) = def.flatpak else { continue };
+            if by_name.contains_key(def.id) {
+                continue;
+            }
+            for app_id in app_ids {
+                let dir = home.join(".var/app").join(app_id).join("config").join(sub);
+                if def.present_at(&dir) {
+                    by_name.insert(
+                        def.id.to_string(),
+                        ChromiumInstallRoot {
+                            browser: def.id.to_string(),
+                            display: format!("{} (Flatpak)", def.display),
+                            dir,
+                            layout: def.layout,
+                        },
+                    );
+                    break;
+                }
+            }
         }
-        let dir = home.join(".var/app").join(app_id).join("config").join(sub);
-        if dir.join("Default").is_dir() {
-            let mut display = browser_display(name);
-            display.push_str(" (Flatpak)");
-            by_name.insert(
-                (*name).to_string(),
-                ChromiumInstallRoot {
-                    browser: (*name).to_string(),
-                    display,
-                    dir,
-                },
-            );
-        }
-    }
     }
     let mut out = Vec::new();
-    for &name in LINUX_FAMILY {
-        if let Some(r) = by_name.remove(name) {
+    for def in crate::browsers::all() {
+        if let Some(r) = by_name.remove(def.id) {
             out.push(r);
         }
     }
-    out.extend(by_name.into_values());
     out
 }
 
@@ -555,28 +576,42 @@ pub fn linux_firefox_profile_homes(native_base: Option<&Path>) -> Vec<PathBuf> {
     linux_firefox_profile_homes_at(&home, &xdg)
 }
 
-/// (short name, folder under `~/Library/Application Support`) pairs, macOS.
-fn mac_subs() -> [(&'static str, &'static str); 4] {
-    [
-        ("brave", "BraveSoftware/Brave-Browser"),
-        ("chrome", "Google/Chrome"),
-        ("chromium", "Chromium"),
-        ("edge", "Microsoft Edge"),
-    ]
+/// (short name, folder under `~/Library/Application Support`) pairs,
+/// macOS, from the registry, in listing order.
+fn mac_subs() -> Vec<(&'static str, &'static str)> {
+    crate::browsers::all()
+        .iter()
+        .filter_map(|d| d.mac_dir.map(|sub| (d.id, sub)))
+        .collect()
+}
+
+/// (short name, folder under the config base) pairs, Linux, from the
+/// registry, in listing order.
+fn linux_subs() -> Vec<(&'static str, &'static str)> {
+    crate::browsers::all()
+        .iter()
+        .filter_map(|d| d.linux_dir.map(|sub| (d.id, sub)))
+        .collect()
 }
 
 /// Is this browser root the canonical macOS location for one of the known
-/// browsers (`~/Library/Application Support/<browser folder>`)? A root
+/// stable browsers (`~/Library/Application Support/<browser folder>`)? A root
 /// anywhere else is a non-default user data dir. That used to be taken as
 /// proof the browser writes v11; live proof on Chrome 156 and Brave 1.98
 /// showed both writing v10 there, so the location no longer decides the
-/// write label (only the store's own rows do).
+/// write label (only the store's own rows do). Channel builds and
+/// SingleProfile browsers are not canonical roots for this check: the
+/// stable Standard browsers are the set it has always covered.
 pub fn is_canonical_mac_root(root: &Path) -> bool {
     let comps: Vec<String> = root
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    for (_, sub) in mac_subs() {
+    for def in crate::browsers::all() {
+        if def.channel_of.is_some() || def.layout != crate::browsers::LayoutKind::Standard {
+            continue;
+        }
+        let Some(sub) = def.mac_dir else { continue };
         let tail: Vec<&str> = std::iter::once("Library")
             .chain(std::iter::once("Application Support"))
             .chain(sub.split('/'))
@@ -593,16 +628,23 @@ pub fn is_canonical_mac_root(root: &Path) -> bool {
     false
 }
 
-/// Every browser in `subs` whose folder under `base` holds a `Default`.
-fn scan(base: &Path, subs: &[(&str, &str)]) -> Vec<DetectedProfile> {
+/// Every browser in `defs` whose folder under `base` holds profile data,
+/// with `dir_of` picking the per-OS folder out of each registry row.
+fn scan(
+    base: &Path,
+    defs: &[&'static crate::browsers::BrowserDef],
+    dir_of: fn(&crate::browsers::BrowserDef) -> Option<&'static str>,
+) -> Vec<DetectedProfile> {
     let mut out = Vec::new();
-    for (name, sub) in subs {
+    for def in defs {
+        let Some(sub) = dir_of(def) else { continue };
         let dir = base.join(sub);
-        if dir.join("Default").is_dir() {
+        if def.present_at(&dir) {
             out.push(DetectedProfile {
-                browser: name.to_string(),
-                display: browser_display(name),
+                browser: def.id.to_string(),
+                display: def.display.to_string(),
                 dir,
+                layout: def.layout,
             });
         }
     }
@@ -619,13 +661,15 @@ pub fn detect_profiles() -> Vec<DetectedProfile> {
                 browser: r.browser,
                 display: r.display,
                 dir: r.dir,
+                layout: r.layout,
             })
             .collect(),
         Platform::Mac => {
             match std::env::var_os("HOME") {
                 Some(h) => scan(
                     &PathBuf::from(h).join("Library").join("Application Support"),
-                    &mac_subs(),
+                    &crate::browsers::defs_for_platform(Platform::Mac),
+                    |d| d.mac_dir,
                 ),
                 None => Vec::new(),
             }
@@ -657,6 +701,35 @@ mod detection_tests {
                 ("chrome", "Google/Chrome"),
                 ("chromium", "Chromium"),
                 ("edge", "Microsoft Edge"),
+                ("opera", "com.operasoftware.Opera"),
+                ("vivaldi", "Vivaldi"),
+                ("chrome-beta", "Google/Chrome Beta"),
+                ("chrome-dev", "Google/Chrome Dev"),
+                ("chrome-canary", "Google/Chrome Canary"),
+                ("edge-beta", "Microsoft Edge Beta"),
+                ("edge-dev", "Microsoft Edge Dev"),
+                ("brave-beta", "BraveSoftware/Brave-Browser-Beta"),
+                ("brave-nightly", "BraveSoftware/Brave-Browser-Nightly"),
+                ("opera-gx", "com.operasoftware.OperaGX"),
+            ]
+        );
+        assert_eq!(
+            linux_subs(),
+            [
+                ("brave", "BraveSoftware/Brave-Browser"),
+                ("chrome", "google-chrome"),
+                ("chromium", "chromium"),
+                ("edge", "microsoft-edge"),
+                ("opera", "opera"),
+                ("vivaldi", "vivaldi"),
+                ("chrome-beta", "google-chrome-beta"),
+                ("chrome-dev", "google-chrome-unstable"),
+                ("chrome-canary", "google-chrome-canary"),
+                ("edge-beta", "microsoft-edge-beta"),
+                ("edge-dev", "microsoft-edge-dev"),
+                ("brave-beta", "BraveSoftware/Brave-Browser-Beta"),
+                ("brave-nightly", "BraveSoftware/Brave-Browser-Nightly"),
+                ("opera-gx", "opera-gx"),
             ]
         );
     }
@@ -687,7 +760,7 @@ mod detection_tests {
         plant(base, "Google/Chrome", true);
         plant(base, "Chromium", true);
         plant(base, "Microsoft Edge", false); // installed once, never run: no Default
-        let found = scan(base, &mac_subs());
+        let found = scan(base, &crate::browsers::defs_for_platform(Platform::Mac), |d| d.mac_dir);
         let names: Vec<&str> = found.iter().map(|p| p.browser.as_str()).collect();
         assert_eq!(names, ["brave", "chrome", "chromium"]);
         assert_eq!(found[0].display, "Brave");
@@ -705,7 +778,7 @@ mod detection_tests {
         let base = tmp.path();
         plant(base, "BraveSoftware/Brave-Browser", true);
         plant(base, "microsoft-edge", true);
-        let found = scan(base, &linux_subs());
+        let found = scan(base, &crate::browsers::defs_for_platform(Platform::Linux), |d| d.linux_dir);
         let names: Vec<&str> = found.iter().map(|p| p.browser.as_str()).collect();
         assert_eq!(names, ["brave", "edge"]);
         assert_eq!(found[1].display, "Microsoft Edge");
@@ -714,8 +787,8 @@ mod detection_tests {
     #[test]
     fn scan_of_an_empty_base_finds_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(scan(tmp.path(), &mac_subs()).is_empty());
-        assert!(scan(tmp.path(), &linux_subs()).is_empty());
+        assert!(scan(tmp.path(), &crate::browsers::defs_for_platform(Platform::Mac), |d| d.mac_dir).is_empty());
+        assert!(scan(tmp.path(), &crate::browsers::defs_for_platform(Platform::Linux), |d| d.linux_dir).is_empty());
     }
 
     #[test]
@@ -805,5 +878,43 @@ mod detection_tests {
         .unwrap();
         assert!(ini_dir.join("abc.default").is_dir());
         assert!(linux_firefox_profile_homes_at(home, &xdg).contains(&ini_dir));
+    }
+
+    #[test]
+    fn linux_discovers_vivaldi_and_channel_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        plant(&xdg, "vivaldi", true);
+        plant(&xdg, "google-chrome-beta", true);
+        plant(&xdg, "BraveSoftware/Brave-Browser-Nightly", true);
+        plant(&xdg, "microsoft-edge-dev", true);
+        let found = linux_chromium_install_roots_at(home, &xdg);
+        let names: Vec<&str> = found.iter().map(|r| r.browser.as_str()).collect();
+        assert_eq!(names, ["vivaldi", "chrome-beta", "edge-dev", "brave-nightly"]);
+        assert_eq!(found[0].display, "Vivaldi");
+        assert_eq!(found[0].layout, crate::browsers::LayoutKind::Standard);
+    }
+
+    #[test]
+    fn linux_discovers_opera_as_a_single_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let xdg = home.join(".config");
+        // Opera's folder IS the profile: stores at its root, no Default inside.
+        let opera = xdg.join("opera");
+        std::fs::create_dir_all(&opera).unwrap();
+        std::fs::write(opera.join("Preferences"), b"{}").unwrap();
+        std::fs::write(opera.join("History"), b"x").unwrap();
+        // An Opera GX folder with no profile markers is not a profile.
+        std::fs::create_dir_all(xdg.join("opera-gx")).unwrap();
+        let found = linux_chromium_install_roots_at(home, &xdg);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].browser, "opera");
+        assert_eq!(found[0].layout, crate::browsers::LayoutKind::SingleProfile);
+        let slots = list_slots_for(&found[0].dir, found[0].layout);
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].name, SINGLE_SLOT);
+        assert_eq!(slots[0].dir, found[0].dir);
     }
 }
