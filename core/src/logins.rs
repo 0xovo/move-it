@@ -66,13 +66,20 @@ pub struct Stats {
     pub inserted: usize,
     pub updated: usize,
     /// Every incoming login that did not land. This is always
-    /// `already_present + constraint_skipped`: the two kinds are counted
-    /// separately below because only one of them means "already there".
+    /// `already_present + constraint_skipped + kept_unreadable`: the
+    /// kinds are counted separately below because only one of them
+    /// means "already there".
     pub skipped: usize,
     /// Merge skips: the target already holds this identity and its copy
-    /// won the merge (newer, equal, or unreadable and therefore kept), so
-    /// the incoming login was already present and nothing was lost.
+    /// was read, compared, and won the merge (newer or equal), so the
+    /// incoming login was already present and nothing was lost.
     pub already_present: usize,
+    /// Unreadable skips: the target's copy of this identity could not
+    /// be read at all (every row for it is protected, or a full visible
+    /// tie could not be broken because the password would not unlock),
+    /// so it was kept untouched without any comparison. The incoming
+    /// login may well be newer: these are NOT "already present".
+    pub kept_unreadable: usize,
     /// Constraint skips: the write itself was refused by a UNIQUE or
     /// other SQLite constraint (for example a signon_realm rewrite that
     /// would collide with another row). These are NOT "already present":
@@ -449,9 +456,21 @@ impl Local {
     }
 }
 
-/// Which existing row the incoming login is measured against, and whether it beats it. Decrypts
+/// The outcome of measuring an incoming login against the target's rows
+/// for its identity. `Loses` is a true rank loss: the copies were compared
+/// and the target's won. `Unreadable` is a loss without any comparison:
+/// the deciding password could not be read, so the target row was kept
+/// untouched and nothing is known about which copy is newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Wins,
+    Loses,
+    Unreadable,
+}
+
+/// Which existing row the incoming login is measured against, and the verdict. Decrypts
 /// only when everything else ties, so an unrelated unreadable value never blocks a clear win.
-fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> {
+fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, Verdict)> {
     let top = rows
         .iter()
         .map(Local::key)
@@ -461,7 +480,7 @@ fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> 
     let inc =
         (l.date_password_modified, l.date_created, l.date_last_used, l.times_used, l.action_url.as_str(), l.signon_realm.as_str());
     if tied.len() == 1 && inc != top {
-        return Ok((tied[0].id, inc > top));
+        return Ok((tied[0].id, if inc > top { Verdict::Wins } else { Verdict::Loses }));
     }
     if inc < top {
         let id = tied
@@ -469,7 +488,7 @@ fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> 
             .map(|r| r.id)
             .min()
             .ok_or_else(|| Error::Corrupt("login merge lost its tied rows".into()))?;
-        return Ok((id, false));
+        return Ok((id, Verdict::Loses));
     }
     // Full tie on the visible fields: the password decides. Several equal rows -> highest
     // password, lowest id, so the pick never depends on row order.
@@ -479,20 +498,21 @@ fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> 
     // password is read and a locked tied row cannot veto it. The update lands
     // on the lowest-id tied row, the same row a lost tie would have named.
     if inc > top {
-        return Ok((lowest_id, true));
+        return Ok((lowest_id, Verdict::Wins));
     }
     let mut best: Option<(String, i64)> = None;
     for r in tied {
         // A row locked to the browser itself (App-Bound) cannot be read, so it
         // cannot lose a tiebreak either: it stays, and the incoming login is
-        // the one that gives way.
+        // the one that gives way. The password was never compared, so this
+        // loss is Unreadable, not a rank loss.
         if r.blob.starts_with(b"v20") {
-            return Ok((lowest_id, false));
+            return Ok((lowest_id, Verdict::Unreadable));
         }
         let pw = match unlock(keys, &l.origin_url, &r.realm, &r.blob) {
             Ok(pw) => pw,
             Err(Error::AppBound) => {
-                return Ok((lowest_id, false));
+                return Ok((lowest_id, Verdict::Unreadable));
             }
             Err(e) => return Err(e),
         };
@@ -502,7 +522,7 @@ fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> 
         };
     }
     let (pw, id) = best.ok_or_else(|| Error::Corrupt("login merge lost its tied rows".into()))?;
-    Ok((id, inc > top || l.password_value > pw))
+    Ok((id, if inc > top || l.password_value > pw { Verdict::Wins } else { Verdict::Loses }))
 }
 
 /// How this store's v11 rows fare under `keys`: (rows carrying the v11
@@ -642,10 +662,13 @@ fn import_waiting(
                 .ok_or_else(|| Error::Corrupt("login merge was called with no local rows".into()))?;
             let inc = (l.date_password_modified, l.date_created, l.date_last_used, l.times_used, l.action_url.as_str(), l.signon_realm.as_str());
             if inc != top {
-                // The untouchable target row wins: this identity is
-                // already present in the target, in a copy that stays.
+                // The untouchable target row wins and stays, in either
+                // direction: it cannot be read, so no rank verdict is
+                // claimed. A strictly newer incoming login is dropped
+                // here too, which is exactly why this is not counted as
+                // already present.
                 stats.skipped += 1;
-                stats.already_present += 1;
+                stats.kept_unreadable += 1;
                 continue;
             }
             rows = protected_rows;
@@ -656,11 +679,16 @@ fn import_waiting(
         let text = |s: &str| SqlValue::Text(s.to_string());
 
         if !rows.is_empty() {
-            let (id, wins) = incoming_wins(&rows, l, keys)?;
-            if !wins {
-                // The target's copy won the merge: already present.
+            let (id, verdict) = incoming_wins(&rows, l, keys)?;
+            if verdict != Verdict::Wins {
                 stats.skipped += 1;
-                stats.already_present += 1;
+                match verdict {
+                    // The target's copy won the merge: already present.
+                    Verdict::Loses => stats.already_present += 1,
+                    // Kept without a comparison: not already present.
+                    Verdict::Unreadable => stats.kept_unreadable += 1,
+                    Verdict::Wins => unreachable!(),
+                }
                 continue;
             }
             let pwmod = if l.date_password_modified > 0 { l.date_password_modified } else { l.date_created };
@@ -945,7 +973,9 @@ mod tests {
         // The target holds one login under an older key; a newer incoming
         // login with the same origin and username must not UPDATE over it.
         // The unreadable row wins, its ciphertext stays byte-identical,
-        // and it is counted as preserved, not updated.
+        // and it is counted as preserved and kept-unreadable, never as
+        // already present: the incoming login is strictly newer and was
+        // dropped without a comparison.
         let (_t, p) = db();
         let old_lock = Lock::linux("old-secret", LinuxPrefix::V11);
         let seed = old_lock
@@ -961,7 +991,7 @@ mod tests {
         assert_eq!(before[0].password_value, "old-pw");
         let current = Keys::Cbc { lock: Lock::linux("new-secret", LinuxPrefix::V11), from_libsecret_v2: false };
         let stats = import(&p, &[login("u", "new-pw", D2)], &current, HostTag::Without).unwrap();
-        assert_eq!(stats, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 1 });
+        assert_eq!(stats, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 0, kept_unreadable: 1, constraint_skipped: 0, preserved_undecryptable: 1 });
         assert_eq!(count(&p), 1);
         assert_eq!(blob(&p, "u"), seed);
     }
@@ -1118,7 +1148,7 @@ mod tests {
         for tag in [HostTag::Without, HostTag::With] {
             let (_t, p) = db();
             let s = import(&p, &[login("u", "dummy-pw", D1)], &linux(), tag).unwrap();
-            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0, already_present: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
+            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0, already_present: 0, kept_unreadable: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
             let back = export(&p, &linux()).unwrap();
             assert_eq!(back, vec![login("u", "dummy-pw", D1)]);
             let raw = blob(&p, "u");
@@ -1180,7 +1210,7 @@ mod tests {
         let (_t, p) = db();
         import(&p, &[login("u", "new", D2)], &linux(), HostTag::Without).unwrap();
         let s = import(&p, &[login("u", "old", D1)], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, kept_unreadable: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
         assert_eq!(export(&p, &linux()).unwrap()[0].password_value, "new");
     }
 
@@ -1223,7 +1253,7 @@ mod tests {
         assert_eq!(export(&p1, &linux()).unwrap(), export(&p2, &linux()).unwrap());
         assert_eq!(export(&p1, &linux()).unwrap()[0].password_value, "bravo");
         let s = import(&p1, &[y], &linux(), HostTag::With).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, kept_unreadable: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
     }
 
     #[test]
@@ -1421,7 +1451,7 @@ mod tests {
         let mut l = login("", "pw", D2);
         l.action_url = String::new();
         let s = import(&p, &[l], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0, already_present: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0, already_present: 0, kept_unreadable: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
         assert_eq!(count(&p), 1);
     }
 

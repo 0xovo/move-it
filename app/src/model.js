@@ -49,18 +49,47 @@ export function reportLines(report, { local = false, otherDevice = 'your other c
     if (Number(report.alreadyPresentCookies || 0) > 0) {
       lines.push(`${plural(report.alreadyPresentCookies, 'website login', 'website logins')} already in ${report.target || 'the target'}`);
     }
+    if (Number(report.keptUnreadableLogins || 0) > 0) {
+      lines.push(`${plural(report.keptUnreadableLogins, 'saved password', 'saved passwords')} in ${report.target || 'the target'} could not be read and were kept untouched`);
+    }
+    if (Number(report.keptUnreadableCookies || 0) > 0) {
+      lines.push(`${plural(report.keptUnreadableCookies, 'website login', 'website logins')} in ${report.target || 'the target'} could not be read and were kept untouched`);
+    }
+    if (Number(report.constraintSkippedLogins || 0) > 0) {
+      const v = Number(report.constraintSkippedLogins);
+      lines.push(v === 1
+        ? `1 saved password was refused in ${report.target || 'the target'} and did not land`
+        : `${n(v)} saved passwords were refused in ${report.target || 'the target'} and did not land`);
+    }
+    if (Number(report.bookmarksConflict || 0) > 0) {
+      lines.push(`Bookmarks could not be merged into ${report.target || 'the target'} and were kept in a separate file beside it`);
+    }
     return lines;
   }
   if (report.sentProfiles) {
     lines.push(`Sent ${plural(report.sentProfiles, 'profile', 'profiles')}: ${plural(report.sentLogins, 'saved password', 'saved passwords')}, ${plural(report.sentHistoryUrls, 'history item', 'history items')}, ${plural(report.sentCookies, 'website login', 'website logins')}`);
   }
-  const received = Number(report.cookies || 0) + Number(report.logins || 0) + Number(report.historyUrls || 0);
+  const received = Number(report.cookies || 0) + Number(report.logins || 0) + Number(report.historyUrls || 0) + Number(report.historyVisitsMoved || 0);
   if (received || report.boxesRead) {
     lines.push(`Received: ${plural(report.logins, 'saved password', 'saved passwords')}, ${plural(report.historyUrls, 'history item', 'history items')}, ${plural(report.cookies, 'website login', 'website logins')}`);
   }
   const alreadySync = Number(report.alreadyPresentCookies || 0) + Number(report.alreadyPresentLogins || 0);
   if (alreadySync > 0) {
-    lines.push(`${plural(alreadySync, 'item was', 'items were')} already here and kept`);
+    lines.push(alreadySync === 1
+      ? '1 item was already in its target and kept'
+      : `${n(alreadySync)} items were already in their targets and kept`);
+  }
+  const unreadableSync = Number(report.keptUnreadableCookies || 0) + Number(report.keptUnreadableLogins || 0);
+  if (unreadableSync > 0) {
+    lines.push(unreadableSync === 1
+      ? '1 item in its target could not be read and was kept untouched'
+      : `${n(unreadableSync)} items in their targets could not be read and were kept untouched`);
+  }
+  const refusedSync = Number(report.constraintSkippedLogins || 0);
+  if (refusedSync > 0) {
+    lines.push(refusedSync === 1
+      ? '1 saved password was refused and did not land'
+      : `${n(refusedSync)} saved passwords were refused and did not land`);
   }
   if (Number(report.historyVisitsMoved || 0) > 0 && Number(report.historyUrls || 0) === 0 && !report.sentProfiles) {
     lines.push(`${plural(report.historyVisitsMoved, 'history visit', 'history visits')} moved`);

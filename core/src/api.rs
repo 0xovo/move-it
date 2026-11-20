@@ -1459,6 +1459,19 @@ pub struct MoveReport {
     /// merge skips only, never constraint skips).
     #[serde(default)]
     pub already_present_logins: u64,
+    /// Incoming cookies dropped because the target's copy could not be
+    /// read at all (never compared, so never "already present"), summed
+    /// over every landing. Same meaning as in `LocalMoveReport`.
+    #[serde(default)]
+    pub kept_unreadable_cookies: u64,
+    /// Incoming logins dropped the same way (every target row protected,
+    /// or a tie the password could not break), summed over every landing.
+    #[serde(default)]
+    pub kept_unreadable_logins: u64,
+    /// Incoming logins refused by a database constraint: they neither
+    /// landed nor were already present. Summed over every landing.
+    #[serde(default)]
+    pub constraint_skipped_logins: u64,
     /// History visits that landed (`visits_inserted + visits_updated`),
     /// including visits on urls already present; see `LocalMoveReport`.
     #[serde(default)]
@@ -1554,14 +1567,27 @@ pub struct LocalPreview {
 /// count: an extension with no saved state has nothing to carry.
 ///
 /// The `already_present_*` fields explain a low or zero moved count: they
-/// count source rows the target already held in a copy that won the merge
-/// (the cookie store's `kept_newer`, and the login store's merge skips
-/// only; login constraint skips are a different outcome and are never
-/// counted here). `history_urls` counts only urls inserted or updated, so
+/// count source rows the target already held in a copy that was read,
+/// compared, and won the merge (the cookie store's `kept_newer`, and the
+/// login store's merge skips only). Two further outcomes are counted
+/// separately and are never folded into already-present: `kept_unreadable_*`
+/// (the target's copy could not be read at all, so nothing was compared
+/// and the incoming row, possibly newer, was dropped) and
+/// `constraint_skipped_logins` (the write was refused by a database
+/// constraint, so the login neither landed nor was already there).
+/// `history_urls` counts only urls inserted or updated, so
 /// visits that landed on urls the target already had are counted
 /// separately in `history_visits_moved` (`visits_inserted +
 /// visits_updated`): a visit-only change is not hidden behind a zero
-/// `history_urls`. `summary` is the one honest line core stands behind
+/// `history_urls`. The summary's moved figure counts distinct things
+/// landed (cookies, logins, history urls, extensions, and a bookmarks
+/// file that landed in the target): visits are never added to it, because
+/// a new url and its visits are one thing landed, and visits on urls
+/// already present have their own figure in `history_visits_moved`. A
+/// bookmarks file that conflicts is not a move either (nothing lands in
+/// the target Bookmarks file; it is parked beside it), so it is counted
+/// in `bookmarks_conflict`, never in the moved figure. `summary` is the
+/// one honest line core stands behind
 /// for the whole move; the harness progress stream and the app shell both
 /// surface it, so every surface agrees on what happened.
 #[derive(Debug, Default, PartialEq, Serialize)]
@@ -1594,6 +1620,27 @@ pub struct LocalMoveReport {
     /// show up in `history_urls`.
     #[serde(default)]
     pub history_visits_moved: u64,
+    /// Source cookies dropped because the target's copy of the same
+    /// identity could not be read at all (a v20 row, a dead-key row, or
+    /// an App-Bound decrypt): kept untouched, never compared, and never
+    /// counted as already present, because the incoming copy may be newer.
+    #[serde(default)]
+    pub kept_unreadable_cookies: u64,
+    /// Source logins dropped the same way: every target row for the
+    /// identity was protected, or a full visible tie could not be broken
+    /// because the password would not unlock.
+    #[serde(default)]
+    pub kept_unreadable_logins: u64,
+    /// Source logins refused by a database constraint (for example a
+    /// UNIQUE collision on a realm rewrite): they neither landed nor
+    /// were already present, and the summary says so.
+    #[serde(default)]
+    pub constraint_skipped_logins: u64,
+    /// 1 when the bookmarks file could not be merged into the target
+    /// and was kept beside it for manual reconcile; 0 otherwise. A
+    /// conflict is not a move: nothing landed in the target file.
+    #[serde(default)]
+    pub bookmarks_conflict: u64,
     /// The one-line summary of the move, built by core (see
     /// `local_move_summary`): never an unconditional success line when
     /// nothing was applied to a non-empty source.
@@ -1602,19 +1649,76 @@ pub struct LocalMoveReport {
 }
 
 /// The honest one-line summary of a same-device move, from the same
-/// counts the report carries. A move that applied nothing while the
-/// target already held the source rows is a converged success, not an
-/// error and not an unexplained "everything moved": it says the target
-/// already has all of this. A partial overlap says both halves.
-fn local_move_summary(target: &str, moved: u64, already_present: u64) -> String {
-    if moved == 0 && already_present > 0 {
-        format!("Nothing new to move: {target} already has all of this")
-    } else if moved > 0 && already_present > 0 {
-        format!("Moved {moved}, already had {already_present}")
-    } else if moved == 0 {
-        "Nothing to move".to_string()
+/// counts the report carries. `moved` counts distinct things landed
+/// (visits excluded; see `LocalMoveReport`), `visits_moved` is the
+/// separate visit figure. Truth table over the outcome classes:
+/// - nothing landed, already present, nothing unreadable or refused:
+///   the target already has all of this (a converged success, not an
+///   error and not an unexplained "everything moved").
+/// - something landed, the rest already present, nothing unreadable or
+///   refused: both halves are named.
+/// - anything kept unreadable, refused by a constraint, or parked as a
+///   bookmarks conflict: those rows are named in the line, and the line
+///   never claims "all of this" or a bare "Everything moved", because
+///   those rows neither landed nor were already there.
+/// - a genuinely empty move: "Nothing to move".
+fn local_move_summary(
+    target: &str,
+    moved: u64,
+    visits_moved: u64,
+    already_present: u64,
+    kept_unreadable: u64,
+    constraint_skipped: u64,
+    bookmarks_conflict: u64,
+) -> String {
+    let mut notes: Vec<String> = Vec::new();
+    if kept_unreadable > 0 {
+        let (item, verb) = if kept_unreadable == 1 { ("item", "was") } else { ("items", "were") };
+        notes.push(format!(
+            "{kept_unreadable} {item} in {target} could not be read and {verb} kept untouched"
+        ));
+    }
+    if constraint_skipped > 0 {
+        let (item, verb) =
+            if constraint_skipped == 1 { ("saved password", "was") } else { ("saved passwords", "were") };
+        notes.push(format!(
+            "{constraint_skipped} {item} {verb} refused in {target} and did not land"
+        ));
+    }
+    if bookmarks_conflict > 0 {
+        notes.push(format!(
+            "the bookmarks file could not be merged into {target} and was kept beside it"
+        ));
+    }
+    let landed = moved > 0 || visits_moved > 0;
+    // Visits are named as visits only when they are all that landed;
+    // otherwise the figure is the distinct-things count.
+    let moved_clause = if moved > 0 {
+        format!("Moved {moved}")
     } else {
-        "Everything moved".to_string()
+        format!("Moved {visits_moved} visits")
+    };
+    if notes.is_empty() {
+        if !landed && already_present > 0 {
+            format!("Nothing new to move: {target} already has all of this")
+        } else if !landed {
+            "Nothing to move".to_string()
+        } else if already_present > 0 {
+            format!("{moved_clause}, already had {already_present}")
+        } else {
+            "Everything moved".to_string()
+        }
+    } else {
+        let base = if landed && already_present > 0 {
+            format!("{moved_clause}, already had {already_present}")
+        } else if landed {
+            moved_clause
+        } else if already_present > 0 {
+            "Nothing new to move".to_string()
+        } else {
+            "Nothing moved".to_string()
+        };
+        format!("{base}; {}", notes.join("; "))
     }
 }
 
@@ -2469,6 +2573,12 @@ impl App {
                                 (l.applied.logins.inserted + l.applied.logins.updated) as u64;
                             report.already_present_logins +=
                                 l.applied.logins.already_present as u64;
+                            report.kept_unreadable_cookies +=
+                                l.applied.cookies.kept_unreadable as u64;
+                            report.kept_unreadable_logins +=
+                                l.applied.logins.kept_unreadable as u64;
+                            report.constraint_skipped_logins +=
+                                l.applied.logins.constraint_skipped as u64;
                             if let Some(h) = &l.applied.history {
                                 report.history_urls += (h.urls_inserted + h.urls_updated) as u64;
                                 report.history_visits_moved +=
@@ -3189,6 +3299,9 @@ impl App {
             .unwrap_or(0);
         let already_present_cookies = applied.cookies.kept_newer as u64;
         let already_present_logins = applied.logins.already_present as u64;
+        let kept_unreadable_cookies = applied.cookies.kept_unreadable as u64;
+        let kept_unreadable_logins = applied.logins.kept_unreadable as u64;
+        let constraint_skipped_logins = applied.logins.constraint_skipped as u64;
         let report = {
             let cookies = applied.cookies.imported as u64;
             let logins = (applied.logins.inserted + applied.logins.updated) as u64;
@@ -3198,29 +3311,29 @@ impl App {
                 .map(|h| (h.urls_inserted + h.urls_updated) as u64)
                 .unwrap_or(0);
             let extensions = applied.extensions.ids.len() as u64;
-            // What actually changed hands, for the summary: the moved
-            // counts above, plus visits that landed on already-present
-            // urls and a bookmarks file that was written, merged or kept
-            // as a sibling (an identical bookmarks file is carried but
-            // changes nothing, so it does not count as moved).
+            // What actually changed hands, for the summary: the distinct
+            // things that landed. Visits are not added (a new url and its
+            // visits are one thing; visits on already-present urls keep
+            // their own figure in `history_visits_moved`). A bookmarks
+            // file counts only when it landed in the target (written or
+            // merged): a conflict parks the file beside the target, so
+            // nothing landed and it is reported as a conflict instead.
+            // An identical bookmarks file changes nothing either way.
             let bookmarks_moved = matches!(
                 applied.bookmarks.action,
-                Some(
-                    bookmarks::Action::Written
-                        | bookmarks::Action::Merged
-                        | bookmarks::Action::Conflict
-                )
+                Some(bookmarks::Action::Written | bookmarks::Action::Merged)
             );
-            let moved = cookies
-                + logins
-                + history_urls
-                + history_visits_moved
-                + extensions
-                + u64::from(bookmarks_moved);
+            let bookmarks_conflict =
+                matches!(applied.bookmarks.action, Some(bookmarks::Action::Conflict));
+            let moved = cookies + logins + history_urls + extensions + u64::from(bookmarks_moved);
             let summary = local_move_summary(
                 &dst.display,
                 moved,
+                history_visits_moved,
                 already_present_cookies + already_present_logins,
+                kept_unreadable_cookies + kept_unreadable_logins,
+                constraint_skipped_logins,
+                u64::from(bookmarks_conflict),
             );
             LocalMoveReport {
                 source: src.display.clone(),
@@ -3235,6 +3348,10 @@ impl App {
                 already_present_cookies,
                 already_present_logins,
                 history_visits_moved,
+                kept_unreadable_cookies,
+                kept_unreadable_logins,
+                constraint_skipped_logins,
+                bookmarks_conflict: u64::from(bookmarks_conflict),
                 summary,
             }
         };

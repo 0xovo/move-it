@@ -1076,3 +1076,268 @@ fn local_move_repeat_move_reports_already_present_never_bare_zero() {
     assert_eq!(second.summary, "Nothing new to move: Google Chrome already has all of this");
     assert_eq!(events.last().unwrap().line, second.summary);
 }
+
+/// Plant a raw cookie row with an explicit encrypted_value blob: the rows
+/// no import would ever write (v20, dead-key) are planted byte for byte.
+fn plant_raw_cookie(dir: &Path, name: &str, blob: Vec<u8>, created: i64) {
+    let con = rusqlite::Connection::open(dir.join("Default/Cookies")).unwrap();
+    con.execute(
+        "INSERT INTO cookies (creation_utc, host_key, name, path, encrypted_value) VALUES (?1, '.example.com', ?2, '/', ?3)",
+        rusqlite::params![created, name, blob],
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_move_v20_target_cookie_counts_unreadable_not_already_present() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_dedupe_profile(&src, 300, &["sess"], &[], &[]);
+    plant_dedupe_profile(&dst, 200, &["own"], &[], &[]);
+    // The target also holds the source cookie's identity as a v20 row:
+    // locked to the target browser itself, unreadable from outside, so
+    // the incoming (newer) cookie is dropped without any comparison.
+    let mut blob = b"v20".to_vec();
+    blob.extend_from_slice(&[7u8; 40]);
+    plant_raw_cookie(&dst, "sess", blob.clone(), 100);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 0, "the incoming cookie is dropped");
+    assert_eq!(report.already_present_cookies, 0, "an unreadable row is never already present");
+    assert_eq!(report.kept_unreadable_cookies, 1, "the v20 drop is counted as kept unreadable");
+    assert!(
+        !report.summary.contains("already has all of this"),
+        "the summary must not claim the target has all of this: {}",
+        report.summary
+    );
+    assert!(
+        report.summary.contains("could not be read"),
+        "the summary names the unreadable kept row in plain words: {}",
+        report.summary
+    );
+    let now: Vec<u8> = rusqlite::Connection::open(dst.join("Default/Cookies"))
+        .unwrap()
+        .query_row("SELECT encrypted_value FROM cookies WHERE name='sess'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(now, blob, "the v20 row is byte-identical afterwards");
+}
+
+#[test]
+fn local_move_dead_key_target_cookie_counts_unreadable_not_already_present() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_dedupe_profile(&src, 300, &["sess"], &[], &[]);
+    plant_dedupe_profile(&dst, 200, &["own"], &[], &[]);
+    // One readable v11 cookie in the target, so the destination key gate
+    // (at least one v11 row must open when v11 rows exist) stays green
+    // while the dead row below stays unreadable. Planted raw: an import
+    // would re-seal it under the store's voted prefix (v10 here).
+    let own2_blob = Lock::linux(KEYRING_SECRET, LinuxPrefix::V11)
+        .encrypt(".example.com", "v-own2", HostTag::With)
+        .unwrap();
+    plant_raw_cookie(&dst, "own2", own2_blob, 200);
+    // The target's copy of the source cookie was written under a key that
+    // rotated away: it lands in the scan's dead set and cannot be read.
+    // The blob is v11 (authenticated), so the wrong key fails for sure;
+    // a v10 blob is unauthenticated CBC and a wrong key can "decrypt" it
+    // into garbage, which is why the store's own dead-row test uses v11.
+    let rotated = Lock::linux("rotated-away", LinuxPrefix::V11);
+    let blob = rotated.encrypt(".example.com", "old-value", HostTag::With).unwrap();
+    plant_raw_cookie(&dst, "sess", blob, 100);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 0, "the incoming cookie is dropped");
+    assert_eq!(report.already_present_cookies, 0, "a dead-key row is never already present");
+    assert_eq!(report.kept_unreadable_cookies, 1, "the dead-key drop is counted as kept unreadable");
+    assert_eq!(report.preserved_cookies, 1, "the dead row itself is counted preserved");
+    assert!(!report.summary.contains("already has all of this"), "summary: {}", report.summary);
+    assert!(report.summary.contains("could not be read"), "summary: {}", report.summary);
+}
+
+#[test]
+fn local_move_newer_login_against_protected_target_counts_unreadable() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_dedupe_profile(&src, 900, &[], &["alice"], &[]);
+    plant_dedupe_profile(&dst, 100, &[], &["carol"], &[]);
+    // The target also holds alice, as a v20 row no outside key can read,
+    // stamped far older than the incoming login: the incoming login is
+    // strictly newer on every visible field and is still dropped.
+    let mut blob = b"v20".to_vec();
+    blob.extend_from_slice(&[9u8; 40]);
+    let con = rusqlite::Connection::open(dst.join("Default/Login Data")).unwrap();
+    con.execute(
+        "INSERT INTO logins (origin_url, username_value, password_value, date_created, date_last_used, date_password_modified, signon_realm, times_used) VALUES ('https://example.com/', 'alice', ?1, 1, 1, 1, 'https://example.com', 0)",
+        rusqlite::params![blob],
+    )
+    .unwrap();
+    drop(con);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.logins, 0, "the incoming login is dropped");
+    assert_eq!(report.already_present_logins, 0, "a protected row is never already present");
+    assert_eq!(
+        report.kept_unreadable_logins, 1,
+        "a strictly newer login dropped against a protected row is kept unreadable"
+    );
+    assert!(!report.summary.contains("already has all of this"), "summary: {}", report.summary);
+    assert!(report.summary.contains("could not be read"), "summary: {}", report.summary);
+}
+
+/// The incoming bob whose realm rewrite must collide: newer than both
+/// target rows on every visible field, with the second row's realm.
+fn colliding_bob() -> Login {
+    Login {
+        origin_url: "https://example.com/".into(),
+        action_url: "https://example.com/login".into(),
+        username_value: "bob".into(),
+        password_value: "pw-bob".into(),
+        date_created: 900,
+        date_last_used: 900,
+        times_used: 1,
+        signon_realm: "https://b.example".into(),
+        date_password_modified: 900,
+    }
+}
+
+/// Plant the target side of a realm collision: two rows for bob at the
+/// same origin, differing only by realm, under Chromium's UNIQUE index,
+/// so a winning incoming bob whose realm would be rewritten onto the
+/// other row is refused by the constraint. The password blobs are empty:
+/// the merge never has to read them, because the incoming login wins on
+/// the visible fields alone.
+fn plant_realm_collision_target(dir: &Path) {
+    let con = rusqlite::Connection::open(dir.join("Default/Login Data")).unwrap();
+    for (realm, created) in [("https://a.example", 5i64), ("https://b.example", 4)] {
+        con.execute(
+            "INSERT INTO logins (origin_url, username_element, username_value, password_element, password_value, date_created, date_last_used, date_password_modified, signon_realm, times_used) VALUES ('https://example.com/', '', 'bob', '', x'', ?1, ?1, ?1, ?2, 1)",
+            rusqlite::params![created, realm],
+        )
+        .unwrap();
+    }
+    con.execute(
+        "CREATE UNIQUE INDEX logins_realm_collision ON logins (origin_url, username_element, username_value, password_element, signon_realm)",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_move_constraint_skipped_login_blocks_all_of_this_summary() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    // Source: one cookie the target already holds newer, plus bob.
+    fresh_profile(&src);
+    cookies::import(&src.join("Default/Cookies"), &[cookie(".example.com", "sess", "v-sess", 100)], &keys()).unwrap();
+    logins::import(&src.join("Default/Login Data"), &[colliding_bob()], &keys(), HostTag::Without).unwrap();
+    // Target: the same cookie newer, and the realm collision for bob.
+    fresh_profile(&dst);
+    cookies::import(&dst.join("Default/Cookies"), &[cookie(".example.com", "sess", "v-sess", 200)], &keys()).unwrap();
+    plant_realm_collision_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!((report.cookies, report.logins), (0, 0), "nothing lands");
+    assert_eq!(report.already_present_cookies, 1, "the cookie was already there, newer");
+    assert_eq!(report.already_present_logins, 0, "the refused login was not already there");
+    assert_eq!(report.constraint_skipped_logins, 1, "the refusal is carried in the report");
+    assert!(
+        !report.summary.contains("already has all of this"),
+        "a refused login is not in the target, so the summary must not claim it is: {}",
+        report.summary
+    );
+    assert!(report.summary.contains("refused"), "the summary mentions the refusal: {}", report.summary);
+    assert_eq!(
+        report.summary,
+        "Nothing new to move; 1 saved password was refused in Google Chrome and did not land"
+    );
+}
+
+#[test]
+fn local_move_constraint_skipped_login_blocks_everything_moved_summary() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    // Source: alice, who lands, plus bob, who collides.
+    fresh_profile(&src);
+    logins::import(
+        &src.join("Default/Login Data"),
+        &[login("alice", "pw-a", 900), colliding_bob()],
+        &keys(),
+        HostTag::Without,
+    )
+    .unwrap();
+    fresh_profile(&dst);
+    plant_realm_collision_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.logins, 1, "alice lands");
+    assert_eq!(report.constraint_skipped_logins, 1, "bob is refused and carried in the report");
+    assert_ne!(report.summary, "Everything moved", "one login neither landed nor was already there");
+    assert!(report.summary.contains("refused"), "the summary mentions the refusal: {}", report.summary);
+    assert_eq!(
+        report.summary,
+        "Moved 1; 1 saved password was refused in Google Chrome and did not land"
+    );
+}
+
+#[test]
+fn local_move_history_url_and_visit_count_once_in_summary() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 1000, vec![1000])];
+    plant_dedupe_profile(&src, 100, &["sess"], &[], hist_src);
+    plant_dedupe_profile(&dst, 200, &["sess"], &[], &[]);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.history_urls, 1, "the new url lands");
+    assert_eq!(report.history_visits_moved, 1, "its visit lands and keeps its own figure");
+    assert_eq!(report.already_present_cookies, 1);
+    assert_eq!(
+        report.summary, "Moved 1, already had 1",
+        "the url and its visit are one thing landed, not two"
+    );
+}
+
+#[test]
+fn local_move_bookmarks_conflict_is_not_counted_as_moved() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    fresh_profile(&src);
+    fresh_profile(&dst);
+    // The source bookmarks file is not a bookmark tree at all: it cannot
+    // be merged into the target file and is parked beside it instead.
+    std::fs::write(src.join("Default/Bookmarks"), b"this is not a bookmark tree").unwrap();
+    plant_bookmarks(&dst);
+    let dst_bookmarks_before = std::fs::read(dst.join("Default/Bookmarks")).unwrap();
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.bookmarks_conflict, 1, "the conflict is acknowledged as its own count");
+    assert_ne!(report.summary, "Everything moved", "nothing landed in the target bookmarks");
+    assert_eq!(
+        report.summary,
+        "Nothing moved; the bookmarks file could not be merged into Google Chrome and was kept beside it"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("Default/Bookmarks")).unwrap(),
+        dst_bookmarks_before,
+        "the target bookmarks file is untouched"
+    );
+    let parked = std::fs::read_dir(dst.join("Default"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("Bookmarks.moveit-incoming-"));
+    assert!(parked, "the incoming file is parked beside the target bookmarks");
+}

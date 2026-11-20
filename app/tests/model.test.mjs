@@ -81,3 +81,30 @@ test('a lone profile is preselected, several are not', () => {
   assert.equal(preselectedSlot([{ slot: 'Default' }, { slot: 'Profile 1' }]), null);
   assert.equal(preselectedSlot([]), null);
 });
+
+test('sync already-present wording is aggregate, not per-place', () => {
+  // The sync sums span every landing in every target, so the line must
+  // not claim a single "here".
+  const lines = reportLines({ cookies: 0, logins: 0, historyUrls: 0, alreadyPresentCookies: 2, alreadyPresentLogins: 1, boxesRead: 1 });
+  assert(lines.some(l => /3 items were already in their targets and kept/.test(l)), lines.join(' | '));
+  assert(!lines.some(l => /already here/.test(l)), lines.join(' | '));
+});
+
+test('a visits-only sync report does not also say nothing new to move', () => {
+  const lines = reportLines({ cookies: 0, logins: 0, historyUrls: 0, historyVisitsMoved: 2 });
+  assert(lines.some(l => /2 history visits moved/.test(l)), lines.join(' | '));
+  assert(!lines.some(l => /Nothing new to move/.test(l)), lines.join(' | '));
+});
+
+test('local lines name unreadable, refused and conflict outcomes', () => {
+  const lines = reportLines({
+    summary: 'Moved 1; 1 saved password was refused in Google Chrome and did not land',
+    logins: 1, historyUrls: 0, historyVisitsMoved: 0, cookies: 0,
+    alreadyPresentLogins: 0, alreadyPresentCookies: 0,
+    keptUnreadableCookies: 1, constraintSkippedLogins: 1, bookmarksConflict: 1,
+    target: 'Google Chrome',
+  }, { local: true });
+  assert(lines.some(l => /could not be read and were kept untouched/.test(l)), lines.join(' | '));
+  assert(lines.some(l => /was refused in Google Chrome and did not land/.test(l)), lines.join(' | '));
+  assert(lines.some(l => /Bookmarks could not be merged/.test(l)), lines.join(' | '));
+});

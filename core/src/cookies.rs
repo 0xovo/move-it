@@ -66,7 +66,18 @@ impl Cookie {
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Stats {
     pub imported: usize,
+    /// Incoming cookies dropped because the target's copy of the same
+    /// identity was read, compared, and won the merge (newer or equal).
+    /// Only this counter means "already present": the other drop path,
+    /// `kept_unreadable`, never compares anything.
     pub kept_newer: usize,
+    /// Incoming cookies dropped because the target's copy of the same
+    /// identity could not be read at all (a v20 App-Bound row, a row in
+    /// the dead-key scan, or a decrypt that returns App-Bound). The
+    /// target row is kept untouched, but it is NOT known to hold an
+    /// equivalent copy: the incoming value may well be newer, so these
+    /// must never be reported as already present.
+    pub kept_unreadable: usize,
     /// Existing target rows no available key could decrypt. They are left
     /// byte-for-byte untouched and never block the move.
     pub preserved_undecryptable: usize,
@@ -542,7 +553,8 @@ fn import_inner(
                 // The row already there is locked to this browser itself: it
                 // cannot be read or compared from outside, so it stays untouched
                 // and the incoming row is dropped, never the other way round.
-                stats.kept_newer += 1;
+                // Nothing was compared, so this is not "already present".
+                stats.kept_unreadable += 1;
                 continue;
             } else if dead.contains(rowid) {
                 // The row already there was written under a key that no
@@ -550,14 +562,16 @@ fn import_inner(
                 // cannot be read or compared, so it stays byte-for-byte
                 // untouched and the incoming row is dropped, exactly like
                 // the App-Bound case; the row itself is counted in
-                // preserved_undecryptable.
-                stats.kept_newer += 1;
+                // preserved_undecryptable. Nothing was compared, so this
+                // is not "already present" either.
+                stats.kept_unreadable += 1;
                 continue;
             } else {
                 match keys.lock().decrypt(&c.host, enc) {
                     Ok(v) => v,
                     Err(Error::AppBound) => {
-                        stats.kept_newer += 1;
+                        // Unreadable, never compared: not "already present".
+                        stats.kept_unreadable += 1;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -1014,7 +1028,7 @@ mod tests {
             &keys(),
         )
         .unwrap();
-        assert_eq!(s, Stats { imported: 1, kept_newer: 1, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { imported: 1, kept_newer: 0, kept_unreadable: 1, preserved_undecryptable: 0 });
         // The locked row is still there, still locked; the other cookie landed.
         let raw: Vec<u8> = Connection::open(&p)
             .unwrap()
@@ -1086,7 +1100,8 @@ mod tests {
             .unwrap();
         let stats = import(&p, &[cookie(".dead.com", "same", "new-value", 9)], &current).unwrap();
         assert_eq!(stats.imported, 0);
-        assert_eq!(stats.kept_newer, 1);
+        assert_eq!(stats.kept_newer, 0);
+        assert_eq!(stats.kept_unreadable, 1);
         assert_eq!(stats.preserved_undecryptable, 1);
         let now: Vec<u8> = Connection::open(&p)
             .unwrap()
@@ -1101,10 +1116,10 @@ mod tests {
         import(&p, &[cookie(".a.com", "sid", "v2", 200)], &keys()).unwrap();
         // Older creation loses.
         let s = import(&p, &[cookie(".a.com", "sid", "v1", 100)], &keys()).unwrap();
-        assert_eq!(s, Stats { imported: 0, kept_newer: 1, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { imported: 0, kept_newer: 1, kept_unreadable: 0, preserved_undecryptable: 0 });
         // Newer creation wins.
         let s = import(&p, &[cookie(".a.com", "sid", "v3", 300)], &keys()).unwrap();
-        assert_eq!(s, Stats { imported: 1, kept_newer: 0, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { imported: 1, kept_newer: 0, kept_unreadable: 0, preserved_undecryptable: 0 });
         assert_eq!(export(&p, &keys()).unwrap()[0].value, "v3");
     }
 
