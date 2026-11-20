@@ -478,14 +478,74 @@ fn incoming_wins(rows: &[Local], l: &Login, keys: &Keys) -> Result<(i64, bool)> 
     Ok((id, inc > top || l.password_value > pw))
 }
 
+/// How this store's v11 rows fare under `keys`: (rows carrying the v11
+/// label, of those how many decrypt). The login twin of
+/// `cookies::v11_decryption`; see it for why v10 rows cannot validate a
+/// keyring key. A missing store counts as (0, 0).
+pub fn v11_decryption(path: &Path, keys: &Keys) -> (usize, usize) {
+    if !path.exists() {
+        return (0, 0);
+    }
+    let Ok((_scratch, copy)) = crate::util::snapshot_db(path) else { return (0, 0) };
+    let Ok(con) = open(&copy, Duration::from_secs(5)) else { return (0, 0) };
+    let Ok(mut st) = con.prepare("SELECT origin_url, signon_realm, password_value FROM logins") else {
+        return (0, 0);
+    };
+    let Ok(rows) = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(sql)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql))
+    else {
+        return (0, 0);
+    };
+    let mut total = 0;
+    let mut opened = 0;
+    for (origin, realm, blob) in &rows {
+        if blob.starts_with(b"v11") {
+            total += 1;
+            if unlock(keys, origin, realm, blob).is_ok() {
+                opened += 1;
+            }
+        }
+    }
+    (total, opened)
+}
+
 /// Merge `incoming` into the Login Data at `path`, inside one transaction. `tag` says whether
 /// new values are written with SHA256(host) in front of the password (the reference does;
 /// callers default to `HostTag::Without`). A missing file is left alone.
 pub fn import(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag) -> Result<Stats> {
-    import_waiting(path, incoming, keys, tag, Duration::from_secs(5))
+    import_waiting(path, incoming, keys, tag, Duration::from_secs(5), None)
 }
 
-fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wait: Duration) -> Result<Stats> {
+/// Like [`import`], but every value is written under `prefix` instead of
+/// the label the store's existing rows vote for. The cookie twin is
+/// `cookies::import_with_write_prefix`; see it for why the same-device
+/// move forces the label.
+pub fn import_with_write_prefix(
+    path: &Path,
+    incoming: &[Login],
+    keys: &Keys,
+    tag: HostTag,
+    prefix: LinuxPrefix,
+) -> Result<Stats> {
+    import_waiting(path, incoming, keys, tag, Duration::from_secs(5), Some(prefix))
+}
+
+fn import_waiting(
+    path: &Path,
+    incoming: &[Login],
+    keys: &Keys,
+    tag: HostTag,
+    wait: Duration,
+    forced_prefix: Option<LinuxPrefix>,
+) -> Result<Stats> {
     let mut stats = Stats::default();
     if !path.exists() {
         return Ok(stats);
@@ -496,7 +556,10 @@ fn import_waiting(path: &Path, incoming: &[Login], keys: &Keys, tag: HostTag, wa
         return Err(Error::Corrupt("the Login Data database has no logins table".into()));
     }
     let tx = con.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-    let prefix = resolve_write_prefix(&tx, keys)?;
+    let prefix = match forced_prefix {
+        Some(p) if matches!(keys, Keys::Cbc { .. }) => Some(p),
+        _ => resolve_write_prefix(&tx, keys)?,
+    };
     let mut protected: std::collections::HashSet<i64> = std::collections::HashSet::new();
     if !incoming.is_empty() {
         let scan = scan_target(&tx, keys, prefix)?;
@@ -1184,7 +1247,7 @@ mod tests {
         let before = std::fs::read(&p).unwrap();
         let hold = Connection::open(&p).unwrap();
         hold.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        let err = import_waiting(&p, &[login("v", "pw", D2)], &linux(), HostTag::Without, Duration::from_millis(50)).unwrap_err();
+        let err = import_waiting(&p, &[login("v", "pw", D2)], &linux(), HostTag::Without, Duration::from_millis(50), None).unwrap_err();
         assert_eq!(err, Error::BrowserOpen);
         hold.execute_batch("ROLLBACK").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), before);

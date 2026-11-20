@@ -55,14 +55,20 @@ fn make_db(path: &Path, schema: &str) {
     con.execute_batch(schema).unwrap();
 }
 
-/// The keys the fixtures are planted with. The surface discovers the browser
-/// password itself; the env override pins it to the same word so fixtures open.
+/// The keyring secret the fixtures share. The surface discovers the browser
+/// password itself; the env override pins it to this word so fixtures open.
+/// It is deliberately NOT the compiled-in fallback ("peanuts"): a
+/// same-device move writes under the destination's validated keyring key
+/// (v11) and refuses a fallback destination key, so the fixtures' shared
+/// secret stands in for the keyring key both browsers hold here.
+const KEYRING_SECRET: &str = "moveit-test-keyring-secret";
+
 fn keys() -> Keys {
-    Keys::Cbc { lock: Lock::linux("peanuts", LinuxPrefix::V10), from_libsecret_v2: false }
+    Keys::Cbc { lock: Lock::linux(KEYRING_SECRET, LinuxPrefix::V10), from_libsecret_v2: false }
 }
 
 fn pin_browser_password() {
-    std::env::set_var("MOVEIT_LINUX_PASSWORD", "peanuts");
+    std::env::set_var("MOVEIT_LINUX_PASSWORD", KEYRING_SECRET);
 }
 
 fn fresh_profile(dir: &Path) {

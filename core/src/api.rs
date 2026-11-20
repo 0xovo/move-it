@@ -626,6 +626,64 @@ impl App {
         Ok(Keys::Cbc { lock: Lock::linux(&password, LinuxPrefix::V10), from_libsecret_v2 })
     }
 
+    /// The destination keys for a same-device move: the destination
+    /// browser's own keyring key, found through the validated probing
+    /// (`oscrypt::linux_browser_password_validated_for`, the route the
+    /// harness logins probe uses), never the single first candidate
+    /// `keys_for` returns. A candidate counts as validated when it
+    /// decrypts at least one v11 row in each of the destination's
+    /// stores that carries v11 rows; a store with no v11 rows cannot
+    /// disprove a keyring-found key (its v10 rows open under the
+    /// fallback key whatever is offered, so they prove nothing).
+    ///
+    /// The move writes under this key with the v11 label, so the key
+    /// must be a real keyring key: when discovery finds only the
+    /// compiled-in fallback, or no candidate validates against the
+    /// destination's own v11 rows, this refuses loudly instead of
+    /// letting the move seal secrets under a publicly known key. The
+    /// returned keys carry the v11 trust flag: a validated keyring key
+    /// is trusted to seed v11 rows in an empty store, the same trust
+    /// `verify_write_key` asks for, extended from Chromium's v2 item
+    /// to any browser whose key validated here.
+    fn keys_for_local_destination(&self, browser: &str, dir: &Path, slot: &str) -> Result<Keys> {
+        let b = LinuxBrowser::from_name(browser).ok_or_else(|| {
+            Error::Refused(format!("{} is not a browser Move It can read yet", browser_display(browser)))
+        })?;
+        let cookies_p = paths::cookies_in(dir, slot);
+        let logins_p = paths::login_data_in(dir, slot);
+        let opens_destination = |pw: &str| -> bool {
+            let keys = Keys::Cbc {
+                lock: Lock::linux(pw, LinuxPrefix::V10),
+                from_libsecret_v2: true,
+            };
+            let (c_total, c_opened) = crate::cookies::v11_decryption(&cookies_p, &keys);
+            let (l_total, l_opened) = logins::v11_decryption(&logins_p, &keys);
+            (c_total == 0 || c_opened > 0) && (l_total == 0 || l_opened > 0)
+        };
+        let (password, _from_v2) = crate::oscrypt::linux_browser_password_validated_for(
+            b,
+            &|pw, _from_trusted| opens_destination(pw),
+        )?;
+        if password == crate::oscrypt::LINUX_FALLBACK_PASSWORD {
+            return Err(Error::Refused(format!(
+                "no keyring key for {} was found on this device, so the move would have to seal \
+                 secrets with the browser's public fallback key; Move It will not write those secrets",
+                browser_display(browser)
+            )));
+        }
+        if !opens_destination(&password) {
+            return Err(Error::Refused(format!(
+                "the keyring key found for {} does not open that browser's existing v11 cookies \
+                 or logins, so it cannot be the key its profile was sealed with; the move is refused",
+                browser_display(browser)
+            )));
+        }
+        Ok(Keys::Cbc {
+            lock: Lock::linux(&password, LinuxPrefix::V11),
+            from_libsecret_v2: true,
+        })
+    }
+
     /// All profiles on this device: every family browser folder under the config
     /// base, every slot the browser itself lists. A pinned working profile whose
     /// folder sits outside the usual places is listed too, so the shell's pick is
@@ -2911,9 +2969,10 @@ impl App {
         // If either browser's own password cannot even be attempted, the move
         // can never start (reading needs the source's keys, writing needs the
         // target's), so refuse here with the same error instead of showing
-        // counts that promise a move.
+        // counts that promise a move. The target's bar is the move's own:
+        // its key must be a validated keyring key, not the fallback.
         self.keys_for(&src.browser)?;
-        self.keys_for(&dst.browser)?;
+        self.keys_for_local_destination(&dst.browser, &dst.dir, dst_slot)?;
         let (counts, mut skipped) = self.count_stores(&src, src_slot);
         let locked_cookies = count_locked_cookies_in(&src.dir, src_slot);
         if locked_cookies > 0 {
@@ -2982,7 +3041,11 @@ impl App {
             return Err(Error::BrowserOpen);
         }
         let src_keys = self.keys_for(&src.browser)?;
-        let dst_keys = self.keys_for(&dst.browser)?;
+        // The destination key is the validated keyring key, obtained
+        // before anything is read or recovered: a destination whose key
+        // cannot be obtained or validated fails the move here, before
+        // a single secret is written anywhere.
+        let dst_keys = self.keys_for_local_destination(&dst.browser, &dst.dir, dst_slot)?;
         // A crashed earlier move is put back before a new one, on BOTH
         // browsers: the source may itself be the survivor of a crashed move
         // (as an earlier target), and reading it half-moved would carry the
@@ -3016,7 +3079,11 @@ impl App {
             browser: &dst.browser,
             display: &dst.display,
         };
-        let applied = engine::import(&dst_prof, &payload, now_micros())?;
+        // Written under the destination's validated keyring key with
+        // the v11 label, never the store-vote label: the vote falls
+        // back to the compiled-in fallback key on legacy or empty
+        // destination stores.
+        let applied = engine::import_with_write_prefix(&dst_prof, &payload, now_micros(), LinuxPrefix::V11)?;
         self.record_landings(&BTreeSet::from([dst.dir.clone()]), &self.load_landed())?;
 
         let report = LocalMoveReport {

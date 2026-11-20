@@ -389,10 +389,69 @@ fn default_for(col: &str, c: &Cookie) -> SqlValue {
     }
 }
 
+/// How this store's v11 rows fare under `keys`: (rows carrying the v11
+/// label, of those how many decrypt). The same-device move validates a
+/// candidate destination key against exactly this: v10 rows open under
+/// the compiled-in fallback key whatever candidate is offered, so they
+/// can never prove a keyring key (caveat N2 in the registry report); a
+/// missing store counts as (0, 0).
+pub fn v11_decryption(path: &Path, keys: &Keys) -> (usize, usize) {
+    if !path.exists() {
+        return (0, 0);
+    }
+    let Ok((_scratch, copy)) = crate::util::snapshot_db(path) else { return (0, 0) };
+    let Ok(con) = open(&copy) else { return (0, 0) };
+    let Ok(mut st) = con.prepare("SELECT host_key, encrypted_value FROM cookies") else {
+        return (0, 0);
+    };
+    let Ok(rows) = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+        .map_err(sql)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql))
+    else {
+        return (0, 0);
+    };
+    let mut total = 0;
+    let mut opened = 0;
+    for (host, enc) in &rows {
+        if enc.starts_with(b"v11") {
+            total += 1;
+            if keys.lock().decrypt(host, enc).is_ok() {
+                opened += 1;
+            }
+        }
+    }
+    (total, opened)
+}
+
 /// Merge `incoming` into the cookies at `path`, inside one transaction. The caller takes the
 /// atomic journal (txn.rs) around the whole move; this owns only the SQLite transaction so a
 /// locked database (browser open) changes nothing.
 pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
+    import_inner(path, incoming, keys, None)
+}
+
+/// Like [`import`], but every value is written under `prefix` instead of
+/// the label the store's existing rows vote for. The same-device move
+/// writes under the destination browser's validated keyring key, which
+/// is a v11 key: letting a destination whose existing rows are legacy
+/// v10 (or an empty store) vote would seal the moved values under the
+/// compiled-in fallback key instead.
+pub fn import_with_write_prefix(
+    path: &Path,
+    incoming: &[Cookie],
+    keys: &Keys,
+    prefix: LinuxPrefix,
+) -> Result<Stats> {
+    import_inner(path, incoming, keys, Some(prefix))
+}
+
+fn import_inner(
+    path: &Path,
+    incoming: &[Cookie],
+    keys: &Keys,
+    forced_prefix: Option<LinuxPrefix>,
+) -> Result<Stats> {
     let mut con = open(path)?;
     let cols = table_columns(&con, "cookies")?;
     if cols.is_empty() {
@@ -402,7 +461,10 @@ pub fn import(path: &Path, incoming: &[Cookie], keys: &Keys) -> Result<Stats> {
         return Err(Error::Corrupt("this Cookies database predates partition keys; it is too old to write".into()));
     }
     let tx = con.transaction().map_err(sql)?;
-    let write_prefix = resolve_write_prefix(&tx, keys)?;
+    let write_prefix = match forced_prefix {
+        Some(p) if matches!(keys, Keys::Cbc { .. }) => Some(p),
+        _ => resolve_write_prefix(&tx, keys)?,
+    };
     let mut stats = Stats::default();
     let mut dead: std::collections::HashSet<i64> = std::collections::HashSet::new();
     if !incoming.is_empty() {

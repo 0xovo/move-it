@@ -247,6 +247,30 @@ fn apply_one(
 
 /// Write a box into a profile, all stores at once, all-or-nothing.
 pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied> {
+    import_inner(p, box_payload, now_us, None)
+}
+
+/// Like [`import`], but cookies and logins are written under
+/// `write_prefix` instead of the label the destination stores' existing
+/// rows vote for. The same-device move uses this with the destination
+/// browser's validated keyring key (a v11 key): the vote would seal
+/// moved values under the compiled-in fallback key whenever the
+/// destination's existing rows are legacy v10 or the store is empty.
+pub fn import_with_write_prefix(
+    p: &Profile,
+    box_payload: &Payload,
+    now_us: i64,
+    write_prefix: crate::oscrypt::LinuxPrefix,
+) -> Result<Applied> {
+    import_inner(p, box_payload, now_us, Some(write_prefix))
+}
+
+fn import_inner(
+    p: &Profile,
+    box_payload: &Payload,
+    now_us: i64,
+    forced_prefix: Option<crate::oscrypt::LinuxPrefix>,
+) -> Result<Applied> {
     let m = &box_payload.manifest;
 
     // Decode the sections up front, before touching disk, so a malformed box changes nothing.
@@ -327,10 +351,18 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
             profiles::create_empty_stores(&paths::slot_dir(p.dir, p.slot))?;
         }
         if need_cookies && cookies_p.exists() {
-            a.cookies = cookies::import(&cookies_p, &cookies_in, p.keys)?;
+            a.cookies = match forced_prefix {
+                Some(prefix) => cookies::import_with_write_prefix(&cookies_p, &cookies_in, p.keys, prefix)?,
+                None => cookies::import(&cookies_p, &cookies_in, p.keys)?,
+            };
         }
         if need_logins && logins_p.exists() {
-            a.logins = logins::import(&logins_p, &logins_in, p.keys, p.login_tag)?;
+            a.logins = match forced_prefix {
+                Some(prefix) => {
+                    logins::import_with_write_prefix(&logins_p, &logins_in, p.keys, p.login_tag, prefix)?
+                }
+                None => logins::import(&logins_p, &logins_in, p.keys, p.login_tag)?,
+            };
         }
         if m.contains_key("history") {
             a.history = history::import(&history_p, &hist_in)?;
