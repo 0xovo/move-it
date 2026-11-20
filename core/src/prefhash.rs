@@ -361,10 +361,35 @@ pub fn uses_secure_extension_prefs(browser: &str) -> bool {
 }
 
 pub fn seed_for_browser(browser: &str) -> &'static [u8] {
-    if matches!(browser, "chromium") {
-        return &[];
+    // Only the Google Chrome family seals pref hashes under the
+    // Google seed. Rig fixtures written by the real browsers prove
+    // the empty (Chromium OSS) seed for every other family: Brave
+    // (brave-beta 1.101, brave-nightly 1.102), Edge (edge-beta,
+    // edge-dev), Vivaldi, Opera and Opera GX all store the empty-seed
+    // empty-store super_mac, while chrome, chrome-beta and
+    // chrome-dev store the Google-seed constant. Chromium itself
+    // has no rig fixture; its empty seed is the documented OSS
+    // behaviour and is unchanged. Chrome Canary has no fixture
+    // either and is assumed Google as a Chrome channel. Family is
+    // resolved through the registry (channel_of), the same way
+    // uses_secure_extension_prefs resolves the Brave family, so a
+    // channel build inherits its stable browser's seed.
+    match crate::browsers::by_id(browser) {
+        Some(def) => {
+            if def.channel_of.unwrap_or(def.id) == "chrome" {
+                &GOOGLE_CHROME_SEED
+            } else {
+                &[]
+            }
+        }
+        None => {
+            if matches!(browser, "brave" | "chromium") {
+                &[]
+            } else {
+                &GOOGLE_CHROME_SEED
+            }
+        }
     }
-    &GOOGLE_CHROME_SEED
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -806,6 +831,65 @@ mod tests {
         // Google Chrome writes this exact super_mac for a store with no macs.
         let got = calculate_super_mac(&GOOGLE_CHROME_SEED, "", &json!({})).unwrap();
         assert_eq!(got, "33F663353631B144EA660B5F809D89BA41CAF954EE5776BE5004BB589CA96BE1");
+    }
+
+    #[test]
+    fn brave_seed_matches_genuine_brave_empty_store_super_mac() {
+        // Genuine Brave-written Secure Preferences from the rig
+        // fixtures brave-beta (1.101) and brave-nightly (1.102),
+        // profile/Default/Secure Preferences: both carry an empty
+        // macs tree and this exact stored protection.super_mac.
+        const GENUINE_BRAVE_EMPTY_STORE: &str =
+            "B613679A0814D9EC772F95D778C35FC5FF1697C493715653C6C712144292C5AD";
+        for id in ["brave", "brave-beta", "brave-nightly"] {
+            assert!(seed_for_browser(id).is_empty(), "{id}");
+            let got = calculate_super_mac(seed_for_browser(id), "", &json!({})).unwrap();
+            assert_eq!(got, GENUINE_BRAVE_EMPTY_STORE, "{id}");
+            let under_google = calculate_super_mac(&GOOGLE_CHROME_SEED, "", &json!({})).unwrap();
+            assert_ne!(under_google, GENUINE_BRAVE_EMPTY_STORE, "{id}");
+        }
+    }
+
+    #[test]
+    fn seed_selection_matches_rig_fixtures() {
+        // Empty-store constants observed in every rig fixture's
+        // Secure Preferences (empty macs tree, empty Linux device
+        // id): Google seed for the Chrome family only, empty seed
+        // for Edge, Vivaldi, Opera and Opera GX as well as Brave.
+        const GOOGLE_EMPTY_STORE: &str =
+            "33F663353631B144EA660B5F809D89BA41CAF954EE5776BE5004BB589CA96BE1";
+        const EMPTY_EMPTY_STORE: &str =
+            "B613679A0814D9EC772F95D778C35FC5FF1697C493715653C6C712144292C5AD";
+        for id in ["chrome", "chrome-beta", "chrome-dev"] {
+            assert_eq!(seed_for_browser(id), &GOOGLE_CHROME_SEED[..], "{id}");
+            assert_eq!(
+                calculate_super_mac(seed_for_browser(id), "", &json!({})).unwrap(),
+                GOOGLE_EMPTY_STORE,
+                "{id}"
+            );
+        }
+        for id in [
+            "brave",
+            "brave-beta",
+            "brave-nightly",
+            "edge",
+            "edge-beta",
+            "edge-dev",
+            "vivaldi",
+            "opera",
+            "opera-gx",
+            "chromium",
+        ] {
+            assert!(seed_for_browser(id).is_empty(), "{id}");
+            assert_eq!(
+                calculate_super_mac(seed_for_browser(id), "", &json!({})).unwrap(),
+                EMPTY_EMPTY_STORE,
+                "{id}"
+            );
+        }
+        // No fixture: chrome-canary is assumed Google as a Chrome
+        // channel, inheriting through channel_of like the others.
+        assert_eq!(seed_for_browser("chrome-canary"), &GOOGLE_CHROME_SEED[..]);
     }
 
     #[test]
@@ -1340,14 +1424,29 @@ mod tests {
         assert!(secure["extensions"]["settings"].get(id).is_none());
         assert!(secure["extensions"]["settings"][other].is_object());
         // The stamped super_mac is exactly what the codebase's own
-        // super-MAC helper produces for the post-strip macs tree.
+        // super-MAC helper produces for the post-strip macs tree
+        // under the Brave (empty) seed, and it does not validate
+        // under the Google seed Brave does not use.
         let expected = calculate_super_mac(
-            &GOOGLE_CHROME_SEED,
+            seed_for_browser("brave"),
             &chromium_device_id(),
             &secure["protection"]["macs"],
         )
         .unwrap();
         assert_eq!(secure["protection"]["super_mac"], expected);
+        assert_eq!(
+            secure["protection"]["super_mac"],
+            calculate_super_mac(&[], &chromium_device_id(), &secure["protection"]["macs"]).unwrap()
+        );
+        assert_ne!(
+            secure["protection"]["super_mac"],
+            calculate_super_mac(
+                &GOOGLE_CHROME_SEED,
+                &chromium_device_id(),
+                &secure["protection"]["macs"],
+            )
+            .unwrap()
+        );
         assert_ne!(secure["protection"]["super_mac"], "STALE");
     }
 
@@ -1420,14 +1519,14 @@ mod tests {
         // against a restamp of the read-back tree with the same
         // helper the production strip used.
         let expected_super = calculate_super_mac(
-            &GOOGLE_CHROME_SEED,
+            seed_for_browser("brave"),
             &chromium_device_id(),
             &secure["protection"]["macs"],
         )
         .unwrap();
         assert_eq!(secure["protection"]["super_mac"], expected_super);
         let mut clone = secure.clone();
-        stamp_super_encrypted_hash(&mut clone, &GOOGLE_CHROME_SEED, (&lock, LinuxPrefix::V11)).unwrap();
+        stamp_super_encrypted_hash(&mut clone, seed_for_browser("brave"), (&lock, LinuxPrefix::V11)).unwrap();
         assert_eq!(secure["protection"]["super_encrypted_hash"], clone["protection"]["super_encrypted_hash"]);
         assert_ne!(secure["protection"]["super_encrypted_hash"], "c3VwZXI");
     }
