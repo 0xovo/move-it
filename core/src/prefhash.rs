@@ -423,16 +423,7 @@ fn stamp_super_mac(root: &mut Value, seed: &[u8], device_id: &str) -> Result<()>
     Ok(())
 }
 
-/// The version a registration entry carries, as a numeric dotted
-/// vector: `manifest.version` in the shape Chromium writes, with a
-/// top-level `version` as a fallback. Anything else (missing, or a
-/// component that is not a plain number) is unversioned.
-fn entry_version(entry: &Value) -> Option<Vec<u64>> {
-    let raw = entry
-        .get("manifest")
-        .and_then(|m| m.get("version"))
-        .and_then(Value::as_str)
-        .or_else(|| entry.get("version").and_then(Value::as_str))?;
+fn parse_version(raw: &str) -> Option<Vec<u64>> {
     let mut out = Vec::new();
     for part in raw.split('.') {
         if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
@@ -441,6 +432,27 @@ fn entry_version(entry: &Value) -> Option<Vec<u64>> {
         out.push(part.parse().ok()?);
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// The version a registration entry carries, as a numeric dotted
+/// vector: `manifest.version` in the shape Chromium writes, with a
+/// top-level `version` as a fallback. The fallback applies whenever
+/// the manifest version is absent, not a string, or unparseable as
+/// a numeric dotted version: an entry carrying manifest version
+/// "abc" and top-level version "9.0" is versioned 9.0, not
+/// unversioned, so a lower source can never replace it on the
+/// strength of the broken manifest field alone. An entry with no
+/// parseable version in either field is unversioned.
+fn entry_version(entry: &Value) -> Option<Vec<u64>> {
+    if let Some(v) = entry
+        .get("manifest")
+        .and_then(|m| m.get("version"))
+        .and_then(Value::as_str)
+        .and_then(parse_version)
+    {
+        return Some(v);
+    }
+    entry.get("version").and_then(Value::as_str).and_then(parse_version)
 }
 
 fn version_cmp(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
@@ -487,30 +499,38 @@ fn unpacked_path(entry: &Value) -> Option<&str> {
 /// - Only the target's entry carries a version: it stays (the source
 ///   entry cannot prove it is newer). Only the source's, or neither:
 ///   the source entry lands, as before.
-fn merge_entry(settings: &mut Map<String, Value>, id: &str, entry: &Value) {
+/// Returns true when the source entry landed (it was added, or it
+/// replaced the target's entry), false when the target's entry was
+/// kept. Callers that own side effects keyed by registration id
+/// (the Brave Secure Preferences strip) must act only on landed ids.
+fn merge_entry(settings: &mut Map<String, Value>, id: &str, entry: &Value) -> bool {
     let Some(existing) = settings.get(id) else {
         settings.insert(id.to_string(), entry.clone());
-        return;
+        return true;
     };
     if let Some(path) = unpacked_path(entry) {
         if !Path::new(path).exists() {
-            return;
+            return false;
         }
     }
     match (entry_version(existing), entry_version(entry)) {
         (Some(have), Some(incoming)) => {
             if version_cmp(&incoming, &have) == std::cmp::Ordering::Greater {
                 settings.insert(id.to_string(), entry.clone());
+                true
+            } else {
+                false
             }
         }
-        (Some(_), None) => {}
+        (Some(_), None) => false,
         _ => {
             settings.insert(id.to_string(), entry.clone());
+            true
         }
     }
 }
 
-fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<Map<String, Value>> {
+fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<(Map<String, Value>, Vec<String>)> {
     let ext = root
         .as_object_mut()
         .and_then(|o| o.entry("extensions").or_insert_with(|| json!({})).as_object_mut())
@@ -518,10 +538,13 @@ fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<Map<St
     let Some(ext) = ext else {
         return Err(Error::Corrupt("cannot merge into preferences file".into()));
     };
+    let mut landed = Vec::new();
     for (id, entry) in regs {
-        merge_entry(&mut *ext, id, entry);
+        if merge_entry(&mut *ext, id, entry) {
+            landed.push(id.clone());
+        }
     }
-    Ok(ext.clone())
+    Ok((ext.clone(), landed))
 }
 
 /// Merge extension registrations for Chrome-family targets.
@@ -557,7 +580,7 @@ pub fn merge_registrations_secure(
 
     let prefs_path = slot.join("Preferences");
     let mut prefs = read_json(&prefs_path)?;
-    let settings = merge_into_file(&mut prefs, regs)?;
+    let (settings, _) = merge_into_file(&mut prefs, regs)?;
     macs_for_extensions(&mut prefs, &settings, seed, &device_id, false)?;
     if let Some(prot) = prefs
         .as_object_mut()
@@ -575,7 +598,7 @@ pub fn merge_registrations_secure(
     }
     let secure_path = slot.join("Secure Preferences");
     let mut secure = read_json(&secure_path)?;
-    let secure_settings = merge_into_file(&mut secure, regs)?;
+    let (secure_settings, _) = merge_into_file(&mut secure, regs)?;
     if let Some(anchor) = anchor_lock {
         // Gated macOS path: per-entry HMACs first without the super,
         // then the encrypted-hash anchors (which mutate the macs tree),
@@ -601,6 +624,14 @@ pub fn merge_registrations_secure(
 
 /// Brave keeps registrations in plain `Preferences` only.
 pub fn merge_registrations_brave(slot: &Path, regs: &Map<String, Value>) -> Result<usize> {
+    merge_registrations_brave_inner(slot, regs, None)
+}
+
+fn merge_registrations_brave_inner(
+    slot: &Path,
+    regs: &Map<String, Value>,
+    anchor_lock: Option<AnchorLock>,
+) -> Result<usize> {
     if regs.is_empty() {
         return Ok(0);
     }
@@ -614,12 +645,15 @@ pub fn merge_registrations_brave(slot: &Path, regs: &Map<String, Value>) -> Resu
         return Err(Error::Corrupt(format!("cannot merge into {}", prefs_path.display())));
     };
     let mut n = 0;
+    let mut landed = Vec::new();
     for (id, entry) in regs {
-        merge_entry(&mut *settings, id, entry);
+        if merge_entry(&mut *settings, id, entry) {
+            landed.push(id.clone());
+        }
         n += 1;
     }
     write_json(&prefs_path, &prefs)?;
-    preserve_secure_prefs_for_brave(slot, regs)?;
+    preserve_secure_prefs_for_brave(slot, &landed, anchor_lock)?;
     Ok(n)
 }
 
@@ -628,16 +662,37 @@ pub fn merge_registrations_brave(slot: &Path, regs: &Map<String, Value>) -> Resu
 /// it carries other extensions' registrations and unrelated protected
 /// keys, and deleting it outright (the old behaviour) destroyed all
 /// of that in the live profile the moment a move landed. This merge
-/// owns only the registrations it just carried into plain
+/// owns only the registrations it actually landed in plain
 /// `Preferences`, so only those ids are stripped from the secure
 /// file - from `extensions.settings` and from the pref-hash macs
 /// keyed by the same ids - and everything else is left exactly as it
-/// was. The file is rewritten only when something was actually
-/// stripped, so an untouched file stays byte-identical, and a file
-/// that cannot be parsed is left alone rather than deleted or failed
-/// over. Undo never depends on this: the journal restores the file
-/// byte-for-byte either way.
-fn preserve_secure_prefs_for_brave(slot: &Path, regs: &Map<String, Value>) -> Result<()> {
+/// was. An id the merge did not land (its target entry was kept:
+/// version-blocked, or blocked by the unpacked foreign-path guard)
+/// keeps its secure registration and MAC untouched, because the
+/// target's own entry is still the live one there.
+///
+/// Removing entries and MACs invalidates the file's super MACs, so
+/// a strip restamps them with the same helpers the secure merge
+/// uses (`stamp_super_mac`, and `stamp_super_encrypted_hash` when
+/// the file carries one and the caller passed the target's anchor
+/// lock). When the file carries a `super_encrypted_hash` but no
+/// anchor lock is available to restamp it, the file is left
+/// entirely untouched instead: a rewrite with a stale super anchor
+/// would be internally inconsistent, and the unstripped
+/// registration is a duplicate of the one now in `Preferences`,
+/// which is the store Brave actually reads. The file is rewritten
+/// only when something was actually stripped, so an untouched file
+/// stays byte-identical, and a file that cannot be parsed is left
+/// alone rather than deleted or failed over. Undo never depends on
+/// this: the journal restores the file byte-for-byte either way.
+fn preserve_secure_prefs_for_brave(
+    slot: &Path,
+    landed: &[String],
+    anchor_lock: Option<AnchorLock>,
+) -> Result<()> {
+    if landed.is_empty() {
+        return Ok(());
+    }
     let secure_path = slot.join("Secure Preferences");
     if !secure_path.is_file() {
         return Ok(());
@@ -645,13 +700,44 @@ fn preserve_secure_prefs_for_brave(slot: &Path, regs: &Map<String, Value>) -> Re
     let Ok(mut secure) = read_json(&secure_path) else {
         return Ok(());
     };
+    let mut would_change = false;
+    if let Some(settings) = secure
+        .get("extensions")
+        .and_then(|e| e.get("settings"))
+        .and_then(Value::as_object)
+    {
+        would_change |= landed.iter().any(|id| settings.contains_key(id));
+    }
+    if let Some(macs) = secure
+        .get("protection")
+        .and_then(|p| p.get("macs"))
+        .and_then(|m| m.get("extensions"))
+        .and_then(Value::as_object)
+    {
+        for key in ["settings", "settings_encrypted_hash"] {
+            if let Some(by_id) = macs.get(key).and_then(Value::as_object) {
+                would_change |= landed.iter().any(|id| by_id.contains_key(id));
+            }
+        }
+    }
+    if !would_change {
+        return Ok(());
+    }
+    let had_super_encrypted = secure
+        .get("protection")
+        .and_then(|p| p.get("super_encrypted_hash"))
+        .and_then(Value::as_str)
+        .is_some();
+    if had_super_encrypted && anchor_lock.is_none() {
+        return Ok(());
+    }
     let mut changed = false;
     if let Some(settings) = secure
         .get_mut("extensions")
         .and_then(|e| e.get_mut("settings"))
         .and_then(Value::as_object_mut)
     {
-        for id in regs.keys() {
+        for id in landed {
             changed |= settings.remove(id).is_some();
         }
     }
@@ -663,13 +749,21 @@ fn preserve_secure_prefs_for_brave(slot: &Path, regs: &Map<String, Value>) -> Re
     {
         for key in ["settings", "settings_encrypted_hash"] {
             if let Some(by_id) = macs.get_mut(key).and_then(Value::as_object_mut) {
-                for id in regs.keys() {
+                for id in landed {
                     changed |= by_id.remove(id).is_some();
                 }
             }
         }
     }
     if changed {
+        let seed = seed_for_browser("brave");
+        let device_id = chromium_device_id();
+        stamp_super_mac(&mut secure, seed, &device_id)?;
+        if had_super_encrypted {
+            if let Some(anchor) = anchor_lock {
+                stamp_super_encrypted_hash(&mut secure, seed, anchor)?;
+            }
+        }
         write_json(&secure_path, &secure)?;
     }
     Ok(())
@@ -684,7 +778,7 @@ pub fn merge_registrations(
     if uses_secure_extension_prefs(browser) {
         merge_registrations_secure(slot, browser, regs, anchor_lock)
     } else {
-        merge_registrations_brave(slot, regs)
+        merge_registrations_brave_inner(slot, regs, anchor_lock)
     }
 }
 
@@ -1106,6 +1200,220 @@ mod tests {
         regs.insert("nkbihfbeogaeaoehlefnkodbefgpgknn".into(), json!({"state": 1}));
         merge_registrations_brave(&slot, &regs).unwrap();
         assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn entry_version_falls_back_to_the_top_level_version() {
+        // A manifest version that fails numeric parsing does not make
+        // the entry unversioned when a parseable top-level version
+        // sits next to it; the same holds for a non-string manifest
+        // version. A parseable manifest version still wins, and an
+        // entry with nothing parseable in either field stays
+        // unversioned (the source-side safe default).
+        assert_eq!(
+            entry_version(&json!({"manifest": {"version": "abc"}, "version": "9.0"})),
+            Some(vec![9, 0])
+        );
+        assert_eq!(
+            entry_version(&json!({"manifest": {"version": 3}, "version": "1.2"})),
+            Some(vec![1, 2])
+        );
+        assert_eq!(
+            entry_version(&json!({"manifest": {"version": "1.0"}, "version": "9.0"})),
+            Some(vec![1, 0])
+        );
+        assert_eq!(entry_version(&json!({"manifest": {"version": "abc"}})), None);
+        assert_eq!(entry_version(&json!({"version": "abc"})), None);
+    }
+
+    #[test]
+    fn registration_merge_uses_the_top_level_fallback_on_both_sides() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        // The proven counterexample: the target's real version is the
+        // top-level 9.0 behind an unparseable manifest version, so a
+        // 1.0 source must not replace it.
+        let target_entry =
+            json!({"manifest": {"version": "abc"}, "version": "9.0", "path": "local/9.0_0", "state": 1});
+        let seed = json!({"extensions": {"settings": {id: target_entry}}});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&seed).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"manifest": {"version": "1.0"}, "path": "foreign/1.0_0", "state": 1}));
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(got["extensions"]["settings"][id]["path"], "local/9.0_0");
+        assert_eq!(got["extensions"]["settings"][id]["version"], "9.0");
+        // The fallback is symmetric: a source whose manifest version
+        // is unparseable but whose top-level version is strictly
+        // higher (10.0 over 9.0) does land.
+        let mut regs = Map::new();
+        regs.insert(
+            id.into(),
+            json!({"manifest": {"version": "abc"}, "version": "10.0", "path": "new/10.0_0", "state": 1}),
+        );
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(got["extensions"]["settings"][id]["path"], "new/10.0_0");
+    }
+
+    #[test]
+    fn brave_merge_keeps_secure_registration_for_a_blocked_id() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let blocked = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let landed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // The target holds the blocked id at v2.0 in both files; the
+        // source carries it at v1.0, so the merge keeps the target
+        // entry and the secure registration is not this merge's to
+        // strip. The landed id is new to Preferences and present in
+        // the secure file, so it is stripped as before.
+        let prefs_seed = json!({"extensions": {"settings": {
+            blocked: {"manifest": {"version": "2.0"}, "path": "local/2.0_0", "state": 1},
+        }}});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&prefs_seed).unwrap()).unwrap();
+        let secure_seed = json!({
+            "extensions": {"settings": {
+                blocked: {"manifest": {"version": "2.0"}, "path": "local/2.0_0", "state": 1},
+                landed: {"manifest": {"version": "1.0"}, "state": 1},
+            }},
+            "protection": {"macs": {"extensions": {"settings": {blocked: "MAC-BLOCKED", landed: "MAC-LANDED"}}}},
+        });
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&secure_seed).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(blocked.into(), json!({"manifest": {"version": "1.0"}, "path": "foreign/1.0_0", "state": 1}));
+        regs.insert(landed.into(), json!({"manifest": {"version": "1.0"}, "state": 1}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        let prefs: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(prefs["extensions"]["settings"][blocked]["path"], "local/2.0_0");
+        assert!(prefs["extensions"]["settings"][landed].is_object());
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        assert_eq!(secure["extensions"]["settings"][blocked]["manifest"]["version"], "2.0");
+        assert_eq!(secure["extensions"]["settings"][blocked]["path"], "local/2.0_0");
+        assert_eq!(secure["protection"]["macs"]["extensions"]["settings"][blocked], "MAC-BLOCKED");
+        assert!(secure["extensions"]["settings"].get(landed).is_none());
+        assert!(secure["protection"]["macs"]["extensions"]["settings"].get(landed).is_none());
+    }
+
+    #[test]
+    fn brave_strip_restamps_the_super_mac() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let other = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let secure_seed = json!({
+            "extensions": {"settings": {
+                id: {"manifest": {"version": "1.0"}, "state": 1},
+                other: {"manifest": {"version": "3.0"}, "state": 1},
+            }},
+            "protection": {
+                "super_mac": "STALE",
+                "macs": {"extensions": {"settings": {id: "MAC", other: "MAC2"}}},
+            },
+        });
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&secure_seed).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        assert!(secure["extensions"]["settings"].get(id).is_none());
+        assert!(secure["extensions"]["settings"][other].is_object());
+        // The stamped super_mac is exactly what the codebase's own
+        // super-MAC helper produces for the post-strip macs tree.
+        let expected = calculate_super_mac(
+            &GOOGLE_CHROME_SEED,
+            &chromium_device_id(),
+            &secure["protection"]["macs"],
+        )
+        .unwrap();
+        assert_eq!(secure["protection"]["super_mac"], expected);
+        assert_ne!(secure["protection"]["super_mac"], "STALE");
+    }
+
+    #[test]
+    fn brave_strip_leaves_a_super_encrypted_file_untouched_without_an_anchor() {
+        // The file carries a super_encrypted_hash and this call has
+        // no anchor lock to restamp it with, so the strip does not
+        // happen at all: the file stays byte-identical rather than
+        // being rewritten with a stale super anchor.
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let secure_seed = json!({
+            "extensions": {"settings": {id: {"manifest": {"version": "1.0"}, "state": 1}}},
+            "protection": {
+                "super_mac": "STALE",
+                "super_encrypted_hash": "c3VwZXI",
+                "macs": {"extensions": {
+                    "settings": {id: "MAC"},
+                    "settings_encrypted_hash": {id: "b2xk"},
+                }},
+            },
+        });
+        let raw = serde_json::to_vec(&secure_seed).unwrap();
+        std::fs::write(slot.join("Secure Preferences"), &raw).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), raw);
+        // The registration still landed in plain Preferences, the
+        // store Brave reads.
+        let prefs: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert!(prefs["extensions"]["settings"][id].is_object());
+    }
+
+    #[test]
+    fn brave_strip_with_an_anchor_restamps_both_super_macs() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let other = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let secure_seed = json!({
+            "extensions": {"settings": {
+                id: {"manifest": {"version": "1.0"}, "state": 1},
+                other: {"manifest": {"version": "3.0"}, "state": 1},
+            }},
+            "protection": {
+                "super_mac": "STALE",
+                "super_encrypted_hash": "c3VwZXI",
+                "macs": {"extensions": {
+                    "settings": {id: "MAC", other: "MAC2"},
+                    "settings_encrypted_hash": {id: "b2xk", other: "b3RoZXI"},
+                }},
+            },
+        });
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&secure_seed).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        let lock = Lock::mac("fixture-safe-storage-pw");
+        merge_registrations(&slot, "brave", &regs, Some((&lock, LinuxPrefix::V11))).unwrap();
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        assert!(secure["extensions"]["settings"].get(id).is_none());
+        assert!(secure["extensions"]["settings"][other].is_object());
+        assert!(secure["protection"]["macs"]["extensions"]["settings_encrypted_hash"].get(id).is_none());
+        // Both supers verify over the post-strip tree: the HMAC super
+        // against the codebase's own helper, the encrypted super
+        // against a restamp of the read-back tree with the same
+        // helper the production strip used.
+        let expected_super = calculate_super_mac(
+            &GOOGLE_CHROME_SEED,
+            &chromium_device_id(),
+            &secure["protection"]["macs"],
+        )
+        .unwrap();
+        assert_eq!(secure["protection"]["super_mac"], expected_super);
+        let mut clone = secure.clone();
+        stamp_super_encrypted_hash(&mut clone, &GOOGLE_CHROME_SEED, (&lock, LinuxPrefix::V11)).unwrap();
+        assert_eq!(secure["protection"]["super_encrypted_hash"], clone["protection"]["super_encrypted_hash"]);
+        assert_ne!(secure["protection"]["super_encrypted_hash"], "c3VwZXI");
     }
 
     #[test]
