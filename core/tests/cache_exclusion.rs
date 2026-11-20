@@ -216,8 +216,14 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
     write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/gpucache/junk.bin")), b"nested-junk");
     write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/gpucache/junk.bin")), b"nested-junk");
     // A cache-named FILE (final component) in the same trees: data, carried.
-    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/GPUCache")), b"state-file-bytes");
-    write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/GPUCache")), b"bin-file-bytes");
+    // It sits one folder down, not beside the cache directory above: a
+    // `GPUCache` file and a `gpucache` directory cannot be siblings on a
+    // case-insensitive filesystem (NTFS, APFS), so planting them side by
+    // side made the fixture itself impossible there. The assertions are
+    // unchanged: the lowercase cache dirs are still pruned from both
+    // trees, and a file whose name is a cache name still travels whole.
+    write(&a.join(format!("Default/Local Extension Settings/{EXT_ID}/keep/GPUCache")), b"state-file-bytes");
+    write(&a.join(format!("Default/Extensions/{EXT_ID}/1.0_0/keep/GPUCache")), b"bin-file-bytes");
 
     let key = SyncKey::from_bytes([5u8; 32]);
     let sealed = engine::seal_box(&profile(&a, &k), "fixture:A", &key).unwrap();
@@ -226,7 +232,7 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
     assert!(payload
         .ext_files
         .keys()
-        .any(|l| l == &format!("Local Extension Settings/{EXT_ID}/GPUCache")));
+        .any(|l| l == &format!("Local Extension Settings/{EXT_ID}/keep/GPUCache")));
     assert!(payload
         .ext_bins
         .keys()
@@ -242,11 +248,11 @@ fn lowercase_cache_dirs_are_pruned_and_a_cache_named_file_survives() {
         assert!(!paths::is_cache_dir_name(&name), "cache dir {name} landed in the target");
     }
     assert_eq!(
-        std::fs::read(b.join(format!("Default/Local Extension Settings/{EXT_ID}/GPUCache"))).unwrap(),
+        std::fs::read(b.join(format!("Default/Local Extension Settings/{EXT_ID}/keep/GPUCache"))).unwrap(),
         b"state-file-bytes"
     );
     assert_eq!(
-        std::fs::read(b.join(format!("Default/Extensions/{EXT_ID}/1.0_0/GPUCache"))).unwrap(),
+        std::fs::read(b.join(format!("Default/Extensions/{EXT_ID}/1.0_0/keep/GPUCache"))).unwrap(),
         b"bin-file-bytes"
     );
 }
