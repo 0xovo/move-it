@@ -10,9 +10,28 @@ use crate::{Error, Result};
 
 pub const DEFAULT_SLOT: &str = "Default";
 
+/// The slot name of a SingleProfile browser's one profile (see
+/// `crate::browsers::LayoutKind`): the browser folder itself is the
+/// profile, so this slot's folder is the root, not a folder inside it.
+/// No real Chromium profile folder is ever named this.
+pub const SINGLE_SLOT: &str = "Single";
+
 /// The folder one profile lives in, inside its browser's folder.
+/// For [`SINGLE_SLOT`] the root itself is the profile folder.
 pub fn slot_dir(root: &Path, slot: &str) -> PathBuf {
+    if slot == SINGLE_SLOT {
+        return root.to_path_buf();
+    }
     root.join(slot)
+}
+
+/// The folder one profile lives in, under a layout: for a Standard root
+/// the named slot folder, for a SingleProfile root the root itself.
+pub fn profile_dir(root: &Path, slot: &str, layout: crate::browsers::LayoutKind) -> PathBuf {
+    match layout {
+        crate::browsers::LayoutKind::SingleProfile => root.to_path_buf(),
+        crate::browsers::LayoutKind::Standard => slot_dir(root, slot),
+    }
 }
 
 /// Refuse when writing to `dest` would land outside `root`.

@@ -54,19 +54,55 @@ pub enum LinuxBrowser {
     Chromium,
     Edge,
     Opera,
+    Vivaldi,
+    ChromeBeta,
+    ChromeDev,
+    ChromeCanary,
+    EdgeBeta,
+    EdgeDev,
+    BraveBeta,
+    BraveNightly,
+    OperaGx,
 }
 
 impl LinuxBrowser {
-    /// The `application` attribute this browser stores its Safe Storage item under.
-    pub fn keyring_app(self) -> &'static str {
+    /// This browser's id in the registry ([`crate::browsers`]).
+    pub fn id(self) -> &'static str {
         match self {
             LinuxBrowser::Brave => "brave",
             LinuxBrowser::Chrome => "chrome",
             LinuxBrowser::Chromium => "chromium",
-            // Edge brands the libsecret item with the product name, not "edge".
-            LinuxBrowser::Edge => "Microsoft Edge",
-            LinuxBrowser::Opera => "Opera",
+            LinuxBrowser::Edge => "edge",
+            LinuxBrowser::Opera => "opera",
+            LinuxBrowser::Vivaldi => "vivaldi",
+            LinuxBrowser::ChromeBeta => "chrome-beta",
+            LinuxBrowser::ChromeDev => "chrome-dev",
+            LinuxBrowser::ChromeCanary => "chrome-canary",
+            LinuxBrowser::EdgeBeta => "edge-beta",
+            LinuxBrowser::EdgeDev => "edge-dev",
+            LinuxBrowser::BraveBeta => "brave-beta",
+            LinuxBrowser::BraveNightly => "brave-nightly",
+            LinuxBrowser::OperaGx => "opera-gx",
         }
+    }
+
+    /// This browser's registry row: the one place its facts live.
+    pub fn def(self) -> &'static crate::browsers::BrowserDef {
+        crate::browsers::by_id(self.id()).expect("every LinuxBrowser has a registry row")
+    }
+
+    /// The `application` attribute this browser stores its Safe Storage item
+    /// under: the first of its registry probe candidates.
+    pub fn keyring_app(self) -> &'static str {
+        self.def().linux_apps[0]
+    }
+
+    /// Every `application` attribute to probe for this browser's Safe
+    /// Storage item, in probe order: the browser's own first, then the
+    /// aliased stable browser's (Vivaldi keeps Chrome's item, Opera keeps
+    /// Chromium's; see the registry rows).
+    pub fn keyring_apps(self) -> &'static [&'static str] {
+        self.def().linux_apps
     }
 
     /// Whether an empty store may seed v11 when the password came from this
@@ -75,14 +111,25 @@ impl LinuxBrowser {
         matches!(self, LinuxBrowser::Chromium) && from_trusted_item
     }
 
-    /// Parse a browser name as the caller spells it.
+    /// Parse a browser name as the caller spells it. The registry is the
+    /// list of known browsers; this maps an id to its typed handle.
     pub fn from_name(name: &str) -> Option<LinuxBrowser> {
+        crate::browsers::by_id(name)?;
         match name {
             "brave" => Some(LinuxBrowser::Brave),
             "chrome" => Some(LinuxBrowser::Chrome),
             "chromium" => Some(LinuxBrowser::Chromium),
             "edge" => Some(LinuxBrowser::Edge),
             "opera" => Some(LinuxBrowser::Opera),
+            "vivaldi" => Some(LinuxBrowser::Vivaldi),
+            "chrome-beta" => Some(LinuxBrowser::ChromeBeta),
+            "chrome-dev" => Some(LinuxBrowser::ChromeDev),
+            "chrome-canary" => Some(LinuxBrowser::ChromeCanary),
+            "edge-beta" => Some(LinuxBrowser::EdgeBeta),
+            "edge-dev" => Some(LinuxBrowser::EdgeDev),
+            "brave-beta" => Some(LinuxBrowser::BraveBeta),
+            "brave-nightly" => Some(LinuxBrowser::BraveNightly),
+            "opera-gx" => Some(LinuxBrowser::OperaGx),
             _ => None,
         }
     }
@@ -132,15 +179,20 @@ fn linux_browser_password_from(
             let _flatpak_keyrings = flatpak_keyrings_dir(_app_id);
         }
     }
-    let app = browser.keyring_app();
     let label = browser.keyring_label();
-    // The v2-schema item first: it is the one a current browser actually uses, and its
-    // provenance decides the write label for an empty store.
-    if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)])? {
-        return Ok((pw, true));
-    }
-    if let Some(pw) = lookup(&[("application", app)])? {
-        return Ok((pw, false));
+    // Probe each application candidate in registry order (the browser's own
+    // first, then the aliased stable browser's). For a browser with one
+    // candidate this is exactly the historical order: the v2-schema item
+    // first (it is the one a current browser actually uses, and its
+    // provenance decides the write label for an empty store), then the
+    // application-only item, then the label.
+    for app in browser.keyring_apps() {
+        if let Some(pw) = lookup(&[("application", app), ("xdg:schema", LIBSECRET_V2_SCHEMA)])? {
+            return Ok((pw, true));
+        }
+        if let Some(pw) = lookup(&[("application", app)])? {
+            return Ok((pw, false));
+        }
     }
     if let Some(pw) = lookup(&[("label", label)])? {
         return Ok((pw, true));
@@ -186,14 +238,10 @@ fn flatpak_keyrings_dir(app_id: &str) -> Option<std::path::PathBuf> {
 
 impl LinuxBrowser {
     /// The Secret Service label Chromium stamps on its item (`secret-tool search label …`).
+    /// Aliasing browsers carry the aliased browser's label: Vivaldi stores
+    /// under Chrome's, Opera and Opera GX under Chromium's.
     pub fn keyring_label(self) -> &'static str {
-        match self {
-            LinuxBrowser::Brave => "Brave Safe Storage",
-            LinuxBrowser::Chrome => "Chrome Safe Storage",
-            LinuxBrowser::Chromium => "Chromium Safe Storage",
-            LinuxBrowser::Edge => "Microsoft Edge Safe Storage",
-            LinuxBrowser::Opera => "Opera Safe Storage",
-        }
+        self.def().linux_label
     }
 }
 
@@ -562,29 +610,59 @@ pub enum MacBrowser {
     Chromium,
     Edge,
     Opera,
+    Vivaldi,
+    ChromeBeta,
+    ChromeDev,
+    ChromeCanary,
+    EdgeBeta,
+    EdgeDev,
+    BraveBeta,
+    BraveNightly,
+    OperaGx,
 }
 
 impl MacBrowser {
-    /// The `service` of this browser's Safe Storage item in the login Keychain.
-    pub fn keychain_service(self) -> &'static str {
+    /// This browser's id in the registry ([`crate::browsers`]).
+    pub fn id(self) -> &'static str {
         match self {
-            MacBrowser::Brave => "Brave Safe Storage",
-            MacBrowser::Chrome => "Chrome Safe Storage",
-            MacBrowser::Chromium => "Chromium Safe Storage",
-            MacBrowser::Edge => "Microsoft Edge Safe Storage",
-            MacBrowser::Opera => "Opera Safe Storage",
+            MacBrowser::Brave => "brave",
+            MacBrowser::Chrome => "chrome",
+            MacBrowser::Chromium => "chromium",
+            MacBrowser::Edge => "edge",
+            MacBrowser::Opera => "opera",
+            MacBrowser::Vivaldi => "vivaldi",
+            MacBrowser::ChromeBeta => "chrome-beta",
+            MacBrowser::ChromeDev => "chrome-dev",
+            MacBrowser::ChromeCanary => "chrome-canary",
+            MacBrowser::EdgeBeta => "edge-beta",
+            MacBrowser::EdgeDev => "edge-dev",
+            MacBrowser::BraveBeta => "brave-beta",
+            MacBrowser::BraveNightly => "brave-nightly",
+            MacBrowser::OperaGx => "opera-gx",
         }
+    }
+
+    /// This browser's registry row: the one place its facts live.
+    pub fn def(self) -> &'static crate::browsers::BrowserDef {
+        crate::browsers::by_id(self.id()).expect("every MacBrowser has a registry row")
+    }
+
+    /// The `service` of this browser's Safe Storage item in the login
+    /// Keychain: the first of its probe candidates.
+    pub fn keychain_service(self) -> &'static str {
+        self.def().mac_services[0]
+    }
+
+    /// Every Keychain `service` to probe for this browser's Safe Storage
+    /// item, in probe order. Only Opera GX has more than one: its service
+    /// name is unresolved in the sources, so both candidates are tried.
+    pub fn keychain_services(self) -> &'static [&'static str] {
+        self.def().mac_services
     }
 
     /// The `account` of this browser's Safe Storage item.
     pub fn keychain_account(self) -> &'static str {
-        match self {
-            MacBrowser::Brave => "Brave",
-            MacBrowser::Chrome => "Chrome",
-            MacBrowser::Chromium => "Chromium",
-            MacBrowser::Edge => "Microsoft Edge",
-            MacBrowser::Opera => "Opera",
-        }
+        self.def().mac_account
     }
 
     /// Whether an empty store may seed v11 when the password came from this
@@ -593,14 +671,25 @@ impl MacBrowser {
         matches!(self, MacBrowser::Chromium) && from_keychain
     }
 
-    /// Parse a browser name as the caller spells it.
+    /// Parse a browser name as the caller spells it. The registry is the
+    /// list of known browsers; this maps an id to its typed handle.
     pub fn from_name(name: &str) -> Option<MacBrowser> {
+        crate::browsers::by_id(name)?;
         match name {
             "brave" => Some(MacBrowser::Brave),
             "chrome" => Some(MacBrowser::Chrome),
             "chromium" => Some(MacBrowser::Chromium),
             "edge" => Some(MacBrowser::Edge),
             "opera" => Some(MacBrowser::Opera),
+            "vivaldi" => Some(MacBrowser::Vivaldi),
+            "chrome-beta" => Some(MacBrowser::ChromeBeta),
+            "chrome-dev" => Some(MacBrowser::ChromeDev),
+            "chrome-canary" => Some(MacBrowser::ChromeCanary),
+            "edge-beta" => Some(MacBrowser::EdgeBeta),
+            "edge-dev" => Some(MacBrowser::EdgeDev),
+            "brave-beta" => Some(MacBrowser::BraveBeta),
+            "brave-nightly" => Some(MacBrowser::BraveNightly),
+            "opera-gx" => Some(MacBrowser::OperaGx),
             _ => None,
         }
     }
@@ -825,17 +914,55 @@ fn security_output(args: &[&str]) -> Option<std::process::Output> {
     }
 }
 
+/// Combine the per-service probe outcomes of one browser into the one
+/// outcome the password layer acts on: the first service that answers
+/// with a password wins; a refusal anywhere means an item exists but the
+/// read was refused; missing everywhere means missing. Pure, so the
+/// candidate order is pinned by tests off-macOS too.
+#[cfg(any(target_os = "macos", test))]
+fn pick_keychain_outcome(outcomes: Vec<KeychainOutcome>) -> KeychainOutcome {
+    let mut saw_missing = false;
+    let mut saw_refused = false;
+    for o in outcomes {
+        match o {
+            KeychainOutcome::Found(pw) => return KeychainOutcome::Found(pw),
+            KeychainOutcome::Refused => saw_refused = true,
+            KeychainOutcome::Missing => saw_missing = true,
+            KeychainOutcome::Unavailable => {}
+        }
+    }
+    if saw_refused {
+        return KeychainOutcome::Refused;
+    }
+    if saw_missing {
+        return KeychainOutcome::Missing;
+    }
+    KeychainOutcome::Unavailable
+}
+
 #[cfg(target_os = "macos")]
 fn security_cli_lookup(browser: MacBrowser) -> KeychainOutcome {
+    // Probe the browser's Keychain services in registry order (Opera GX
+    // carries two candidates; every other browser exactly one).
+    let outcomes: Vec<KeychainOutcome> = browser
+        .keychain_services()
+        .iter()
+        .map(|service| security_lookup_one(service, browser.keychain_account()))
+        .collect();
+    pick_keychain_outcome(outcomes)
+}
+
+#[cfg(target_os = "macos")]
+fn security_lookup_one(service: &str, account: &str) -> KeychainOutcome {
     // Attributes first: they answer even when the secret read below is
     // refused in silence, which is exactly the first-run case (the item is
     // there and the read waits on the person's OK).
     let attr = match security_output(&[
         "find-generic-password",
         "-s",
-        browser.keychain_service(),
+        service,
         "-a",
-        browser.keychain_account(),
+        account,
     ]) {
         Some(o) => classify_attr_output(o.status.success(), &o.stderr),
         None => AttrOutcome::Unavailable,
@@ -844,9 +971,9 @@ fn security_cli_lookup(browser: MacBrowser) -> KeychainOutcome {
         "find-generic-password",
         "-w",
         "-s",
-        browser.keychain_service(),
+        service,
         "-a",
-        browser.keychain_account(),
+        account,
     ]) {
         Some(o) => classify_security_output(o.status.success(), &o.stdout, &o.stderr),
         None => KeychainOutcome::Unavailable,
@@ -1476,5 +1603,111 @@ mod tests {
         }});
         std::fs::write(slot.join("Preferences"), serde_json::to_vec(&object_v10).unwrap()).unwrap();
         assert!(!mac_data_dir_speaks_v11(&root));
+    }
+}
+
+
+#[cfg(test)]
+mod registry_browser_tests {
+    use super::*;
+
+    #[test]
+    fn vivaldi_linux_probes_vivaldi_then_the_aliased_chrome() {
+        let v = LinuxBrowser::from_name("vivaldi").unwrap();
+        assert_eq!(v.keyring_apps(), ["vivaldi", "chrome"]);
+        assert_eq!(v.keyring_app(), "vivaldi");
+        assert_eq!(v.keyring_label(), "Chrome Safe Storage");
+        // Only Chrome's item exists on this machine: the probe reaches it.
+        let chrome_only = |attrs: &[(&str, &str)]| {
+            Ok(attrs
+                .iter()
+                .any(|(k, x)| *k == "application" && *x == "chrome")
+                .then(|| "chrome-pw".to_string()))
+        };
+        assert_eq!(
+            linux_browser_password_from(v, None, &chrome_only, None).unwrap(),
+            ("chrome-pw".to_string(), true)
+        );
+        // Both exist: vivaldi's own item wins, it is probed first.
+        let both = |attrs: &[(&str, &str)]| {
+            Ok(attrs
+                .iter()
+                .find(|(k, _)| *k == "application")
+                .and_then(|(_, x)| match *x {
+                    "vivaldi" => Some("vivaldi-pw".to_string()),
+                    "chrome" => Some("chrome-pw".to_string()),
+                    _ => None,
+                }))
+        };
+        assert_eq!(
+            linux_browser_password_from(v, None, &both, None).unwrap(),
+            ("vivaldi-pw".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn channel_browsers_carry_the_stable_browsers_secrets() {
+        for (chan, stable) in [
+            ("chrome-beta", "chrome"),
+            ("chrome-dev", "chrome"),
+            ("chrome-canary", "chrome"),
+            ("edge-beta", "edge"),
+            ("edge-dev", "edge"),
+            ("brave-beta", "brave"),
+            ("brave-nightly", "brave"),
+        ] {
+            let c = LinuxBrowser::from_name(chan).unwrap();
+            let st = LinuxBrowser::from_name(stable).unwrap();
+            assert_eq!(c.keyring_label(), st.keyring_label(), "{chan} linux label");
+            assert_eq!(c.keyring_apps(), st.keyring_apps(), "{chan} linux apps");
+            let cm = MacBrowser::from_name(chan).unwrap();
+            let sm = MacBrowser::from_name(stable).unwrap();
+            assert_eq!(cm.keychain_service(), sm.keychain_service(), "{chan} mac service");
+            assert_eq!(cm.keychain_account(), sm.keychain_account(), "{chan} mac account");
+        }
+        assert_eq!(LinuxBrowser::from_name("edge-canary"), None);
+        assert_eq!(MacBrowser::from_name("edge-canary"), None);
+    }
+
+    #[test]
+    fn opera_linux_aliases_chromium_but_keeps_its_own_app_first() {
+        let o = LinuxBrowser::from_name("opera").unwrap();
+        assert_eq!(o.keyring_label(), "Chromium Safe Storage");
+        assert_eq!(o.keyring_apps(), ["Opera", "chromium"]);
+        assert_eq!(o.keyring_app(), "Opera", "the pre-registry app value is unchanged");
+        let m = MacBrowser::from_name("opera").unwrap();
+        assert_eq!(m.keychain_service(), "Opera Safe Storage");
+        assert_eq!(m.keychain_account(), "Opera");
+    }
+
+    #[test]
+    fn opera_gx_mac_probes_the_2023_service_then_opera() {
+        let gx = MacBrowser::from_name("opera-gx").unwrap();
+        assert_eq!(gx.keychain_services(), ["Opera Safe Storage 2023", "Opera Safe Storage"]);
+        assert_eq!(gx.keychain_service(), "Opera Safe Storage 2023");
+        assert_eq!(gx.keychain_account(), "Opera");
+        // The first candidate that answers wins; missing everywhere is missing.
+        assert_eq!(
+            pick_keychain_outcome(vec![
+                KeychainOutcome::Missing,
+                KeychainOutcome::Found("gx-pw".into()),
+            ]),
+            KeychainOutcome::Found("gx-pw".to_string())
+        );
+        assert_eq!(
+            pick_keychain_outcome(vec![KeychainOutcome::Missing, KeychainOutcome::Missing]),
+            KeychainOutcome::Missing
+        );
+        assert_eq!(
+            pick_keychain_outcome(vec![KeychainOutcome::Missing, KeychainOutcome::Refused]),
+            KeychainOutcome::Refused
+        );
+    }
+
+    #[test]
+    fn vivaldi_mac_names_are_its_own() {
+        let m = MacBrowser::from_name("vivaldi").unwrap();
+        assert_eq!(m.keychain_service(), "Vivaldi Safe Storage");
+        assert_eq!(m.keychain_account(), "Vivaldi");
     }
 }

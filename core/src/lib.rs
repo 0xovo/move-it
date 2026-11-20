@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod bookmarks;
+pub mod browsers;
 pub mod cloud;
 pub mod cookies;
 pub mod engine;
