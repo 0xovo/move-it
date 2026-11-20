@@ -360,17 +360,32 @@ fn scan_target(con: &Connection, keys: &Keys, prefix: Option<LinuxPrefix>) -> Re
     Ok(scan)
 }
 
-fn verify_write_key(keys: &Keys, prefix: Option<LinuxPrefix>, scan: &TargetScan) -> Result<()> {
+fn verify_write_key(
+    keys: &Keys,
+    prefix: Option<LinuxPrefix>,
+    scan: &TargetScan,
+    seed_v11_without_label_rows: bool,
+) -> Result<()> {
     if scan.label_verified {
         return Ok(());
     }
     if scan.label_rows == 0 {
         // No row to check against: an empty store is the fresh-browser case.
         // Trust the key only when it came from this browser's unlocked v2
-        // keyring item; a fallback key must never seed v11 rows.
+        // keyring item; a fallback key must never seed v11 rows. The one
+        // other permission is the forced-prefix move path's, passed in as
+        // `seed_v11_without_label_rows`: the destination key was discovered
+        // on this device, no v11 row in the destination contradicts it,
+        // and the destination browser itself will use that same keyring
+        // item for its own v11 writes. That permission is not trust in
+        // the item, and it never covers the fallback key.
         if prefix == Some(LinuxPrefix::V11) {
             let trusted = matches!(keys, Keys::Cbc { from_libsecret_v2: true, .. });
-            if !trusted {
+            let lock = match keys {
+                Keys::Cbc { lock, .. } | Keys::Gcm { lock } => lock,
+            };
+            let move_seed = seed_v11_without_label_rows && !lock.v11_key_is_fallback();
+            if !trusted && !move_seed {
                 return Err(Error::Refused("cannot verify the browser key before writing v11 values".into()));
             }
         }
@@ -563,7 +578,7 @@ fn import_waiting(
     let mut protected: std::collections::HashSet<i64> = std::collections::HashSet::new();
     if !incoming.is_empty() {
         let scan = scan_target(&tx, keys, prefix)?;
-        verify_write_key(keys, prefix, &scan)?;
+        verify_write_key(keys, prefix, &scan, forced_prefix.is_some())?;
         stats.preserved_undecryptable = scan.preserved_undecryptable;
         protected = scan.protected;
     }
@@ -932,9 +947,9 @@ mod tests {
         let con = Connection::open(&p).unwrap();
         let fallback = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: false };
         let scan = scan_target(&con, &fallback, Some(LinuxPrefix::V11)).unwrap();
-        assert!(verify_write_key(&fallback, Some(LinuxPrefix::V11), &scan).is_err());
+        assert!(verify_write_key(&fallback, Some(LinuxPrefix::V11), &scan, false).is_err());
         let v2 = Keys::Cbc { lock: Lock::linux("secret", LinuxPrefix::V11), from_libsecret_v2: true };
-        assert!(verify_write_key(&v2, Some(LinuxPrefix::V11), &scan).is_ok());
+        assert!(verify_write_key(&v2, Some(LinuxPrefix::V11), &scan, false).is_ok());
     }
 
     #[test]

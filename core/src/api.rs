@@ -630,37 +630,63 @@ impl App {
     /// browser's own keyring key, found through the validated probing
     /// (`oscrypt::linux_browser_password_validated_for`, the route the
     /// harness logins probe uses), never the single first candidate
-    /// `keys_for` returns. A candidate counts as validated when it
-    /// decrypts at least one v11 row in each of the destination's
-    /// stores that carries v11 rows; a store with no v11 rows cannot
-    /// disprove a keyring-found key (its v10 rows open under the
-    /// fallback key whatever is offered, so they prove nothing).
+    /// `keys_for` returns.
     ///
-    /// The move writes under this key with the v11 label, so the key
-    /// must be a real keyring key: when discovery finds only the
-    /// compiled-in fallback, or no candidate validates against the
-    /// destination's own v11 rows, this refuses loudly instead of
-    /// letting the move seal secrets under a publicly known key. The
-    /// returned keys carry the v11 trust flag: a validated keyring key
-    /// is trusted to seed v11 rows in an empty store, the same trust
-    /// `verify_write_key` asks for, extended from Chromium's v2 item
-    /// to any browser whose key validated here.
+    /// Validation is evidence-based, and the only evidence is the
+    /// destination's own v11 rows: v10 rows open under the compiled-in
+    /// fallback whatever candidate is offered, so they prove nothing.
+    /// Two cases:
+    ///
+    /// - The destination HAS v11 rows (in either store): a candidate
+    ///   counts only when it decrypts at least one v11 row in each
+    ///   store that carries them. A candidate that fails is refused;
+    ///   there is no unvalidated path past live rows.
+    /// - The destination has NO v11 rows (an empty store, or a legacy
+    ///   v10-only one): no store evidence exists to validate against,
+    ///   and refusing would break moves into fresh profiles, so the
+    ///   move may proceed with the discovered key - the keyring item
+    ///   the destination browser itself will use for its own v11
+    ///   writes - but ONLY when that key is not the compiled-in
+    ///   fallback. The fallback refuses absolutely, before any write:
+    ///   sealing secrets under a publicly known key is never allowed.
+    ///
+    /// Provenance is carried truthfully: the returned keys keep the
+    /// discovery provenance (the probe's own v2 flag, folded through
+    /// `empty_store_v11_from_trusted_item` exactly as `keys_for`
+    /// does), never a manufactured trust flag. The no-v11-rows case
+    /// is NOT marked validated or trusted; its v11 seeding permission
+    /// travels on the forced-prefix import path itself, named for
+    /// what it is - no v11 rows contradict the discovered key - and
+    /// the store-level check on that path still refuses the fallback
+    /// key outright.
     fn keys_for_local_destination(&self, browser: &str, dir: &Path, slot: &str) -> Result<Keys> {
         let b = LinuxBrowser::from_name(browser).ok_or_else(|| {
             Error::Refused(format!("{} is not a browser Move It can read yet", browser_display(browser)))
         })?;
         let cookies_p = paths::cookies_in(dir, slot);
         let logins_p = paths::login_data_in(dir, slot);
-        let opens_destination = |pw: &str| -> bool {
+        // (v11 rows, of those how many this candidate opens), per store.
+        // The probe keys carry no trust flag: decryption is all that is
+        // being measured, and a flag would say nothing about it.
+        let v11_counts = |pw: &str| -> ((usize, usize), (usize, usize)) {
             let keys = Keys::Cbc {
                 lock: Lock::linux(pw, LinuxPrefix::V10),
-                from_libsecret_v2: true,
+                from_libsecret_v2: false,
             };
-            let (c_total, c_opened) = crate::cookies::v11_decryption(&cookies_p, &keys);
-            let (l_total, l_opened) = logins::v11_decryption(&logins_p, &keys);
+            (
+                crate::cookies::v11_decryption(&cookies_p, &keys),
+                logins::v11_decryption(&logins_p, &keys),
+            )
+        };
+        let has_v11_rows = |pw: &str| -> bool {
+            let ((c_total, _), (l_total, _)) = v11_counts(pw);
+            c_total + l_total > 0
+        };
+        let opens_destination = |pw: &str| -> bool {
+            let ((c_total, c_opened), (l_total, l_opened)) = v11_counts(pw);
             (c_total == 0 || c_opened > 0) && (l_total == 0 || l_opened > 0)
         };
-        let (password, _from_v2) = crate::oscrypt::linux_browser_password_validated_for(
+        let (password, from_v2) = crate::oscrypt::linux_browser_password_validated_for(
             b,
             &|pw, _from_trusted| opens_destination(pw),
         )?;
@@ -671,7 +697,7 @@ impl App {
                 browser_display(browser)
             )));
         }
-        if !opens_destination(&password) {
+        if has_v11_rows(&password) && !opens_destination(&password) {
             return Err(Error::Refused(format!(
                 "the keyring key found for {} does not open that browser's existing v11 cookies \
                  or logins, so it cannot be the key its profile was sealed with; the move is refused",
@@ -680,7 +706,7 @@ impl App {
         }
         Ok(Keys::Cbc {
             lock: Lock::linux(&password, LinuxPrefix::V11),
-            from_libsecret_v2: true,
+            from_libsecret_v2: b.empty_store_v11_from_trusted_item(from_v2),
         })
     }
 
@@ -2970,7 +2996,8 @@ impl App {
         // can never start (reading needs the source's keys, writing needs the
         // target's), so refuse here with the same error instead of showing
         // counts that promise a move. The target's bar is the move's own:
-        // its key must be a validated keyring key, not the fallback.
+        // its key must validate against its v11 rows when it has any,
+        // and must never be the fallback.
         self.keys_for(&src.browser)?;
         self.keys_for_local_destination(&dst.browser, &dst.dir, dst_slot)?;
         let (counts, mut skipped) = self.count_stores(&src, src_slot);
@@ -3041,10 +3068,12 @@ impl App {
             return Err(Error::BrowserOpen);
         }
         let src_keys = self.keys_for(&src.browser)?;
-        // The destination key is the validated keyring key, obtained
-        // before anything is read or recovered: a destination whose key
-        // cannot be obtained or validated fails the move here, before
-        // a single secret is written anywhere.
+        // The destination key is obtained before anything is read or
+        // recovered, under `keys_for_local_destination`'s rule (validated
+        // against the destination's v11 rows when it has any, a discovered
+        // non-fallback key when it has none): a destination whose key
+        // cannot be obtained, or fails that rule, fails the move here,
+        // before a single secret is written anywhere.
         let dst_keys = self.keys_for_local_destination(&dst.browser, &dst.dir, dst_slot)?;
         // A crashed earlier move is put back before a new one, on BOTH
         // browsers: the source may itself be the survivor of a crashed move
@@ -3079,9 +3108,9 @@ impl App {
             browser: &dst.browser,
             display: &dst.display,
         };
-        // Written under the destination's validated keyring key with
-        // the v11 label, never the store-vote label: the vote falls
-        // back to the compiled-in fallback key on legacy or empty
+        // Written under the destination key obtained above with the
+        // v11 label, never the store-vote label: the vote falls back
+        // to the compiled-in fallback key on legacy or empty
         // destination stores.
         let applied = engine::import_with_write_prefix(&dst_prof, &payload, now_micros(), LinuxPrefix::V11)?;
         self.record_landings(&BTreeSet::from([dst.dir.clone()]), &self.load_landed())?;
