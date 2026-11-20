@@ -652,8 +652,16 @@ fn merge_registrations_brave_inner(
         }
         n += 1;
     }
+    // Compute the Secure Preferences strip (including both super
+    // stamps / the seal) before any file is written, mirroring the
+    // secure path: both files are written only after every fallible
+    // step has succeeded, so a seal failure leaves Preferences and
+    // Secure Preferences exactly as they were.
+    let secure_update = prepare_secure_prefs_for_brave(slot, &landed, anchor_lock)?;
     write_json(&prefs_path, &prefs)?;
-    preserve_secure_prefs_for_brave(slot, &landed, anchor_lock)?;
+    if let Some((secure_path, secure)) = secure_update {
+        write_json(&secure_path, &secure)?;
+    }
     Ok(n)
 }
 
@@ -685,20 +693,25 @@ fn merge_registrations_brave_inner(
 /// stays byte-identical, and a file that cannot be parsed is left
 /// alone rather than deleted or failed over. Undo never depends on
 /// this: the journal restores the file byte-for-byte either way.
-fn preserve_secure_prefs_for_brave(
+///
+/// This only prepares the stripped file in memory, stamps and seal
+/// included; the caller writes it (and `Preferences`) only after
+/// this has succeeded, so a fallible stamp or seal cannot leave a
+/// partially applied merge behind.
+fn prepare_secure_prefs_for_brave(
     slot: &Path,
     landed: &[String],
     anchor_lock: Option<AnchorLock>,
-) -> Result<()> {
+) -> Result<Option<(std::path::PathBuf, Value)>> {
     if landed.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let secure_path = slot.join("Secure Preferences");
     if !secure_path.is_file() {
-        return Ok(());
+        return Ok(None);
     }
     let Ok(mut secure) = read_json(&secure_path) else {
-        return Ok(());
+        return Ok(None);
     };
     let mut would_change = false;
     if let Some(settings) = secure
@@ -721,15 +734,18 @@ fn preserve_secure_prefs_for_brave(
         }
     }
     if !would_change {
-        return Ok(());
+        return Ok(None);
     }
+    // Presence check, not a string check: any present, non-null
+    // value counts as carrying a super_encrypted_hash, so a
+    // malformed (e.g. numeric) one still gates the strip below
+    // instead of being left stale by it.
     let had_super_encrypted = secure
         .get("protection")
         .and_then(|p| p.get("super_encrypted_hash"))
-        .and_then(Value::as_str)
-        .is_some();
+        .map_or(false, |v| !v.is_null());
     if had_super_encrypted && anchor_lock.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let mut changed = false;
     if let Some(settings) = secure
@@ -764,9 +780,9 @@ fn preserve_secure_prefs_for_brave(
                 stamp_super_encrypted_hash(&mut secure, seed, anchor)?;
             }
         }
-        write_json(&secure_path, &secure)?;
+        return Ok(Some((secure_path, secure)));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn merge_registrations(
@@ -1414,6 +1430,74 @@ mod tests {
         stamp_super_encrypted_hash(&mut clone, &GOOGLE_CHROME_SEED, (&lock, LinuxPrefix::V11)).unwrap();
         assert_eq!(secure["protection"]["super_encrypted_hash"], clone["protection"]["super_encrypted_hash"]);
         assert_ne!(secure["protection"]["super_encrypted_hash"], "c3VwZXI");
+    }
+
+    #[test]
+    fn brave_anchor_with_a_keyless_lock_fails_loudly() {
+        // Mirror of anchor_with_a_keyless_lock_fails_loudly for the
+        // Brave path: the Secure Preferences carries a
+        // super_encrypted_hash and the one landed id, and the lock
+        // cannot seal for the requested label, so the strip's seal
+        // cannot be computed. The merge must refuse rather than
+        // partially apply, and the refusal must leave BOTH files
+        // byte-identical: Preferences is not written first.
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let prefs_bytes = br#"{"preexisting":"prefs"}"#.to_vec();
+        std::fs::write(slot.join("Preferences"), &prefs_bytes).unwrap();
+        let secure_seed = json!({
+            "extensions": {"settings": {id: {"manifest": {"version": "1.0"}, "state": 1}}},
+            "protection": {
+                "super_mac": "STALE",
+                "super_encrypted_hash": "c3VwZXI",
+                "macs": {"extensions": {
+                    "settings": {id: "MAC"},
+                    "settings_encrypted_hash": {id: "b2xk"},
+                }},
+            },
+        });
+        let secure_bytes = serde_json::to_vec(&secure_seed).unwrap();
+        std::fs::write(slot.join("Secure Preferences"), &secure_bytes).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        let lock = Lock::windows([7u8; 32]);
+        assert!(merge_registrations(&slot, "brave", &regs, Some((&lock, LinuxPrefix::V11))).is_err());
+        assert_eq!(std::fs::read(slot.join("Preferences")).unwrap(), prefs_bytes);
+        assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), secure_bytes);
+    }
+
+    #[test]
+    fn brave_strip_leaves_a_non_string_super_encrypted_file_untouched_without_an_anchor() {
+        // The no-anchor gate is a presence check: a non-string
+        // super_encrypted_hash (here a number) still counts as
+        // carrying one, so with no anchor lock to restamp it the
+        // file is left entirely untouched instead of being stripped
+        // with the field left stale.
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let secure_seed = json!({
+            "extensions": {"settings": {id: {"manifest": {"version": "1.0"}, "state": 1}}},
+            "protection": {
+                "super_mac": "STALE",
+                "super_encrypted_hash": 12345,
+                "macs": {"extensions": {
+                    "settings": {id: "MAC"},
+                    "settings_encrypted_hash": {id: "b2xk"},
+                }},
+            },
+        });
+        let raw = serde_json::to_vec(&secure_seed).unwrap();
+        std::fs::write(slot.join("Secure Preferences"), &raw).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), raw);
+        let prefs: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert!(prefs["extensions"]["settings"][id].is_object());
     }
 
     #[test]
