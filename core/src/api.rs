@@ -1450,6 +1450,19 @@ pub struct MoveReport {
     pub preserved_cookies: u64,
     pub logins: u64,
     pub history_urls: u64,
+    /// Incoming cookies the target already had in a winning copy, kept
+    /// rather than moved (the cookie store's `kept_newer`, summed over
+    /// every landing). Same meaning as in `LocalMoveReport`.
+    #[serde(default)]
+    pub already_present_cookies: u64,
+    /// Incoming logins the target already had in a winning copy (login
+    /// merge skips only, never constraint skips).
+    #[serde(default)]
+    pub already_present_logins: u64,
+    /// History visits that landed (`visits_inserted + visits_updated`),
+    /// including visits on urls already present; see `LocalMoveReport`.
+    #[serde(default)]
+    pub history_visits_moved: u64,
     pub wrote_box: bool,
     /// What this device packed for the other one (including a box already
     /// waiting unchanged in the shared place).
@@ -1539,6 +1552,18 @@ pub struct LocalPreview {
 /// What one same-device move did. `extensions` here counts the extensions whose
 /// saved state was carried, which can be fewer than the preview's installed
 /// count: an extension with no saved state has nothing to carry.
+///
+/// The `already_present_*` fields explain a low or zero moved count: they
+/// count source rows the target already held in a copy that won the merge
+/// (the cookie store's `kept_newer`, and the login store's merge skips
+/// only; login constraint skips are a different outcome and are never
+/// counted here). `history_urls` counts only urls inserted or updated, so
+/// visits that landed on urls the target already had are counted
+/// separately in `history_visits_moved` (`visits_inserted +
+/// visits_updated`): a visit-only change is not hidden behind a zero
+/// `history_urls`. `summary` is the one honest line core stands behind
+/// for the whole move; the harness progress stream and the app shell both
+/// surface it, so every surface agrees on what happened.
 #[derive(Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalMoveReport {
@@ -1555,6 +1580,42 @@ pub struct LocalMoveReport {
     pub preserved_cookies: u64,
     #[serde(default)]
     pub extension_installs: Vec<crate::extinstall::InstallReport>,
+    /// Source cookies the target already had in a winning (newer or
+    /// equal) copy, so they were kept rather than moved.
+    #[serde(default)]
+    pub already_present_cookies: u64,
+    /// Source logins the target already had in a winning copy. Merge
+    /// skips only: a login refused by a database constraint is not
+    /// counted here, because it was not already present.
+    #[serde(default)]
+    pub already_present_logins: u64,
+    /// History visits that landed (`visits_inserted + visits_updated`),
+    /// including visits on urls that were already present and so do not
+    /// show up in `history_urls`.
+    #[serde(default)]
+    pub history_visits_moved: u64,
+    /// The one-line summary of the move, built by core (see
+    /// `local_move_summary`): never an unconditional success line when
+    /// nothing was applied to a non-empty source.
+    #[serde(default)]
+    pub summary: String,
+}
+
+/// The honest one-line summary of a same-device move, from the same
+/// counts the report carries. A move that applied nothing while the
+/// target already held the source rows is a converged success, not an
+/// error and not an unexplained "everything moved": it says the target
+/// already has all of this. A partial overlap says both halves.
+fn local_move_summary(target: &str, moved: u64, already_present: u64) -> String {
+    if moved == 0 && already_present > 0 {
+        format!("Nothing new to move: {target} already has all of this")
+    } else if moved > 0 && already_present > 0 {
+        format!("Moved {moved}, already had {already_present}")
+    } else if moved == 0 {
+        "Nothing to move".to_string()
+    } else {
+        "Everything moved".to_string()
+    }
 }
 
 /// The movable counts of one profile, before anyone decides where they go.
@@ -2402,10 +2463,16 @@ impl App {
                             report.cookies += l.applied.cookies.imported as u64;
                             report.preserved_cookies +=
                                 l.applied.cookies.preserved_undecryptable as u64;
+                            report.already_present_cookies +=
+                                l.applied.cookies.kept_newer as u64;
                             report.logins +=
                                 (l.applied.logins.inserted + l.applied.logins.updated) as u64;
+                            report.already_present_logins +=
+                                l.applied.logins.already_present as u64;
                             if let Some(h) = &l.applied.history {
                                 report.history_urls += (h.urls_inserted + h.urls_updated) as u64;
+                                report.history_visits_moved +=
+                                    (h.visits_inserted + h.visits_updated) as u64;
                             }
                             let into_profile = if l.slot == paths::SINGLE_SLOT {
                                 // "Single" is the engine's name for the
@@ -3115,22 +3182,63 @@ impl App {
         let applied = engine::import_with_write_prefix(&dst_prof, &payload, now_micros(), LinuxPrefix::V11)?;
         self.record_landings(&BTreeSet::from([dst.dir.clone()]), &self.load_landed())?;
 
-        let report = LocalMoveReport {
-            source: src.display.clone(),
-            target: dst.display.clone(),
-            cookies: applied.cookies.imported as u64,
-            logins: (applied.logins.inserted + applied.logins.updated) as u64,
-            history_urls: applied
+        let history_visits_moved = applied
+            .history
+            .as_ref()
+            .map(|h| (h.visits_inserted + h.visits_updated) as u64)
+            .unwrap_or(0);
+        let already_present_cookies = applied.cookies.kept_newer as u64;
+        let already_present_logins = applied.logins.already_present as u64;
+        let report = {
+            let cookies = applied.cookies.imported as u64;
+            let logins = (applied.logins.inserted + applied.logins.updated) as u64;
+            let history_urls = applied
                 .history
                 .as_ref()
                 .map(|h| (h.urls_inserted + h.urls_updated) as u64)
-                .unwrap_or(0),
-            extensions: applied.extensions.ids.len() as u64,
-            locked_cookies: count_locked_cookies_in(&src.dir, src_slot),
-            preserved_cookies: applied.cookies.preserved_undecryptable as u64,
-            extension_installs: applied.extension_installs.reports,
+                .unwrap_or(0);
+            let extensions = applied.extensions.ids.len() as u64;
+            // What actually changed hands, for the summary: the moved
+            // counts above, plus visits that landed on already-present
+            // urls and a bookmarks file that was written, merged or kept
+            // as a sibling (an identical bookmarks file is carried but
+            // changes nothing, so it does not count as moved).
+            let bookmarks_moved = matches!(
+                applied.bookmarks.action,
+                Some(
+                    bookmarks::Action::Written
+                        | bookmarks::Action::Merged
+                        | bookmarks::Action::Conflict
+                )
+            );
+            let moved = cookies
+                + logins
+                + history_urls
+                + history_visits_moved
+                + extensions
+                + u64::from(bookmarks_moved);
+            let summary = local_move_summary(
+                &dst.display,
+                moved,
+                already_present_cookies + already_present_logins,
+            );
+            LocalMoveReport {
+                source: src.display.clone(),
+                target: dst.display.clone(),
+                cookies,
+                logins,
+                history_urls,
+                extensions,
+                locked_cookies: count_locked_cookies_in(&src.dir, src_slot),
+                preserved_cookies: applied.cookies.preserved_undecryptable as u64,
+                extension_installs: applied.extension_installs.reports,
+                already_present_cookies,
+                already_present_logins,
+                history_visits_moved,
+                summary,
+            }
         };
-        on(Progress { frac: 1.0, step: "done".into(), line: "Everything moved".into() });
+        on(Progress { frac: 1.0, step: "done".into(), line: report.summary.clone() });
         Ok(report)
     }
 

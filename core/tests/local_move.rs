@@ -868,3 +868,211 @@ fn local_move_updates_the_home_undo_record() {
     assert_eq!(store_bytes(&dst), before);
     assert!(!a.home_state().unwrap().can_undo);
 }
+
+// ---- Already-present reporting (notes/localmove-noop-investigation.md) ----
+//
+// Two synthetic profiles planted with the same identities; only the
+// timestamps differ, which is what decides the merge. No extensions and
+// no bookmarks, so the report counts are purely cookies/logins/history.
+
+fn plant_dedupe_profile(
+    dir: &Path,
+    stamp: i64,
+    cookie_names: &[&str],
+    login_users: &[&str],
+    history: &[(&str, i64, Vec<i64>)],
+) {
+    fresh_profile(dir);
+    if !cookie_names.is_empty() {
+        let rows: Vec<Cookie> = cookie_names
+            .iter()
+            .map(|n| cookie(".example.com", n, &format!("v-{n}"), stamp))
+            .collect();
+        cookies::import(&dir.join("Default/Cookies"), &rows, &keys()).unwrap();
+    }
+    if !login_users.is_empty() {
+        let rows: Vec<Login> = login_users
+            .iter()
+            .map(|u| login(u, &format!("pw-{u}"), stamp))
+            .collect();
+        logins::import(&dir.join("Default/Login Data"), &rows, &keys(), HostTag::Without).unwrap();
+    }
+    if !history.is_empty() {
+        let mut section = history::Section::default();
+        for (url, last, visits) in history {
+            section.urls.push(history::HistoryUrl {
+                url: (*url).to_string(),
+                title: String::new(),
+                typed_count: 0,
+                last_visit_time: *last,
+                hidden: 0,
+            });
+            for t in visits {
+                section.visits.push(history::Visit {
+                    url: (*url).to_string(),
+                    visit_time: *t,
+                    from_visit_time: None,
+                    transition: 0,
+                    visit_duration: 0,
+                });
+            }
+        }
+        history::import(&dir.join("Default/History"), &section).unwrap();
+    }
+}
+
+#[test]
+fn local_move_destination_newer_reports_already_present() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 1000, vec![1000])];
+    let hist_dst: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 2000, vec![1000])];
+    plant_dedupe_profile(&src, 100, &["sess", "pref"], &["alice"], hist_src);
+    plant_dedupe_profile(&dst, 200, &["sess", "pref"], &["alice"], hist_dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let preview = a.local_preview("brave", "chrome", None, None).unwrap();
+    assert_eq!((preview.cookies, preview.logins, preview.history), (2, 1, 1));
+    let cookies_before = std::fs::read(dst.join("Default/Cookies")).unwrap();
+    let logins_before = std::fs::read(dst.join("Default/Login Data")).unwrap();
+    let mut events: Vec<Progress> = Vec::new();
+    let report = a
+        .local_move("brave", "chrome", None, None, None, &mut |p| events.push(p))
+        .unwrap();
+    assert_eq!((report.cookies, report.logins, report.history_urls), (0, 0, 0));
+    assert_eq!(report.history_visits_moved, 0);
+    assert_eq!(report.already_present_cookies, 2, "the whole cookie preview was already there");
+    assert_eq!(report.already_present_logins, 1, "the whole login preview was already there");
+    assert_eq!(report.summary, "Nothing new to move: Google Chrome already has all of this");
+    assert_ne!(report.summary, "Everything moved");
+    let last = events.last().unwrap();
+    assert_eq!(last.step, "done");
+    assert_eq!(last.line, report.summary, "the progress done line is the report summary");
+    assert_eq!(
+        std::fs::read(dst.join("Default/Cookies")).unwrap(),
+        cookies_before,
+        "kept cookies leave the target store byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(dst.join("Default/Login Data")).unwrap(),
+        logins_before,
+        "kept logins leave the target store byte-identical"
+    );
+}
+
+#[test]
+fn local_move_source_newer_lands_everything_and_reports_no_already_present() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 2000, vec![1000])];
+    let hist_dst: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 1000, vec![1000])];
+    plant_dedupe_profile(&src, 200, &["sess", "pref"], &["alice"], hist_src);
+    plant_dedupe_profile(&dst, 100, &["sess", "pref"], &["alice"], hist_dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 2, "newer source cookies replace the target copies");
+    assert_eq!(report.logins, 1, "the newer source login updates the target copy");
+    assert_eq!(report.history_urls, 1, "the newer last visit updates the url");
+    assert_eq!(report.already_present_cookies, 0);
+    assert_eq!(report.already_present_logins, 0);
+    assert_eq!(report.summary, "Everything moved");
+}
+
+#[test]
+fn local_move_exact_tie_reports_already_present_not_imported() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 1500, vec![1500])];
+    plant_dedupe_profile(&src, 150, &["sess", "pref"], &["alice"], hist);
+    plant_dedupe_profile(&dst, 150, &["sess", "pref"], &["alice"], hist);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!((report.cookies, report.logins, report.history_urls), (0, 0, 0));
+    assert_eq!(report.history_visits_moved, 0);
+    assert_eq!(report.already_present_cookies, 2, "a tie keeps the destination row");
+    assert_eq!(report.already_present_logins, 1, "a tie keeps the destination row");
+    assert_eq!(report.summary, "Nothing new to move: Google Chrome already has all of this");
+}
+
+#[test]
+fn local_move_partial_overlap_reports_moved_and_already_had() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 1000, vec![1000])];
+    let hist_dst: &[(&str, i64, Vec<i64>)] = &[("https://site0.example/", 2000, vec![1000])];
+    plant_dedupe_profile(&src, 100, &["sess", "pref", "extra"], &["alice", "bob"], hist_src);
+    plant_dedupe_profile(&dst, 200, &["sess", "pref"], &["alice"], hist_dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 1, "only the missing cookie lands");
+    assert_eq!(report.already_present_cookies, 2, "the shared cookies were already there, newer");
+    assert_eq!(report.logins, 1, "only the missing login lands");
+    assert_eq!(report.already_present_logins, 1, "the shared login was already there, newer");
+    assert_eq!(report.summary, "Moved 2, already had 3");
+    let got = cookies::export(&dst.join("Default/Cookies"), &keys()).unwrap();
+    assert_eq!(got.len(), 3);
+    let found = logins::export(&dst.join("Default/Login Data"), &keys()).unwrap();
+    assert_eq!(found.len(), 2);
+}
+
+#[test]
+fn local_move_visit_only_history_change_is_reported() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[
+        ("https://site0.example/", 1000, vec![3000, 4000]),
+        ("https://site1.example/", 1000, vec![3000]),
+    ];
+    let hist_dst: &[(&str, i64, Vec<i64>)] = &[
+        ("https://site0.example/", 5000, vec![1000]),
+        ("https://site1.example/", 5000, vec![1000]),
+    ];
+    plant_dedupe_profile(&src, 100, &[], &[], hist_src);
+    plant_dedupe_profile(&dst, 200, &[], &[], hist_dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.history_urls, 0, "no url is inserted or updated");
+    assert_eq!(report.history_visits_moved, 3, "the new visits landed and are reported");
+    assert_eq!(report.summary, "Everything moved");
+    let hist = history::export(&dst.join("Default/History")).unwrap();
+    assert_eq!(hist.urls.len(), 2);
+    assert_eq!(hist.visits.len(), 5, "the target gained the three source visits");
+}
+
+#[test]
+fn local_move_repeat_move_reports_already_present_never_bare_zero() {
+    pin_browser_password();
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    let hist_src: &[(&str, i64, Vec<i64>)] = &[
+        ("https://site0.example/", 1000, vec![1000]),
+        ("https://site1.example/", 1000, vec![1000]),
+    ];
+    plant_dedupe_profile(&src, 100, &["sess", "pref"], &["alice", "bob"], hist_src);
+    plant_dedupe_profile(&dst, 50, &["own"], &["carol"], &[]);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+    let first = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!((first.cookies, first.logins, first.history_urls), (2, 2, 2));
+    assert_eq!((first.already_present_cookies, first.already_present_logins), (0, 0));
+    assert_eq!(first.summary, "Everything moved");
+    let mut events: Vec<Progress> = Vec::new();
+    let second = a
+        .local_move("brave", "chrome", None, None, None, &mut |p| events.push(p))
+        .unwrap();
+    assert_eq!((second.cookies, second.logins, second.history_urls), (0, 0, 0));
+    assert_eq!(second.history_visits_moved, 0);
+    assert_eq!(second.already_present_cookies, 2, "the repeat move finds its cookies already there");
+    assert_eq!(second.already_present_logins, 2, "the repeat move finds its logins already there");
+    assert_eq!(second.summary, "Nothing new to move: Google Chrome already has all of this");
+    assert_eq!(events.last().unwrap().line, second.summary);
+}

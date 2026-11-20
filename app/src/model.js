@@ -33,9 +33,22 @@ export function reportLines(report, { local = false, otherDevice = 'your other c
   const n = v => Number(v || 0).toLocaleString();
   const plural = (v, one, many) => `${n(v)} ${Number(v || 0) === 1 ? one : many}`;
   if (local) {
+    // Core's one-line summary leads when it says something other than the
+    // plain success line, so an all-duplicate move never reads as a bare
+    // zero success in the shell either.
+    if (report.summary && report.summary !== 'Everything moved') lines.push(report.summary);
     lines.push(`${plural(report.logins, 'saved password', 'saved passwords')} moved`);
     lines.push(`${plural(report.historyUrls, 'history item', 'history items')} moved`);
+    if (Number(report.historyVisitsMoved || 0) > 0 && Number(report.historyUrls || 0) === 0) {
+      lines.push(`${plural(report.historyVisitsMoved, 'history visit', 'history visits')} moved`);
+    }
     lines.push(`${plural(report.cookies, 'website login', 'website logins')} moved`);
+    if (Number(report.alreadyPresentLogins || 0) > 0) {
+      lines.push(`${plural(report.alreadyPresentLogins, 'saved password', 'saved passwords')} already in ${report.target || 'the target'}`);
+    }
+    if (Number(report.alreadyPresentCookies || 0) > 0) {
+      lines.push(`${plural(report.alreadyPresentCookies, 'website login', 'website logins')} already in ${report.target || 'the target'}`);
+    }
     return lines;
   }
   if (report.sentProfiles) {
@@ -44,6 +57,13 @@ export function reportLines(report, { local = false, otherDevice = 'your other c
   const received = Number(report.cookies || 0) + Number(report.logins || 0) + Number(report.historyUrls || 0);
   if (received || report.boxesRead) {
     lines.push(`Received: ${plural(report.logins, 'saved password', 'saved passwords')}, ${plural(report.historyUrls, 'history item', 'history items')}, ${plural(report.cookies, 'website login', 'website logins')}`);
+  }
+  const alreadySync = Number(report.alreadyPresentCookies || 0) + Number(report.alreadyPresentLogins || 0);
+  if (alreadySync > 0) {
+    lines.push(`${plural(alreadySync, 'item was', 'items were')} already here and kept`);
+  }
+  if (Number(report.historyVisitsMoved || 0) > 0 && Number(report.historyUrls || 0) === 0 && !report.sentProfiles) {
+    lines.push(`${plural(report.historyVisitsMoved, 'history visit', 'history visits')} moved`);
   }
   if (!report.sentProfiles && !received && !(report.routes || []).length) lines.push('Nothing new to move.');
   for (const line of report.routes || []) {

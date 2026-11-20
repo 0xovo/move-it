@@ -65,7 +65,19 @@ impl Login {
 pub struct Stats {
     pub inserted: usize,
     pub updated: usize,
+    /// Every incoming login that did not land. This is always
+    /// `already_present + constraint_skipped`: the two kinds are counted
+    /// separately below because only one of them means "already there".
     pub skipped: usize,
+    /// Merge skips: the target already holds this identity and its copy
+    /// won the merge (newer, equal, or unreadable and therefore kept), so
+    /// the incoming login was already present and nothing was lost.
+    pub already_present: usize,
+    /// Constraint skips: the write itself was refused by a UNIQUE or
+    /// other SQLite constraint (for example a signon_realm rewrite that
+    /// would collide with another row). These are NOT "already present":
+    /// the incoming login did not land and was not already there either.
+    pub constraint_skipped: usize,
     /// Existing target rows no available key could decrypt. They are
     /// preserved byte-for-byte and never updated over; the count covers
     /// the whole target store, as the cookie store counts them.
@@ -630,7 +642,10 @@ fn import_waiting(
                 .ok_or_else(|| Error::Corrupt("login merge was called with no local rows".into()))?;
             let inc = (l.date_password_modified, l.date_created, l.date_last_used, l.times_used, l.action_url.as_str(), l.signon_realm.as_str());
             if inc != top {
+                // The untouchable target row wins: this identity is
+                // already present in the target, in a copy that stays.
                 stats.skipped += 1;
+                stats.already_present += 1;
                 continue;
             }
             rows = protected_rows;
@@ -643,7 +658,9 @@ fn import_waiting(
         if !rows.is_empty() {
             let (id, wins) = incoming_wins(&rows, l, keys)?;
             if !wins {
+                // The target's copy won the merge: already present.
                 stats.skipped += 1;
+                stats.already_present += 1;
                 continue;
             }
             let pwmod = if l.date_password_modified > 0 { l.date_password_modified } else { l.date_created };
@@ -667,7 +684,12 @@ fn import_waiting(
             // constraint violation becomes a skip and the transaction continues.
             match tx.execute(&stmt, params_from_iter(vals)) {
                 Ok(_) => stats.updated += 1,
-                Err(e) if is_constraint(&e) => stats.skipped += 1,
+                Err(e) if is_constraint(&e) => {
+                    // A constraint refusal is not "already present": the
+                    // incoming login neither landed nor was already there.
+                    stats.skipped += 1;
+                    stats.constraint_skipped += 1;
+                }
                 Err(e) => return Err(sql(e)),
             }
             continue;
@@ -721,7 +743,10 @@ fn import_waiting(
             params_from_iter(put.iter().map(|(_, v)| *v)),
         ) {
             Ok(_) => stats.inserted += 1,
-            Err(e) if is_constraint(&e) => stats.skipped += 1,
+            Err(e) if is_constraint(&e) => {
+                stats.skipped += 1;
+                stats.constraint_skipped += 1;
+            }
             Err(e) => return Err(sql(e)),
         }
     }
@@ -936,7 +961,7 @@ mod tests {
         assert_eq!(before[0].password_value, "old-pw");
         let current = Keys::Cbc { lock: Lock::linux("new-secret", LinuxPrefix::V11), from_libsecret_v2: false };
         let stats = import(&p, &[login("u", "new-pw", D2)], &current, HostTag::Without).unwrap();
-        assert_eq!(stats, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 1 });
+        assert_eq!(stats, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 1 });
         assert_eq!(count(&p), 1);
         assert_eq!(blob(&p, "u"), seed);
     }
@@ -1093,7 +1118,7 @@ mod tests {
         for tag in [HostTag::Without, HostTag::With] {
             let (_t, p) = db();
             let s = import(&p, &[login("u", "dummy-pw", D1)], &linux(), tag).unwrap();
-            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0, preserved_undecryptable: 0 });
+            assert_eq!(s, Stats { inserted: 1, updated: 0, skipped: 0, already_present: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
             let back = export(&p, &linux()).unwrap();
             assert_eq!(back, vec![login("u", "dummy-pw", D1)]);
             let raw = blob(&p, "u");
@@ -1155,7 +1180,7 @@ mod tests {
         let (_t, p) = db();
         import(&p, &[login("u", "new", D2)], &linux(), HostTag::Without).unwrap();
         let s = import(&p, &[login("u", "old", D1)], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 0 });
         assert_eq!(export(&p, &linux()).unwrap()[0].password_value, "new");
     }
 
@@ -1198,7 +1223,7 @@ mod tests {
         assert_eq!(export(&p1, &linux()).unwrap(), export(&p2, &linux()).unwrap());
         assert_eq!(export(&p1, &linux()).unwrap()[0].password_value, "bravo");
         let s = import(&p1, &[y], &linux(), HostTag::With).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 0, skipped: 1, already_present: 1, constraint_skipped: 0, preserved_undecryptable: 0 });
     }
 
     #[test]
@@ -1396,7 +1421,7 @@ mod tests {
         let mut l = login("", "pw", D2);
         l.action_url = String::new();
         let s = import(&p, &[l], &linux(), HostTag::Without).unwrap();
-        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0, preserved_undecryptable: 0 });
+        assert_eq!(s, Stats { inserted: 0, updated: 1, skipped: 0, already_present: 0, constraint_skipped: 0, preserved_undecryptable: 0 });
         assert_eq!(count(&p), 1);
     }
 
@@ -1468,6 +1493,8 @@ mod tests {
         collide.password_value = "new".into();
         let s = import(&p, &[collide, fine], &linux(), HostTag::Without).unwrap();
         assert_eq!(s.skipped, 1, "the colliding login is skipped");
+        assert_eq!(s.constraint_skipped, 1, "a constraint skip is counted apart from merge skips");
+        assert_eq!(s.already_present, 0, "a constraint skip is never labelled already present");
         assert!(s.inserted + s.updated >= 1, "the clean login still lands");
         let rows: i64 = Connection::open(&p).unwrap().query_row("SELECT COUNT(*) FROM logins", [], |r| r.get(0)).unwrap();
         assert!(rows >= 2, "nothing was lost; the DB is intact");
