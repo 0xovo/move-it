@@ -164,6 +164,11 @@ fn take(prefix: &str, dir: &Path, rel: &str, files: &mut BTreeMap<String, Vec<u8
         let path = dir.join(&name);
         let rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         if ft.is_dir() {
+            // Cache folders never travel, wherever they sit in a carried
+            // tree (see `crate::paths::PROFILE_CACHE_DIRS`).
+            if crate::paths::is_cache_dir_name(&name) {
+                continue;
+            }
             take(prefix, &path, &rel, files, entries)?;
         } else if ft.is_file() {
             let data = fs::read(&path).map_err(|e| io(e, "cannot read", &path))?;
@@ -176,8 +181,8 @@ fn take(prefix: &str, dir: &Path, rel: &str, files: &mut BTreeMap<String, Vec<u8
 }
 
 /// Read every extension state file under `Default`. No file inside a collected folder is
-/// excluded (a leveldb store is only coherent whole); the manifest records size + SHA-256 per
-/// file so the receiving side can verify before writing anything.
+/// excluded, cache folders aside (a leveldb store is only coherent whole); the manifest
+/// records size + SHA-256 per file so the receiving side can verify before writing anything.
 pub fn collect(profile: &Path) -> Result<Collected> {
     collect_in(profile, "Default")
 }
@@ -235,6 +240,11 @@ fn plan(ext_manifest: &Value, files: &BTreeMap<String, Vec<u8>>) -> Result<Targe
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Corrupt("extensions manifest entry has no path".into()))?;
         validate_ext_logical_path(logical)?;
+        // A box from anywhere else can still name cache files; they are
+        // excluded on this side too, never written into the profile.
+        if crate::paths::logical_path_has_cache_dir(logical) {
+            continue;
+        }
         if !files.contains_key(logical) {
             return Err(Error::Corrupt(format!("bundle payload is missing the bytes for extension file {logical}")));
         }

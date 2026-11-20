@@ -354,6 +354,10 @@ fn walk_collect(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Vec<u8>>) -
         // imported extension its verification files (fix 3 round 2).
         let logical = format!("{prefix}/{name}");
         if ft.is_dir() {
+            // Cache folders never travel (see `crate::paths::PROFILE_CACHE_DIRS`).
+            if crate::paths::is_cache_dir_name(&name) {
+                continue;
+            }
             walk_collect(&ent.path(), &logical, out)?;
         } else if ft.is_file() {
             let data = fs::read(&ent.path()).map_err(|e| io(e, "cannot read", &ent.path()))?;
@@ -369,6 +373,10 @@ fn write_bins_from_payload(slot: &Path, bins: &BTreeMap<String, Vec<u8>>) -> Res
     // must not leave a half-installed tree behind.
     let mut plan: Vec<(PathBuf, &Vec<u8>)> = Vec::with_capacity(bins.len());
     for (logical, data) in bins {
+        // Cache files are excluded on this side too: never written.
+        if crate::paths::logical_path_has_cache_dir(logical) {
+            continue;
+        }
         let rest = logical
             .strip_prefix(&format!("{EXT_BIN_PREFIX}/"))
             .ok_or_else(|| Error::Corrupt(format!("extension binary path {logical:?} has wrong prefix")))?;

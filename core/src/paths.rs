@@ -16,6 +16,36 @@ pub const DEFAULT_SLOT: &str = "Default";
 /// No real Chromium profile folder is ever named this.
 pub const SINGLE_SLOT: &str = "Single";
 
+/// GPU/shader/code cache folders a Chromium browser keeps at its
+/// user-data root. They are built for the source machine's GPU and
+/// driver, rebuild on their own wherever the profile lands, and must
+/// never travel: a moved profile carrying them died during browser
+/// startup inside another machine's graphics stack.
+pub const ROOT_CACHE_DIRS: &[&str] = &["ShaderCache", "GrShaderCache"];
+
+/// The same cache class at the per-profile level (inside one profile
+/// folder): the full set Chromium writes there.
+pub const PROFILE_CACHE_DIRS: &[&str] = &[
+    "GPUCache",
+    "ShaderCache",
+    "GrShaderCache",
+    "DawnWebGPUCache",
+    "DawnGraphiteCache",
+    "Code Cache",
+];
+
+/// True when `name` is one of the cache folders, at either level.
+pub fn is_cache_dir_name(name: &str) -> bool {
+    ROOT_CACHE_DIRS.contains(&name) || PROFILE_CACHE_DIRS.contains(&name)
+}
+
+/// True when any component of a `/`-joined logical payload path is a
+/// cache folder: such an entry is excluded on the way into a box and on
+/// the way out of one.
+pub fn logical_path_has_cache_dir(logical: &str) -> bool {
+    logical.split('/').any(is_cache_dir_name)
+}
+
 /// The folder one profile lives in, inside its browser's folder.
 /// For [`SINGLE_SLOT`] the root itself is the profile folder.
 pub fn slot_dir(root: &Path, slot: &str) -> PathBuf {
