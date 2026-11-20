@@ -475,7 +475,18 @@ pub fn install_in(
             version_dirs(&ext_root, id)?
         };
         let Some(ver) = pick_version(&versions) else {
-            reports.push(store_report(id, "failed", "could not install: no extension files on disk".into()));
+            if registrations.contains_key(id) {
+                // No binary tree travels for an unpacked extension: its
+                // files stay where the copied registration entry points,
+                // and the registration merge above is its install.
+                reports.push(store_report(
+                    id,
+                    "installed",
+                    format!("installed in {browser_display} with registration copied from the source"),
+                ));
+            } else {
+                reports.push(store_report(id, "failed", "could not install: no extension files on disk".into()));
+            }
             continue;
         };
         let ver_dir = ext_root.join(id).join(ver);

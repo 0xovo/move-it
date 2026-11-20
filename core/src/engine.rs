@@ -95,12 +95,14 @@ pub fn export(p: &Profile, origin: &str, kinds: Option<&[String]>) -> Result<Pay
     if wants_kind(kinds, "extensions") {
         let ext = extstate::collect_in(p.dir, p.slot)?;
         let ls = localstorage::export_in(p.dir, p.slot)?;
-        let ids: Vec<String> = ext
-            .manifest
-            .get("installed_ids")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-            .unwrap_or_default();
+        // Registrations are collected for every extension the profile
+        // carries state for, not only the ones with a folder under
+        // Extensions: an unpacked extension (loaded from a folder
+        // outside the profile) has no binary tree in the profile, but
+        // the browser did register it in Preferences, and that
+        // registration is the only thing that makes the target browser
+        // run it again. Its state folders are what mark it as carried.
+        let ids = extstate::extension_id_candidates_in(p.dir, p.slot)?;
         let regs = extinstall::collect_registrations_in(p.dir, p.slot, &ids)?;
         m.insert("extensions".into(), Value::Object(ext.manifest));
         m.insert("ext_registrations".into(), Value::Object(regs));
@@ -166,6 +168,32 @@ fn installed_ids(ext_manifest: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The extensions an import must install and register: the ones with a
+/// binary tree in the profile (`installed_ids`) plus every id the box
+/// carries a registration for. The second set is what an unpacked
+/// extension arrives as (state and a Preferences entry, no binary tree);
+/// installing only the first set left its state on disk with no
+/// registration, so no target browser ever ran it.
+fn install_ids(ext_manifest: &Value, regs: &Map<String, Value>) -> Vec<String> {
+    let mut ids = installed_ids(ext_manifest);
+    for id in regs.keys() {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    ids.sort();
+    ids
+}
+
+fn registrations_of(payload: &Payload) -> Map<String, Value> {
+    payload
+        .manifest
+        .get("ext_registrations")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn apply_one(
     root: &std::path::Path,
     slot: &str,
@@ -209,14 +237,8 @@ fn apply_one(
     if m.contains_key("extensions") {
         a.extensions = extstate::import_in(root, slot, &d.ext_manifest, &d.payload.ext_files)?;
         a.localstorage = localstorage::import_in(root, slot, &d.localstorage, now_us)?;
-        let ids = installed_ids(&d.ext_manifest);
-        let regs = d
-            .payload
-            .manifest
-            .get("ext_registrations")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let regs = registrations_of(d.payload);
+        let ids = install_ids(&d.ext_manifest, &regs);
         a.extension_installs =
             extinstall::install_in(root, slot, browser, display, &ids, &d.payload.ext_bins, &regs, keys)?;
     }
@@ -250,7 +272,7 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
         dirs.extend(extinstall::target_paths(
             p.dir,
             p.slot,
-            &installed_ids(ext_manifest),
+            &install_ids(ext_manifest, &registrations_of(box_payload)),
             &box_payload.ext_bins,
         ));
         dirs
@@ -319,14 +341,10 @@ pub fn import(p: &Profile, box_payload: &Payload, now_us: i64) -> Result<Applied
         if m.contains_key("extensions") {
             a.extensions = extstate::import_in(p.dir, p.slot, ext_manifest, &box_payload.ext_files)?;
             a.localstorage = localstorage::import_in(p.dir, p.slot, &ls_in, now_us)?;
-            let ids = installed_ids(ext_manifest);
+            let regs = registrations_of(box_payload);
+            let ids = install_ids(ext_manifest, &regs);
             let display = if p.display.is_empty() { "the browser" } else { p.display };
             let browser = if p.browser.is_empty() { "chrome" } else { p.browser };
-            let regs = m
-                .get("ext_registrations")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
             a.extension_installs = extinstall::install_in(
                 p.dir,
                 p.slot,
@@ -562,7 +580,7 @@ pub(crate) fn import_many_preserving(
         ext_t.extend(extinstall::target_paths(
             root,
             slot,
-            &installed_ids(&d.ext_manifest),
+            &install_ids(&d.ext_manifest, &registrations_of(d.payload)),
             &d.payload.ext_bins,
         ));
         for (j, dir) in ext_t.into_iter().enumerate() {
