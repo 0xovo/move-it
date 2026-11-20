@@ -348,7 +348,16 @@ fn stamp_super_encrypted_hash(root: &mut Value, seed: &[u8], anchor: AnchorLock)
 }
 
 pub fn uses_secure_extension_prefs(browser: &str) -> bool {
-    !matches!(browser, "brave")
+    // The whole Brave family keeps registrations in plain Preferences
+    // only. The registry's channel rows (brave-beta, brave-nightly)
+    // record the stable browser they belong to, so the family match
+    // goes through the registry rather than the exact id string: a
+    // channel build named here must not take the Chrome secure-prefs
+    // merge just because its id is not literally "brave".
+    match crate::browsers::by_id(browser) {
+        Some(def) => !(def.id == "brave" || def.channel_of == Some("brave")),
+        None => !matches!(browser, "brave"),
+    }
 }
 
 pub fn seed_for_browser(browser: &str) -> &'static [u8] {
@@ -414,6 +423,93 @@ fn stamp_super_mac(root: &mut Value, seed: &[u8], device_id: &str) -> Result<()>
     Ok(())
 }
 
+/// The version a registration entry carries, as a numeric dotted
+/// vector: `manifest.version` in the shape Chromium writes, with a
+/// top-level `version` as a fallback. Anything else (missing, or a
+/// component that is not a plain number) is unversioned.
+fn entry_version(entry: &Value) -> Option<Vec<u64>> {
+    let raw = entry
+        .get("manifest")
+        .and_then(|m| m.get("version"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("version").and_then(Value::as_str))?;
+    let mut out = Vec::new();
+    for part in raw.split('.') {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        out.push(part.parse().ok()?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn version_cmp(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The folder an unpacked (developer-mode) registration points at,
+/// when the entry carries one: an absolute path outside the profile.
+/// Packed and Web Store entries carry a profile-relative path, so an
+/// absolute one is the unpacked shape. Windows-shaped absolute paths
+/// count too: a sealed box can carry another machine's entry verbatim,
+/// and on this machine such a path simply does not exist.
+fn unpacked_path(entry: &Value) -> Option<&str> {
+    let path = entry.get("path").and_then(Value::as_str)?;
+    let windows_absolute = path.len() >= 3
+        && path.as_bytes()[1] == b':'
+        && matches!(path.as_bytes()[2], b'\\' | b'/');
+    (Path::new(path).is_absolute() || windows_absolute || path.starts_with("\\\\")).then_some(path)
+}
+
+/// Merge one source registration into a target settings map without
+/// ever downgrading what the target already holds:
+///
+/// - No target entry: the source entry lands, as before.
+/// - The source entry is unpacked and its folder does not exist on
+///   this machine, while the target already holds an entry for the
+///   id: the target's entry stays. The incoming one points at a
+///   folder this machine does not have (on the sealed path, a foreign
+///   machine's folder), so replacing a working local registration
+///   with it would break the extension here.
+/// - Both entries carry a version: the source entry replaces the
+///   target's only when its version is strictly higher. Tie rule:
+///   equal versions keep the target's entry - its path, state and
+///   permissions are this machine's own, and an equal-version foreign
+///   entry has nothing to add.
+/// - Only the target's entry carries a version: it stays (the source
+///   entry cannot prove it is newer). Only the source's, or neither:
+///   the source entry lands, as before.
+fn merge_entry(settings: &mut Map<String, Value>, id: &str, entry: &Value) {
+    let Some(existing) = settings.get(id) else {
+        settings.insert(id.to_string(), entry.clone());
+        return;
+    };
+    if let Some(path) = unpacked_path(entry) {
+        if !Path::new(path).exists() {
+            return;
+        }
+    }
+    match (entry_version(existing), entry_version(entry)) {
+        (Some(have), Some(incoming)) => {
+            if version_cmp(&incoming, &have) == std::cmp::Ordering::Greater {
+                settings.insert(id.to_string(), entry.clone());
+            }
+        }
+        (Some(_), None) => {}
+        _ => {
+            settings.insert(id.to_string(), entry.clone());
+        }
+    }
+}
+
 fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<Map<String, Value>> {
     let ext = root
         .as_object_mut()
@@ -423,7 +519,7 @@ fn merge_into_file(root: &mut Value, regs: &Map<String, Value>) -> Result<Map<St
         return Err(Error::Corrupt("cannot merge into preferences file".into()));
     };
     for (id, entry) in regs {
-        ext.insert(id.clone(), entry.clone());
+        merge_entry(&mut *ext, id, entry);
     }
     Ok(ext.clone())
 }
@@ -519,15 +615,64 @@ pub fn merge_registrations_brave(slot: &Path, regs: &Map<String, Value>) -> Resu
     };
     let mut n = 0;
     for (id, entry) in regs {
-        settings.insert(id.clone(), entry.clone());
+        merge_entry(&mut *settings, id, entry);
         n += 1;
     }
     write_json(&prefs_path, &prefs)?;
-    let secure = slot.join("Secure Preferences");
-    if secure.is_file() {
-        fs::remove_file(&secure).map_err(|e| io(e, "cannot remove", &secure))?;
-    }
+    preserve_secure_prefs_for_brave(slot, regs)?;
     Ok(n)
+}
+
+/// Brave does not read `Secure Preferences` for extension
+/// registrations, but the file is the target's own protected store:
+/// it carries other extensions' registrations and unrelated protected
+/// keys, and deleting it outright (the old behaviour) destroyed all
+/// of that in the live profile the moment a move landed. This merge
+/// owns only the registrations it just carried into plain
+/// `Preferences`, so only those ids are stripped from the secure
+/// file - from `extensions.settings` and from the pref-hash macs
+/// keyed by the same ids - and everything else is left exactly as it
+/// was. The file is rewritten only when something was actually
+/// stripped, so an untouched file stays byte-identical, and a file
+/// that cannot be parsed is left alone rather than deleted or failed
+/// over. Undo never depends on this: the journal restores the file
+/// byte-for-byte either way.
+fn preserve_secure_prefs_for_brave(slot: &Path, regs: &Map<String, Value>) -> Result<()> {
+    let secure_path = slot.join("Secure Preferences");
+    if !secure_path.is_file() {
+        return Ok(());
+    }
+    let Ok(mut secure) = read_json(&secure_path) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    if let Some(settings) = secure
+        .get_mut("extensions")
+        .and_then(|e| e.get_mut("settings"))
+        .and_then(Value::as_object_mut)
+    {
+        for id in regs.keys() {
+            changed |= settings.remove(id).is_some();
+        }
+    }
+    if let Some(macs) = secure
+        .get_mut("protection")
+        .and_then(|p| p.get_mut("macs"))
+        .and_then(|m| m.get_mut("extensions"))
+        .and_then(Value::as_object_mut)
+    {
+        for key in ["settings", "settings_encrypted_hash"] {
+            if let Some(by_id) = macs.get_mut(key).and_then(Value::as_object_mut) {
+                for id in regs.keys() {
+                    changed |= by_id.remove(id).is_some();
+                }
+            }
+        }
+    }
+    if changed {
+        write_json(&secure_path, &secure)?;
+    }
+    Ok(())
 }
 
 pub fn merge_registrations(
@@ -904,6 +1049,119 @@ mod tests {
             stored_super_mac,
             calculate_super_mac(&GOOGLE_CHROME_SEED, &chromium_device_id(), &secure["protection"]["macs"]).unwrap()
         );
+    }
+
+    #[test]
+    fn brave_family_uses_plain_preferences() {
+        assert!(!uses_secure_extension_prefs("brave"));
+        assert!(!uses_secure_extension_prefs("brave-beta"));
+        assert!(!uses_secure_extension_prefs("brave-nightly"));
+        assert!(uses_secure_extension_prefs("chrome"));
+        assert!(uses_secure_extension_prefs("chrome-beta"));
+        assert!(uses_secure_extension_prefs("chromium"));
+    }
+
+    #[test]
+    fn brave_merge_preserves_secure_preferences_content() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let other = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let secure_seed = json!({
+            "extensions": {"settings": {
+                id: {"manifest": {"version": "9.9"}, "state": 1},
+                other: {"manifest": {"version": "3.0"}, "state": 1},
+            }},
+            "protection": {"macs": {"extensions": {"settings": {id: "MAC", other: "MAC2"}}}},
+            "unrelated": {"protected": "keep-me"},
+        });
+        std::fs::write(slot.join("Secure Preferences"), serde_json::to_vec(&secure_seed).unwrap()).unwrap();
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"state": 1, "manifest": {"version": "1.0"}}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        // The file survives: the other extension and the unrelated
+        // protected keys are untouched, and only the merged id's own
+        // secure entries (which this merge now owns in Preferences)
+        // are stripped.
+        let secure: Value =
+            serde_json::from_slice(&std::fs::read(slot.join("Secure Preferences")).unwrap()).unwrap();
+        assert_eq!(secure["unrelated"]["protected"], "keep-me");
+        assert!(secure["extensions"]["settings"][other].is_object());
+        assert!(secure["extensions"]["settings"].get(id).is_none());
+        assert!(secure["protection"]["macs"]["extensions"]["settings"].get(id).is_none());
+        assert_eq!(secure["protection"]["macs"]["extensions"]["settings"][other], "MAC2");
+        let prefs: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert!(prefs["extensions"]["settings"][id].is_object());
+    }
+
+    #[test]
+    fn brave_merge_leaves_an_unrelated_secure_file_byte_identical() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let raw = br#"{"unrelated":  {"protected": "keep-me"}}"#;
+        std::fs::write(slot.join("Secure Preferences"), raw).unwrap();
+        let mut regs = Map::new();
+        regs.insert("nkbihfbeogaeaoehlefnkodbefgpgknn".into(), json!({"state": 1}));
+        merge_registrations_brave(&slot, &regs).unwrap();
+        assert_eq!(std::fs::read(slot.join("Secure Preferences")).unwrap(), raw.to_vec());
+    }
+
+    #[test]
+    fn registration_merge_never_downgrades_the_target_entry() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let target_entry = json!({"manifest": {"version": "2.0"}, "path": "local/2.0_0", "state": 1});
+        for name in ["Preferences", "Secure Preferences"] {
+            let seed = json!({"extensions": {"settings": {id: target_entry}}});
+            std::fs::write(slot.join(name), serde_json::to_vec(&seed).unwrap()).unwrap();
+        }
+        // A lower source version replaces nothing, in either file.
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"manifest": {"version": "1.0"}, "path": "foreign/1.0_0", "state": 1}));
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        for name in ["Preferences", "Secure Preferences"] {
+            let got: Value = serde_json::from_slice(&std::fs::read(slot.join(name)).unwrap()).unwrap();
+            assert_eq!(got["extensions"]["settings"][id]["manifest"]["version"], "2.0", "{name}");
+            assert_eq!(got["extensions"]["settings"][id]["path"], "local/2.0_0", "{name}");
+        }
+        // Tie rule: an equal version also keeps the target's entry.
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"manifest": {"version": "2.0"}, "path": "foreign/2.0_0", "state": 0}));
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(got["extensions"]["settings"][id]["path"], "local/2.0_0");
+        // A strictly higher source version does replace it.
+        let mut regs = Map::new();
+        regs.insert(id.into(), json!({"manifest": {"version": "3.0"}, "path": "new/3.0_0", "state": 1}));
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(got["extensions"]["settings"][id]["manifest"]["version"], "3.0");
+    }
+
+    #[test]
+    fn registration_merge_keeps_target_over_a_missing_unpacked_source() {
+        let t = tempfile::tempdir().unwrap();
+        let slot = t.path().join("Default");
+        std::fs::create_dir_all(&slot).unwrap();
+        let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+        let seed = json!({"extensions": {"settings": {id: {"manifest": {"version": "1.0"}, "path": "local/1.0_0", "state": 1}}}});
+        std::fs::write(slot.join("Preferences"), serde_json::to_vec(&seed).unwrap()).unwrap();
+        // An unpacked source entry pointing at a folder this machine
+        // does not have never replaces a target entry, even at a
+        // higher version.
+        let mut regs = Map::new();
+        regs.insert(
+            id.into(),
+            json!({"manifest": {"version": "9.0"}, "path": "/no/such/folder/on/this/machine", "location": 8, "state": 1}),
+        );
+        merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+        let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+        assert_eq!(got["extensions"]["settings"][id]["path"], "local/1.0_0");
+        assert_eq!(got["extensions"]["settings"][id]["manifest"]["version"], "1.0");
     }
 
     #[test]
