@@ -294,7 +294,7 @@ fn parse_v2_zip(raw: &[u8]) -> Result<Payload> {
         .filter_map(|i| {
             zr.by_index(i)
                 .ok()
-                .map(|f| f.name().to_string())
+                .and_then(|f| f.name().ok().map(|n| n.into_owned()))
                 .filter(|n| n.starts_with(EXT_BIN_ZIP_PREFIX))
         })
         .collect();
