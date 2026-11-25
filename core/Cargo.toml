@@ -23,7 +23,7 @@ thiserror = "2"
 # ureq 3.4.0 (MIT/Apache-2.0): blocking HTTP client for provider APIs and OAuth token exchange.
 ureq = "=3.4.0"
 # zip (MIT): the v2 payload container, deflate only.
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 # Argon2id (RustCrypto, MIT/Apache-2.0): makes the pairing code slow to guess.
 argon2 = "0.5"
