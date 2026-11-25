@@ -638,9 +638,15 @@ impl App {
     /// Two cases:
     ///
     /// - The destination HAS v11 rows (in either store): a candidate
-    ///   counts only when it decrypts at least one v11 row in each
-    ///   store that carries them. A candidate that fails is refused;
-    ///   there is no unvalidated path past live rows.
+    ///   counts only when it decrypts a strict majority of the v11
+    ///   rows in each store that carries them (opens > 50% per
+    ///   non-empty store). A key that opens only a minority - a stale
+    ///   or aliased keyring item left from a rotation, say - is not
+    ///   proven to be the destination's live key, however many rows
+    ///   it opens. A candidate that fails is refused; there is no
+    ///   unvalidated path past live rows. The live key still passes
+    ///   when a small number of dead rows sealed under an older key
+    ///   sit in the store: majority, not unanimity, is the bar.
     /// - The destination has NO v11 rows (an empty store, or a legacy
     ///   v10-only one): no store evidence exists to validate against,
     ///   and refusing would break moves into fresh profiles, so the
@@ -682,9 +688,12 @@ impl App {
             let ((c_total, _), (l_total, _)) = v11_counts(pw);
             c_total + l_total > 0
         };
+        // Strict majority per non-empty store: a candidate that opens
+        // only a minority of a store's v11 rows is not that store's
+        // live key, and sealing under it would strand every moved row.
         let opens_destination = |pw: &str| -> bool {
             let ((c_total, c_opened), (l_total, l_opened)) = v11_counts(pw);
-            (c_total == 0 || c_opened > 0) && (l_total == 0 || l_opened > 0)
+            (c_total == 0 || c_opened * 2 > c_total) && (l_total == 0 || l_opened * 2 > l_total)
         };
         let (password, from_v2) = crate::oscrypt::linux_browser_password_validated_for(
             b,
@@ -1606,6 +1615,12 @@ pub struct LocalMoveReport {
     pub preserved_cookies: u64,
     #[serde(default)]
     pub extension_installs: Vec<crate::extinstall::InstallReport>,
+    /// Extensions whose install step reported `failed`: their state may
+    /// have landed, but the target browser will not run them, so they
+    /// are never counted in `extensions` or in the summary's moved
+    /// figure, and the summary names them instead of claiming success.
+    #[serde(default)]
+    pub extension_install_failed: u64,
     /// Source cookies the target already had in a winning (newer or
     /// equal) copy, so they were kept rather than moved.
     #[serde(default)]
@@ -1657,10 +1672,11 @@ pub struct LocalMoveReport {
 ///   error and not an unexplained "everything moved").
 /// - something landed, the rest already present, nothing unreadable or
 ///   refused: both halves are named.
-/// - anything kept unreadable, refused by a constraint, or parked as a
-///   bookmarks conflict: those rows are named in the line, and the line
-///   never claims "all of this" or a bare "Everything moved", because
-///   those rows neither landed nor were already there.
+/// - anything kept unreadable, refused by a constraint, parked as a
+///   bookmarks conflict, or failed at the extension install step: those
+///   rows are named in the line, and the line never claims "all of
+///   this" or a bare "Everything moved", because those rows neither
+///   landed nor were already there.
 /// - a genuinely empty move: "Nothing to move".
 fn local_move_summary(
     target: &str,
@@ -1670,6 +1686,7 @@ fn local_move_summary(
     kept_unreadable: u64,
     constraint_skipped: u64,
     bookmarks_conflict: u64,
+    extension_install_failed: u64,
 ) -> String {
     let mut notes: Vec<String> = Vec::new();
     if kept_unreadable > 0 {
@@ -1688,6 +1705,12 @@ fn local_move_summary(
     if bookmarks_conflict > 0 {
         notes.push(format!(
             "the bookmarks file could not be merged into {target} and was kept beside it"
+        ));
+    }
+    if extension_install_failed > 0 {
+        let item = if extension_install_failed == 1 { "extension" } else { "extensions" };
+        notes.push(format!(
+            "{extension_install_failed} {item} could not be installed in {target} and did not land"
         ));
     }
     let landed = moved > 0 || visits_moved > 0;
@@ -3310,7 +3333,27 @@ impl App {
                 .as_ref()
                 .map(|h| (h.urls_inserted + h.urls_updated) as u64)
                 .unwrap_or(0);
-            let extensions = applied.extensions.ids.len() as u64;
+            // An extension whose install step failed does not count as
+            // moved: its state may have landed, but the target browser
+            // will not run it. `pending_open` still counts: install_in
+            // only reports it after the binaries are on disk and
+            // register_store_extension has placed the external
+            // registration, so the browser's next open is the only
+            // step left, and it is the browser's, not the move's.
+            let failed_installs: std::collections::BTreeSet<&str> = applied
+                .extension_installs
+                .reports
+                .iter()
+                .filter(|r| r.status == "failed")
+                .map(|r| r.id.as_str())
+                .collect();
+            let extension_install_failed = failed_installs.len() as u64;
+            let extensions = applied
+                .extensions
+                .ids
+                .iter()
+                .filter(|id| !failed_installs.contains(id.as_str()))
+                .count() as u64;
             // What actually changed hands, for the summary: the distinct
             // things that landed. Visits are not added (a new url and its
             // visits are one thing; visits on already-present urls keep
@@ -3334,6 +3377,7 @@ impl App {
                 kept_unreadable_cookies + kept_unreadable_logins,
                 constraint_skipped_logins,
                 u64::from(bookmarks_conflict),
+                extension_install_failed,
             );
             LocalMoveReport {
                 source: src.display.clone(),
@@ -3345,6 +3389,7 @@ impl App {
                 locked_cookies: count_locked_cookies_in(&src.dir, src_slot),
                 preserved_cookies: applied.cookies.preserved_undecryptable as u64,
                 extension_installs: applied.extension_installs.reports,
+                extension_install_failed,
                 already_present_cookies,
                 already_present_logins,
                 history_visits_moved,
@@ -3657,6 +3702,21 @@ mod tests {
         app.welcome_start().unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"in progress");
         drop(tx);
+    }
+
+    #[test]
+    fn local_move_summary_names_failed_extension_installs() {
+        // A failed install is a not-landed bucket like kept_unreadable:
+        // the line names it and never claims full success, even when
+        // everything else landed.
+        let s = local_move_summary("Google Chrome", 3, 0, 0, 0, 0, 0, 1);
+        assert!(s.contains("1 extension could not be installed in Google Chrome and did not land"), "{s}");
+        assert!(!s.contains("Everything moved"), "{s}");
+        let s = local_move_summary("Google Chrome", 0, 0, 0, 0, 0, 0, 2);
+        assert!(s.contains("2 extensions could not be installed"), "{s}");
+        assert!(!s.contains("Everything moved"), "{s}");
+        // No failures: the honest success line is unchanged.
+        assert_eq!(local_move_summary("Google Chrome", 3, 0, 0, 0, 0, 0, 0), "Everything moved");
     }
 
     #[test]
