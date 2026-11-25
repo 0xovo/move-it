@@ -507,3 +507,178 @@ fn local_move_into_brave_keeps_the_targets_secure_preferences() {
     assert_eq!(a.local_undo("brave", false).unwrap(), UndoOutcome::Done);
     assert_eq!(std::fs::read(&secure_path).unwrap(), secure_bytes);
 }
+
+/// A target whose five cookies and five logins are all v11 rows sealed
+/// under `secret`: the live key opens 5 of 5 in each store.
+fn plant_target_v11_five(dir: &Path, secret: &str) {
+    fresh_profile(dir);
+    let k = v11_keys(secret);
+    let cookies: Vec<Cookie> = (0..5)
+        .map(|i| cookie(".own.example", &format!("c{i}"), "keep", 10 + i))
+        .collect();
+    cookies::import_with_write_prefix(&dir.join("Default/Cookies"), &cookies, &k, LinuxPrefix::V11)
+        .unwrap();
+    let logins_in: Vec<Login> = (0..5).map(|i| login(&format!("u{i}"), "pw", 50 + i)).collect();
+    logins::import_with_write_prefix(
+        &dir.join("Default/Login Data"),
+        &logins_in,
+        &k,
+        HostTag::Without,
+        LinuxPrefix::V11,
+    )
+    .unwrap();
+}
+
+/// A target with five v11 rows per store where one row in each store is
+/// a dead row sealed under `stale` and the other four under `live`: the
+/// live key opens 4 of 5 (a strict majority), the stale key 1 of 5.
+fn plant_target_v11_mixed(dir: &Path, live: &str, stale: &str) {
+    fresh_profile(dir);
+    let stale_k = v11_keys(stale);
+    cookies::import_with_write_prefix(
+        &dir.join("Default/Cookies"),
+        &[cookie(".own.example", "c0", "keep", 10)],
+        &stale_k,
+        LinuxPrefix::V11,
+    )
+    .unwrap();
+    logins::import_with_write_prefix(
+        &dir.join("Default/Login Data"),
+        &[login("u0", "pw", 50)],
+        &stale_k,
+        HostTag::Without,
+        LinuxPrefix::V11,
+    )
+    .unwrap();
+    let live_k = v11_keys(live);
+    let cookies: Vec<Cookie> = (1..5)
+        .map(|i| cookie(".own.example", &format!("c{i}"), "keep", 10 + i))
+        .collect();
+    cookies::import_with_write_prefix(&dir.join("Default/Cookies"), &cookies, &live_k, LinuxPrefix::V11)
+        .unwrap();
+    let logins_in: Vec<Login> = (1..5).map(|i| login(&format!("u{i}"), "pw", 50 + i)).collect();
+    logins::import_with_write_prefix(
+        &dir.join("Default/Login Data"),
+        &logins_in,
+        &live_k,
+        HostTag::Without,
+        LinuxPrefix::V11,
+    )
+    .unwrap();
+}
+
+#[test]
+fn local_move_refuses_a_stale_key_that_opens_only_a_minority_of_v11_rows() {
+    // The stale key is the only candidate (the pinned word stands in
+    // for the one keyring item discovery returns): it opens 1 of 5
+    // v11 rows in each destination store, so it must never validate,
+    // and the move fails loud exactly like the cannot-obtain-key case.
+    let _pin = pin("stale-candidate-word");
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    plant_target_v11_mixed(&dst, KEYRING_SECRET, "stale-candidate-word");
+    let before = tree_snapshot(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+
+    let err = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap_err();
+    assert!(
+        format!("{err}").contains("does not open"),
+        "the refusal must name the validation failure: {err}"
+    );
+    assert!(a.local_preview("brave", "chrome", None, None).is_err(), "the preview refuses too");
+    assert_eq!(tree_snapshot(&dst), before);
+    assert!(txn_leftovers(&dst).is_empty(), "leftovers: {:?}", txn_leftovers(&dst));
+}
+
+#[test]
+fn local_move_accepts_the_live_key_opening_all_v11_rows() {
+    let _pin = pin(KEYRING_SECRET);
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    plant_target_v11_five(&dst, KEYRING_SECRET);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 1);
+    assert_eq!(report.logins, 1);
+    // The destination's own five rows still read under the live key,
+    // plus the two moved rows.
+    assert_eq!(cookies::export(&dst.join("Default/Cookies"), &v11_keys(KEYRING_SECRET)).unwrap().len(), 6);
+    assert_eq!(logins::export(&dst.join("Default/Login Data"), &v11_keys(KEYRING_SECRET)).unwrap().len(), 6);
+}
+
+#[test]
+fn local_move_accepts_the_live_key_opening_a_majority_with_one_dead_row() {
+    // One dead row per store (sealed under a rotated-away key) must not
+    // block the live key: 4 of 5 is a strict majority in each store.
+    let _pin = pin(KEYRING_SECRET);
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    plant_target_v11_mixed(&dst, KEYRING_SECRET, "stale-candidate-word");
+    let mut a = app(&t.path().join("state"), &src, &dst);
+
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+    assert_eq!(report.cookies, 1);
+    assert_eq!(report.logins, 1);
+    let blob = raw_cookie_blob(&dst, "sess");
+    assert_eq!(&blob[..3], b"v11", "moved cookie must carry the v11 label");
+    assert_eq!(
+        Lock::linux(KEYRING_SECRET, LinuxPrefix::V11).decrypt(".example.com", &blob).unwrap(),
+        "v1"
+    );
+}
+
+#[test]
+fn local_move_does_not_count_a_failed_extension_install_as_moved() {
+    let _pin = pin(KEYRING_SECRET);
+    let t = tempfile::tempdir().unwrap();
+    let src = t.path().join("brave-prof");
+    let dst = t.path().join("chrome-prof");
+    plant_source(&src);
+    // A second state-carrying extension whose binary tree does not
+    // travel: its Extensions folder holds an empty version dir, so no
+    // files are collected for it, and it has no registration either.
+    // install_in reports exactly this shape as "failed" ("no extension
+    // files on disk") - the per-install failure the extinstall tests
+    // force at that level, reachable here through the whole move. (The
+    // registration-write failure those tests force with a linked
+    // External Extensions folder cannot be used at this level: the
+    // move's journal refuses the link before any install runs.)
+    const EXT_NO_FILES: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    std::fs::create_dir_all(src.join(format!("Default/Extensions/{EXT_NO_FILES}/1.0_0"))).unwrap();
+    let state = src.join(format!("Default/Local Extension Settings/{EXT_NO_FILES}"));
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("state.txt"), b"nofiles-state").unwrap();
+    plant_target(&dst);
+    let mut a = app(&t.path().join("state"), &src, &dst);
+
+    let report = a.local_move("brave", "chrome", None, None, None, &mut |_| {}).unwrap();
+
+    assert!(
+        report
+            .extension_installs
+            .iter()
+            .any(|r| r.id == EXT_NO_FILES && r.status == "failed"),
+        "the install must report failed: {:?}",
+        report.extension_installs
+    );
+    // Its state landed in the target, but it does not count as moved,
+    // the failure is in its own bucket, and the summary cannot claim
+    // full success. (The unpacked extension still installs and counts:
+    // 1, not 2.)
+    assert_eq!(
+        std::fs::read(dst.join(format!("Default/Local Extension Settings/{EXT_NO_FILES}/state.txt"))).unwrap(),
+        b"nofiles-state",
+        "the failed extension's state did land"
+    );
+    assert_eq!(report.extensions, 1, "only the unpacked extension counts: {:?}", report.extension_installs);
+    assert_eq!(report.extension_install_failed, 1);
+    assert!(report.summary.contains("1 extension could not be installed"), "{}", report.summary);
+    assert!(!report.summary.contains("Everything moved"), "{}", report.summary);
+}
