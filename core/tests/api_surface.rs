@@ -107,7 +107,20 @@ fn store_for(
 }
 
 fn app(state: &Path, profile: &Path, device: &str, pipe_dir: &Path) -> App {
-    let mut a = App::open(state).unwrap().with_key_store(store_for(state)).with_profile("brave", profile);
+    // Pin the discovery base per app, not only via the process-wide
+    // XDG_CONFIG_HOME that pin_browser_password sets: that env var is
+    // shared by every test in this binary, and the side-by-side test
+    // repoints it at its own live fixture roots. An app that captured
+    // the base in that window enrolled another test's browsers as its
+    // sources, and its move then rightly refused with BrowserOpen
+    // while those stores were mid-move (the ubuntu CI failure in
+    // lookalike_and_stale_ids_exclude_nothing). A per-app empty base
+    // makes the fixture world hermetic however the env moves.
+    let mut a = App::open(state)
+        .unwrap()
+        .with_key_store(store_for(state))
+        .with_browser_base(Path::new("/tmp/moveit-test-empty-xdg"))
+        .with_profile("brave", profile);
     a.use_pipe(pipe_dir).unwrap();
     a.set_device_name(device).unwrap();
     a

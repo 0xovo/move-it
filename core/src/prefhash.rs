@@ -500,10 +500,23 @@ fn version_cmp(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
 /// and on this machine such a path simply does not exist.
 fn unpacked_path(entry: &Value) -> Option<&str> {
     let path = entry.get("path").and_then(Value::as_str)?;
-    let windows_absolute = path.len() >= 3
-        && path.as_bytes()[1] == b':'
-        && matches!(path.as_bytes()[2], b'\\' | b'/');
-    (Path::new(path).is_absolute() || windows_absolute || path.starts_with("\\\\")).then_some(path)
+    is_absolute_path_any_os(path).then_some(path)
+}
+
+/// Is this path string absolute under either OS's semantics? A sealed
+/// box can carry another machine's entry verbatim, so the classification
+/// must not depend on the host: `Path::is_absolute` on Windows rejects
+/// a leading-slash path (it is rooted on the current drive there, not
+/// absolute), which let a foreign `/no/such/...` unpacked path slip
+/// past the merge guard on Windows. Leading slash, leading backslash
+/// (rooted and UNC shapes), and a drive-letter prefix all count, on
+/// every host; profile-relative paths (`local/1.0_0`) never do.
+fn is_absolute_path_any_os(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') {
+        return true;
+    }
+    let b = path.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 /// Merge one source registration into a target settings map without
@@ -1653,6 +1666,49 @@ mod tests {
         let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
         assert_eq!(got["extensions"]["settings"][id]["path"], "local/1.0_0");
         assert_eq!(got["extensions"]["settings"][id]["manifest"]["version"], "1.0");
+    }
+
+    #[test]
+    fn absolute_path_classification_covers_both_os_shapes() {
+        // Unix shapes.
+        for path in ["/no/such/folder", "/home/user/ext", "/"] {
+            assert!(is_absolute_path_any_os(path), "{path}");
+        }
+        // Windows shapes: drive-letter (either separator, or none),
+        // rooted, and UNC. These must classify as absolute on a Linux
+        // host too, because the string, not the host, decides.
+        for path in [r"C:\Users\x\ext", "C:/Users/x/ext", r"c:\ext", "C:ext", r"\no\such\folder", r"\\server\share\ext", "//server/share/ext"] {
+            assert!(is_absolute_path_any_os(path), "{path}");
+        }
+        // Profile-relative shapes are never unpacked paths.
+        for path in ["local/1.0_0", "ext/2.0_0", "./local", "1.0_0", ""] {
+            assert!(!is_absolute_path_any_os(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn registration_merge_keeps_target_over_windows_shaped_missing_unpacked_sources() {
+        // The Windows CI failure shape, exercised on any host: a
+        // leading-slash source path and Windows-shaped source paths
+        // are all foreign here, so none replaces the target entry
+        // even at a higher version.
+        for foreign in ["/no/such/folder/on/this/machine", r"C:\no\such\folder", r"\\server\share\ext", r"\no\such\folder"] {
+            let t = tempfile::tempdir().unwrap();
+            let slot = t.path().join("Default");
+            std::fs::create_dir_all(&slot).unwrap();
+            let id = "nkbihfbeogaeaoehlefnkodbefgpgknn";
+            let seed = json!({"extensions": {"settings": {id: {"manifest": {"version": "1.0"}, "path": "local/1.0_0", "state": 1}}}});
+            std::fs::write(slot.join("Preferences"), serde_json::to_vec(&seed).unwrap()).unwrap();
+            let mut regs = Map::new();
+            regs.insert(
+                id.into(),
+                json!({"manifest": {"version": "9.0"}, "path": foreign, "location": 8, "state": 1}),
+            );
+            merge_registrations_secure(&slot, "chrome", &regs, None).unwrap();
+            let got: Value = serde_json::from_slice(&std::fs::read(slot.join("Preferences")).unwrap()).unwrap();
+            assert_eq!(got["extensions"]["settings"][id]["path"], "local/1.0_0", "{foreign}");
+            assert_eq!(got["extensions"]["settings"][id]["manifest"]["version"], "1.0", "{foreign}");
+        }
     }
 
     #[test]
