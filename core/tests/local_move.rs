@@ -1132,14 +1132,18 @@ fn local_move_dead_key_target_cookie_counts_unreadable_not_already_present() {
     let dst = t.path().join("chrome-prof");
     plant_dedupe_profile(&src, 300, &["sess"], &[], &[]);
     plant_dedupe_profile(&dst, 200, &["own"], &[], &[]);
-    // One readable v11 cookie in the target, so the destination key gate
-    // (at least one v11 row must open when v11 rows exist) stays green
+    // Readable v11 cookies in the target forming a strict majority of
+    // its v11 rows (2 of 3), so the destination key gate stays green
     // while the dead row below stays unreadable. Planted raw: an import
     // would re-seal it under the store's voted prefix (v10 here).
     let own2_blob = Lock::linux(KEYRING_SECRET, LinuxPrefix::V11)
         .encrypt(".example.com", "v-own2", HostTag::With)
         .unwrap();
     plant_raw_cookie(&dst, "own2", own2_blob, 200);
+    let own3_blob = Lock::linux(KEYRING_SECRET, LinuxPrefix::V11)
+        .encrypt(".example.com", "v-own3", HostTag::With)
+        .unwrap();
+    plant_raw_cookie(&dst, "own3", own3_blob, 200);
     // The target's copy of the source cookie was written under a key that
     // rotated away: it lands in the scan's dead set and cannot be read.
     // The blob is v11 (authenticated), so the wrong key fails for sure;
